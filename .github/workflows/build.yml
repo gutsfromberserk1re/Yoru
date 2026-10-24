@@ -1,0 +1,77 @@
+name: Build (Windows)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # only used by the tag -> GitHub Release step
+
+env:
+  CARGO_TERM_COLOR: always
+  # link FFmpeg dynamically (import libs from vcpkg) and ship the DLLs next to the exe
+  VCPKGRS_DYNAMIC: "1"
+  # bindgen (used by ffmpeg-sys-next) needs libclang; preinstalled on windows-latest
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ---- FFmpeg via vcpkg (first run ~15-25 min, then restored from cache in seconds) ----
+      - name: Configure vcpkg + binary cache location
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          $cache = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-cache"
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          # bump the suffix to force a fresh FFmpeg build
+          key: vcpkg-ffmpeg-x64-windows-${{ runner.os }}-v1
+
+      - name: Install FFmpeg
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+
+      # ---- build ----
+      - name: cargo build --release
+        run: cargo build --release
+
+      # ---- package: exe + FFmpeg DLLs ----
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\editor_ui.exe dist\
+          Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" dist\
+          Compress-Archive -Path dist\* -DestinationPath editor_ui-windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editor_ui-windows-x64
+          path: editor_ui-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: editor_ui-windows-x64.zip
