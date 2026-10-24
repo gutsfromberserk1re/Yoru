@@ -1,0 +1,29 @@
+[package]
+name = "editor_ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+# 8.1 line builds against FFmpeg 7.x *and* 8.x (it probes the installed headers)
+ffmpeg-next = "8.1"
+cpal = "0.15"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+window-vibrancy = "0.5"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
+[profile.dev]
+opt-level = 1
+
+# FFmpeg bindings + decode glue are hot paths even in debug: optimise deps, keep your code debuggable
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

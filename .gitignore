@@ -1,0 +1,4 @@
+target/
+.vcpkg-cache/
+dist/
+*.zip
