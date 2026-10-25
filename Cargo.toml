@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 eframe = "0.29"
-# 8.1 line builds against FFmpeg 7.x *and* 8.x (it probes the installed headers)
-ffmpeg-next = "8.1"
+# The crate's major.minor tracks FFmpeg's (9.0 <-> FFmpeg 9.0). vcpkg in CI installs the
+# newest FFmpeg, so keep this in step with it. "~9.0" = any 9.0.x, never a surprise 9.1.
+ffmpeg-next = "~9.0"
 cpal = "0.15"
 raw-window-handle = "0.6"
 

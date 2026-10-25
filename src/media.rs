@@ -651,12 +651,14 @@ impl Player {
         self.seek_audio(t);
     }
 
-    /// Start/stop real-time playback. Starting re-aligns audio to `t` (exact resume point).
-    pub fn set_playing(&mut self, on: bool, t: f64) {
+    /// Start/stop real-time playback. `resync` re-aligns audio to that source time (exact resume).
+    pub fn set_playing(&mut self, on: bool, resync: Option<f64>) {
         let _ = self.cmd.send(Cmd::Play(on));
         if let Some(a) = &self.audio {
             if on {
-                self.seek_audio(t);
+                if let Some(t) = resync {
+                    self.seek_audio(t);
+                }
             }
             a.sh.playing.store(on, Relaxed);
         }
