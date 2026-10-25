@@ -11,7 +11,7 @@
 //! audio that are still in flight are discarded instead of played.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SizedSample};
+use cpal::{FromSample, SizedSample};
 use eframe::egui::Context;
 use ffmpeg::{
     codec, format,
@@ -59,7 +59,7 @@ enum Cmd {
     Play(bool),
 }
 
-struct VideoWorker {
+pub struct VideoWorker {
     ictx: format::context::Input,
     dec: ffmpeg::decoder::Video,
     scaler: scaling::Context,
@@ -74,7 +74,12 @@ struct VideoWorker {
 }
 
 impl VideoWorker {
-    fn open(path: &Path) -> Result<(Self, Info), ffmpeg::Error> {
+    pub fn open(path: &Path) -> Result<(Self, Info), ffmpeg::Error> {
+        Self::open_sized(path, MAX_PREVIEW_W)
+    }
+
+    /// `max_w`: output width cap (preview = 1280, thumbnails = small).
+    pub fn open_sized(path: &Path, max_w: u32) -> Result<(Self, Info), ffmpeg::Error> {
         let ictx = format::input(path)?;
         let (idx, tb, params, fps) = {
             let s = ictx.streams().best(Type::Video).ok_or(ffmpeg::Error::StreamNotFound)?;
@@ -86,7 +91,7 @@ impl VideoWorker {
         let dec = cctx.decoder().video()?;
 
         let (sw, sh) = (dec.width().max(2), dec.height().max(2));
-        let w = (sw.min(MAX_PREVIEW_W) & !1).max(2);
+        let w = (sw.min(max_w) & !1).max(2);
         let h = ((((sh as u64 * w as u64) / sw as u64) as u32) & !1).max(2);
         let scaler = scaling::Context::get(dec.format(), sw, sh, format::Pixel::RGBA, w, h, scaling::Flags::BILINEAR)?;
         let dur = ictx.duration();
@@ -107,7 +112,7 @@ impl VideoWorker {
         Ok((me, info))
     }
 
-    fn seek(&mut self, t: f64, gen: u64) {
+    pub fn seek(&mut self, t: f64, gen: u64) {
         let ts = (t.max(0.0) * 1_000_000.0) as i64;
         let _ = self.ictx.seek(ts, ..ts); // lands on the previous keyframe
         self.dec.flush();
@@ -115,7 +120,7 @@ impl VideoWorker {
         self.gen = gen;
     }
 
-    fn next_frame(&mut self) -> Option<Frame> {
+    pub fn next_frame(&mut self) -> Option<Frame> {
         loop {
             if self.dec.receive_frame(&mut self.raw).is_ok() {
                 if let Some(f) = self.convert() {
@@ -313,7 +318,7 @@ impl AudioShared {
 }
 
 // ================================================================== AUDIO DECODE WORKER
-struct AudioWorker {
+pub struct AudioWorker {
     ictx: format::context::Input,
     dec: ffmpeg::decoder::Audio,
     rs: resampling::Context,
@@ -339,7 +344,7 @@ fn make_resampler(dec: &ffmpeg::decoder::Audio, rate: u32) -> Result<resampling:
 
 impl AudioWorker {
     /// Ok(None) = the file has no audio stream.
-    fn open(path: &Path, rate: u32) -> Result<Option<Self>, ffmpeg::Error> {
+    pub fn open(path: &Path, rate: u32) -> Result<Option<Self>, ffmpeg::Error> {
         let ictx = format::input(path)?;
         let found = ictx.streams().best(Type::Audio).map(|s| (s.index(), rational(s.time_base()), s.parameters()));
         let Some((idx, tb, params)) = found else { return Ok(None) };
@@ -374,7 +379,7 @@ impl AudioWorker {
     }
 
     /// Decode + resample the next chunk into `buf`. False at end of stream.
-    fn next_chunk(&mut self, buf: &mut Vec<f32>) -> bool {
+    pub fn next_chunk(&mut self, buf: &mut Vec<f32>) -> bool {
         loop {
             if self.dec.receive_frame(&mut self.raw).is_ok() {
                 self.resample(buf);

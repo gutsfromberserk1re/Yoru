@@ -1,7 +1,8 @@
 [package]
-name = "editor_ui"
+name = "yoru"
 version = "0.1.0"
 edition = "2021"
+description = "Yoru - video editor"
 
 [dependencies]
 eframe = "0.29"
@@ -9,6 +10,7 @@ eframe = "0.29"
 # newest FFmpeg, so keep this in step with it. "~9.0" = any 9.0.x, never a surprise 9.1.
 ffmpeg-next = "~9.0"
 cpal = "0.15"
+rfd = "0.15"
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]

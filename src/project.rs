@@ -173,6 +173,95 @@ impl Project {
         v
     }
 
+    // ---------------------------------------------------------------- save / load
+    /// Plain-text project format (tab separated; names/paths are the last field of a line).
+    pub fn to_text(&self) -> String {
+        let mut s = String::from("YORU 1\n");
+        s += &format!("N\t{}\n", self.next_id);
+        for m in &self.media {
+            s += &format!(
+                "M\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                m.id,
+                m.duration,
+                m.has_audio as u8,
+                m.seed,
+                m.name,
+                m.path.to_string_lossy()
+            );
+        }
+        for c in &self.clips {
+            let lane = match c.lane {
+                Lane::Conn => 0,
+                Lane::Main => 1,
+                Lane::Audio => 2,
+            };
+            s += &format!(
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                c.id,
+                c.link,
+                lane,
+                c.start,
+                c.dur,
+                c.src_off,
+                c.src_len,
+                c.seed,
+                c.media.unwrap_or(0),
+                c.name
+            );
+        }
+        s
+    }
+
+    pub fn from_text(text: &str) -> Result<Project, String> {
+        let mut lines = text.lines();
+        if lines.next().map(str::trim) != Some("YORU 1") {
+            return Err("not a Yoru project file".into());
+        }
+        let mut p = Project { media: vec![], clips: vec![], next_id: 0, undo: vec![], redo: vec![] };
+        for (n, line) in lines.enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let bad = || format!("line {}: damaged record", n + 2);
+            let f: Vec<&str> = line.splitn(11, '\t').collect();
+            match f[0] {
+                "N" => p.next_id = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
+                "M" if f.len() >= 7 => p.media.push(Media {
+                    id: f[1].parse().map_err(|_| bad())?,
+                    duration: f[2].parse().map_err(|_| bad())?,
+                    has_audio: f[3] == "1",
+                    seed: f[4].parse().map_err(|_| bad())?,
+                    name: f[5].to_string(),
+                    path: PathBuf::from(f[6..].join("\t")),
+                }),
+                "C" if f.len() == 11 => {
+                    let media: u32 = f[9].parse().map_err(|_| bad())?;
+                    p.clips.push(Clip {
+                        id: f[1].parse().map_err(|_| bad())?,
+                        link: f[2].parse().map_err(|_| bad())?,
+                        lane: match f[3] {
+                            "0" => Lane::Conn,
+                            "1" => Lane::Main,
+                            "2" => Lane::Audio,
+                            _ => return Err(bad()),
+                        },
+                        start: f[4].parse().map_err(|_| bad())?,
+                        dur: f[5].parse().map_err(|_| bad())?,
+                        src_off: f[6].parse().map_err(|_| bad())?,
+                        src_len: f[7].parse().map_err(|_| bad())?,
+                        seed: f[8].parse().map_err(|_| bad())?,
+                        media: if media == 0 { None } else { Some(media) },
+                        name: f[10].to_string(),
+                    });
+                }
+                _ => return Err(bad()),
+            }
+        }
+        let max_id = p.media.iter().map(|m| m.id).chain(p.clips.iter().flat_map(|c| [c.id, c.link])).max().unwrap_or(0);
+        p.next_id = p.next_id.max(max_id);
+        Ok(p)
+    }
+
     // ---------------------------------------------------------------- undo / redo
     pub fn push_undo(&mut self, pre: Vec<Clip>) {
         self.undo.push(pre);
@@ -491,6 +580,16 @@ mod tests {
         p.apply_drag(&pre, id, DragOp::TrimR { new_end: 6.0, ripple: false });
         assert!((p.clips[0].end() - 6.0).abs() < 1e-9);
         assert!((p.clips[1].end() - 6.0).abs() < 1e-9); // partner follows
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let (p, _) = media_project();
+        let q = Project::from_text(&p.to_text()).expect("parse");
+        assert_eq!(q.clips.len(), p.clips.len());
+        assert_eq!(q.media.len(), 1);
+        assert!((q.end() - p.end()).abs() < 1e-9);
+        assert_eq!(q.clips[0].link, q.clips[1].link);
     }
 
     #[test]

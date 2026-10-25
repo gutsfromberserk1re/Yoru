@@ -1,4 +1,4 @@
-//! Video editor UI prototype - Rust / egui port (v5.0)
+//! Yoru - video editor (Rust / egui)
 //!
 //! * Panels: solid French Blue (#394988), rounded, 1px border.
 //! * Everything else (title bar, gaps between panels, window background):
@@ -7,16 +7,20 @@
 //! Run:  cargo run --release
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+#![allow(unknown_lints, float_literal_f32_fallback, deprecated)]
 
+use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, ecolor::Hsva, epaint::CubicBezierShape, *};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+mod assets;
 mod engine;
 mod media;
 mod project;
 
+use assets::Assets;
 use project::{nearest, Clip, DragOp, Lane, Project};
 
 // ------------------------------------------------------------------ settings
@@ -513,7 +517,7 @@ impl Timeline {
     }
 
     /// Returns (edited, seeked).
-    fn show(&mut self, ui: &mut Ui, rect: Rect, t: &mut f64, proj: &mut Project) -> (bool, bool) {
+    fn show(&mut self, ui: &mut Ui, rect: Rect, t: &mut f64, proj: &mut Project, assets: &Assets) -> (bool, bool) {
         let (mut edited, mut seeked) = (false, false);
         let (hover, pressed, down, delta, scroll_y, zoom) = ui.input(|i| {
             (
@@ -636,11 +640,11 @@ impl Timeline {
         }
         self.last_t = *t;
 
-        self.paint(ui, rect, *t, if over && !self.scrub { hover } else { None }, proj);
+        self.paint(ui, rect, *t, if over && !self.scrub { hover } else { None }, proj, assets);
         (edited, seeked)
     }
 
-    fn paint(&self, ui: &Ui, rect: Rect, t: f64, hover: Option<Pos2>, proj: &Project) {
+    fn paint(&self, ui: &Ui, rect: Rect, t: f64, hover: Option<Pos2>, proj: &Project, assets: &Assets) {
         let p = ui.painter_at(rect);
         let font = FontId::monospace(8.0);
 
@@ -681,7 +685,7 @@ impl Timeline {
 
         // clips
         for c in &proj.clips {
-            self.draw_clip(ui, &p, rect, c, self.sel == Some(c.id), &font);
+            self.draw_clip(ui, &p, rect, c, self.sel == Some(c.id), &font, assets);
         }
 
         // snap guide
@@ -717,7 +721,7 @@ impl Timeline {
         }
     }
 
-    fn draw_clip(&self, ui: &Ui, p: &Painter, rect: Rect, c: &Clip, selected: bool, font: &FontId) {
+    fn draw_clip(&self, ui: &Ui, p: &Painter, rect: Rect, c: &Clip, selected: bool, font: &FontId, assets: &Assets) {
         let (y, hh) = self.lane(c.lane, rect.height());
         let y = rect.top() + y;
         let x0 = self.x_of(rect, c.start);
@@ -739,7 +743,13 @@ impl Timeline {
                 let xe = x1.min(rect.right());
                 while x < xe {
                     let tt = (x - x0) as f64 / self.pps + c.src_off;
-                    let a = w[((tt * 20.0) as usize).min(w.len() - 1)] * amp;
+                    let a = match c.media {
+                        Some(mid) => assets
+                            .peak(mid, tt, tt + 2.0 / self.pps)
+                            .map_or(1.0, |pk| pk.min(1.0).powf(0.6) * amp),
+                        None => w[((tt * 20.0) as usize).min(w.len() - 1)] * amp,
+                    }
+                    .max(0.6);
                     m.add_colored_rect(
                         Rect::from_min_max(pos2(x, mid - a), pos2(x + 1.0, mid + a)),
                         VISTA,
@@ -755,19 +765,24 @@ impl Timeline {
             }
             _ => {
                 let th = hh - LABEL;
-                let tw = (th * 16.0 / 9.0).max(24.0);
+                let asp = c.media.and_then(|mid| assets.aspect(mid)).unwrap_or(16.0 / 9.0);
+                let tw = (th * asp).max(24.0);
                 let ty = y + LABEL;
                 let mut i = ((rect.left() - x0).max(0.0) / tw) as u32;
                 let mut x = x0 + i as f32 * tw;
                 let mut m = Mesh::default();
                 while x < x1.min(rect.right()) {
-                    let hue = thumb_hue(c.seed, i);
-                    push_rect_gradient(
-                        &mut m,
-                        Rect::from_min_size(pos2(x, ty), vec2(tw + 1.0, th)),
-                        hsv(hue, 35.0, 55.0),
-                        hsv(hue, 45.0, 25.0),
-                    );
+                    let tile = Rect::from_min_size(pos2(x, ty), vec2(tw + 1.0, th));
+                    let src_t = c.src_off + ((x + tw * 0.5 - x0) as f64 / self.pps);
+                    match c.media.and_then(|mid| assets.thumb_at(mid, src_t)) {
+                        Some((tex, _)) => {
+                            p.image(tex.id(), tile, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        None => {
+                            let hue = thumb_hue(c.seed, i);
+                            push_rect_gradient(&mut m, tile, hsv(hue, 35.0, 55.0), hsv(hue, 45.0, 25.0));
+                        }
+                    }
                     x += tw;
                     i += 1;
                 }
@@ -1150,6 +1165,7 @@ fn timeline_panel(
     project: &str,
     levels: (f32, f32),
     proj: &mut Project,
+    assets: &Assets,
 ) -> (bool, bool) {
     let mut out = (false, false);
     glass(12.0, 8.0, 12.0, 10.0).show(ui, |ui| {
@@ -1173,7 +1189,7 @@ fn timeline_panel(
         let meter = Rect::from_min_max(pos2(full.right() - 36.0, full.top()), full.max);
         let view = Rect::from_min_max(full.min, pos2(meter.left() - 6.0, full.bottom()));
         ui.allocate_rect(full, Sense::hover());
-        out = tl.show(ui, view, t, proj);
+        out = tl.show(ui, view, t, proj, assets);
         level_meter(ui, meter, levels.0, levels.1);
     });
     out
@@ -1230,7 +1246,9 @@ fn title_bar(ui: &mut Ui, ctx: &Context, title: &str, maximized: bool) {
             let st = Stroke::new(1.4, ink);
             let o = r.min;
             match i {
-                0 => p.line_segment([o + vec2(5.5, 9.0), o + vec2(12.5, 9.0)], st),
+                0 => {
+                    p.line_segment([o + vec2(5.5, 9.0), o + vec2(12.5, 9.0)], st);
+                }
                 1 => {
                     p.rect_stroke(Rect::from_min_size(o + vec2(5.5, 5.5), vec2(7.0, 7.0)), 0.0, st);
                 }
@@ -1267,6 +1285,8 @@ struct App {
     jumped: bool,
     tex: Option<TextureHandle>,
     tex_aspect: f32,
+    assets: Assets,
+    project_path: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -1287,6 +1307,8 @@ impl App {
             jumped: false,
             tex: None,
             tex_aspect: 16.0 / 9.0,
+            assets: Assets::new(),
+            project_path: None,
         }
     }
 
@@ -1294,6 +1316,59 @@ impl App {
     fn seek(&mut self, t: f64) {
         self.set_time(t);
         self.jumped = true; // the engine repositions its decoders on the next frame
+    }
+
+    fn project_file_dialog() -> rfd::FileDialog {
+        rfd::FileDialog::new().add_filter("Yoru project", &["yoru"])
+    }
+
+    fn save_project(&mut self, save_as: bool) {
+        let path = match (&self.project_path, save_as) {
+            (Some(p), false) => Some(p.clone()),
+            _ => Self::project_file_dialog().set_file_name(format!("{}.yoru", self.project)).save_file(),
+        };
+        let Some(mut path) = path else { return };
+        if path.extension().is_none() {
+            path.set_extension("yoru");
+        }
+        match std::fs::write(&path, self.proj.to_text()) {
+            Ok(()) => {
+                if let Some(stem) = path.file_stem() {
+                    self.project = stem.to_string_lossy().into_owned();
+                }
+                self.project_path = Some(path);
+                self.dirty = false;
+            }
+            Err(e) => eprintln!("cannot save {}: {e}", path.display()),
+        }
+    }
+
+    fn open_project(&mut self, ctx: &Context) {
+        let Some(path) = Self::project_file_dialog().pick_file() else { return };
+        let loaded = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Project::from_text(&t));
+        match loaded {
+            Ok(p) => {
+                self.set_rate(0);
+                self.proj = p;
+                self.engine = engine::Engine::new();
+                self.assets = Assets::new();
+                for m in &self.proj.media {
+                    self.assets.spawn(ctx, m.id, &m.path, m.duration, m.has_audio);
+                }
+                self.tex = None;
+                self.t = 0.0;
+                self.timeline.sel = None;
+                self.timeline.scroll = 0.0;
+                self.after_edit();
+                self.timeline.pps = (900.0 / duration()).clamp(2.0, 200.0);
+                if let Some(stem) = path.file_stem() {
+                    self.project = stem.to_string_lossy().into_owned();
+                }
+                self.project_path = Some(path);
+                self.dirty = false;
+            }
+            Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+        }
     }
 
     /// Call after ANY change to the clip list (edit, undo, redo, import).
@@ -1377,8 +1452,13 @@ impl App {
                 }
             }
         }
-        if k(Key::S, cmd) {
-            self.dirty = false;
+        if k(Key::S, cmd | Modifiers::SHIFT) {
+            self.save_project(true);
+        } else if k(Key::S, cmd) {
+            self.save_project(false);
+        }
+        if k(Key::O, cmd) {
+            self.open_project(ctx);
         }
         if k(Key::Space, none) {
             self.toggle_play();
@@ -1461,6 +1541,8 @@ impl eframe::App for App {
         }
         self.handle_keys(ctx);
 
+        self.assets.pump(ctx);
+
         // drop video files onto the window: import into the media pool and append to the timeline
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         let mut imported = false;
@@ -1469,7 +1551,9 @@ impl eframe::App for App {
             match media::Player::open(&path, ctx.clone()) {
                 Ok(p) => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let id = self.proj.add_media(path, name, p.info.duration, p.has_audio());
+                    let (dur, audio) = (p.info.duration, p.has_audio());
+                    let id = self.proj.add_media(path.clone(), name, dur, audio);
+                    self.assets.spawn(ctx, id, &path, dur, audio);
                     self.engine.insert(id, p); // already open: reuse it for playback
                     imported |= self.proj.append_media(id);
                 }
@@ -1513,7 +1597,7 @@ impl eframe::App for App {
             bg.rect_stroke(r, radius, Stroke::new(1.2, rgba(110, 125, 170, 180)));
         }
 
-        let title = if self.dirty { format!("{} *", self.project) } else { self.project.clone() };
+        let title = format!("Yoru  -  {}{}", self.project, if self.dirty { " *" } else { "" });
         TopBottomPanel::top("title")
             .exact_height(36.0)
             .frame(Frame::none())
@@ -1523,7 +1607,7 @@ impl eframe::App for App {
         let (mut edited, mut seeked, mut play) = (false, false, false);
         let mut add_media: Option<u32> = None;
         {
-            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, .. } = self;
+            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, .. } = self;
             let playing = *rate > 0;
 
             TopBottomPanel::bottom("bottom")
@@ -1543,7 +1627,7 @@ impl eframe::App for App {
                             add_media = browser_panel(ui, browser, proj);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        let r = timeline_panel(ui, timeline, t, project, *levels, proj);
+                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets);
                         edited |= r.0;
                         seeked |= r.1;
                     });
@@ -1652,7 +1736,7 @@ fn setup(ctx: &Context) {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_title(PROJECT_NAME)
+            .with_title("Yoru")
             .with_inner_size([1600.0, 900.0])
             .with_min_inner_size([1100.0, 700.0])
             .with_decorations(false)
@@ -1660,7 +1744,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        PROJECT_NAME,
+        "Yoru",
         options,
         Box::new(|cc| {
             setup(&cc.egui_ctx);
