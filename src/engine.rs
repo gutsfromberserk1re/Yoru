@@ -185,6 +185,12 @@ impl Engine {
         self.prepared = Some(next);
     }
 
+    /// The most recently decoded frame of the active clip (for re-rendering when effects change).
+    pub fn current(&self) -> Option<&Frame> {
+        let a = self.active?;
+        self.players.get(&a.media)?.player.current.as_ref()
+    }
+
     pub fn is_active(&self) -> bool {
         self.active.is_some()
     }

@@ -66,7 +66,8 @@ const GLAUCOUS: Color32 = Color32::from_rgb(0x8B, 0x94, 0x9E);
 const TEXT: Color32 = POWDER;
 const MUTED: Color32 = GLAUCOUS;
 const DEEP: Color32 = Color32::from_rgb(0x22, 0x25, 0x30);
-const PANEL_BG: Color32 = Color32::from_rgb(0x39, 0x49, 0x88);
+/// Panel glass: very dark navy, ~84% opaque (premultiplied RGBA; lower the last number for more see-through).
+const PANEL_BG: Color32 = Color32::from_rgba_premultiplied(6, 13, 39, 215);
 const DOT_COLORS: [Color32; 3] = [
     Color32::from_rgb(0x48, 0x52, 0x66),
     Color32::from_rgb(0x5E, 0x6B, 0x82),
@@ -77,7 +78,7 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 fn panel_border() -> Color32 {
-    rgba(110, 125, 170, 217)
+    rgba(80, 100, 160, 170)
 }
 
 fn fmt_tc(t: f64) -> String {

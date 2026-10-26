@@ -367,7 +367,7 @@ impl AudioWorker {
         }))
     }
 
-    fn seek(&mut self, t: f64) {
+    pub fn seek(&mut self, t: f64) {
         let ts = (t.max(0.0) * 1_000_000.0) as i64;
         let _ = self.ictx.seek(ts, ..ts);
         self.dec.flush();

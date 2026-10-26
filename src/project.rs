@@ -18,6 +18,37 @@ pub enum Lane {
     Audio,
 }
 
+/// Per-clip effects. Neutral values = untouched picture.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Fx {
+    pub scale: f32,      // 1.0 = fit to canvas
+    pub pos_x: f32,      // fraction of half-canvas, +right
+    pub pos_y: f32,      // fraction of half-canvas, +down
+    pub rotation: f32,   // degrees, clockwise
+    pub opacity: f32,    // 0..1
+    pub brightness: f32, // -1..1
+    pub contrast: f32,   // 1.0 = neutral
+    pub saturation: f32, // 1.0 = neutral
+}
+
+impl Default for Fx {
+    fn default() -> Self {
+        Fx { scale: 1.0, pos_x: 0.0, pos_y: 0.0, rotation: 0.0, opacity: 1.0, brightness: 0.0, contrast: 1.0, saturation: 1.0 }
+    }
+}
+
+impl Fx {
+    pub fn is_identity(&self) -> bool {
+        *self == Fx::default()
+    }
+    fn to_fields(self) -> [f32; 8] {
+        [self.scale, self.pos_x, self.pos_y, self.rotation, self.opacity, self.brightness, self.contrast, self.saturation]
+    }
+    fn from_fields(a: [f32; 8]) -> Fx {
+        Fx { scale: a[0], pos_x: a[1], pos_y: a[2], rotation: a[3], opacity: a[4], brightness: a[5], contrast: a[6], saturation: a[7] }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Clip {
     pub id: u32,
@@ -33,6 +64,7 @@ pub struct Clip {
     pub name: String,
     pub seed: u32,
     pub media: Option<u32>,
+    pub fx: Fx,
 }
 
 impl Clip {
@@ -41,6 +73,7 @@ impl Clip {
     }
 }
 
+#[derive(Clone)]
 pub struct Media {
     pub id: u32,
     pub path: PathBuf,
@@ -124,6 +157,7 @@ impl Project {
             name: name.to_string(),
             seed,
             media: None,
+            fx: Fx::default(),
         });
     }
 
@@ -138,6 +172,9 @@ impl Project {
     }
     pub fn clip(&self, id: u32) -> Option<&Clip> {
         self.clips.iter().find(|c| c.id == id)
+    }
+    pub fn clip_mut(&mut self, id: u32) -> Option<&mut Clip> {
+        self.clips.iter_mut().find(|c| c.id == id)
     }
     fn index_of(&self, id: u32) -> Option<usize> {
         self.clips.iter().position(|c| c.id == id)
@@ -176,7 +213,7 @@ impl Project {
     // ---------------------------------------------------------------- save / load
     /// Plain-text project format (tab separated; names/paths are the last field of a line).
     pub fn to_text(&self) -> String {
-        let mut s = String::from("YORU 1\n");
+        let mut s = String::from("YORU 2\n");
         s += &format!("N\t{}\n", self.next_id);
         for m in &self.media {
             s += &format!(
@@ -195,8 +232,9 @@ impl Project {
                 Lane::Main => 1,
                 Lane::Audio => 2,
             };
+            let f = c.fx.to_fields();
             s += &format!(
-                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 c.id,
                 c.link,
                 lane,
@@ -206,6 +244,14 @@ impl Project {
                 c.src_len,
                 c.seed,
                 c.media.unwrap_or(0),
+                f[0],
+                f[1],
+                f[2],
+                f[3],
+                f[4],
+                f[5],
+                f[6],
+                f[7],
                 c.name
             );
         }
@@ -214,16 +260,18 @@ impl Project {
 
     pub fn from_text(text: &str) -> Result<Project, String> {
         let mut lines = text.lines();
-        if lines.next().map(str::trim) != Some("YORU 1") {
-            return Err("not a Yoru project file".into());
-        }
+        let ver = match lines.next().map(str::trim) {
+            Some("YORU 1") => 1,
+            Some("YORU 2") => 2,
+            _ => return Err("not a Yoru project file".into()),
+        };
         let mut p = Project { media: vec![], clips: vec![], next_id: 0, undo: vec![], redo: vec![] };
         for (n, line) in lines.enumerate() {
             if line.is_empty() {
                 continue;
             }
             let bad = || format!("line {}: damaged record", n + 2);
-            let f: Vec<&str> = line.splitn(11, '\t').collect();
+            let f: Vec<&str> = line.splitn(19, '\t').collect();
             match f[0] {
                 "N" => p.next_id = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
                 "M" if f.len() >= 7 => p.media.push(Media {
@@ -234,8 +282,14 @@ impl Project {
                     name: f[5].to_string(),
                     path: PathBuf::from(f[6..].join("\t")),
                 }),
-                "C" if f.len() == 11 => {
+                "C" if (ver == 1 && f.len() == 11) || (ver == 2 && f.len() == 19) => {
                     let media: u32 = f[9].parse().map_err(|_| bad())?;
+                    let mut fa = Fx::default().to_fields();
+                    if ver == 2 {
+                        for (i, slot) in fa.iter_mut().enumerate() {
+                            *slot = f[10 + i].parse().map_err(|_| bad())?;
+                        }
+                    }
                     p.clips.push(Clip {
                         id: f[1].parse().map_err(|_| bad())?,
                         link: f[2].parse().map_err(|_| bad())?,
@@ -251,7 +305,8 @@ impl Project {
                         src_len: f[7].parse().map_err(|_| bad())?,
                         seed: f[8].parse().map_err(|_| bad())?,
                         media: if media == 0 { None } else { Some(media) },
-                        name: f[10].to_string(),
+                        fx: Fx::from_fields(fa),
+                        name: f[f.len() - 1].to_string(),
                     });
                 }
                 _ => return Err(bad()),
@@ -320,6 +375,7 @@ impl Project {
             name: name.clone(),
             seed,
             media: Some(media_id),
+            fx: Fx::default(),
         });
         if audio {
             let aid = self.alloc();
@@ -334,6 +390,7 @@ impl Project {
                 name,
                 seed: 0,
                 media: Some(media_id),
+                fx: Fx::default(),
             });
         }
         self.push_undo(pre);
@@ -590,6 +647,16 @@ mod tests {
         assert_eq!(q.media.len(), 1);
         assert!((q.end() - p.end()).abs() < 1e-9);
         assert_eq!(q.clips[0].link, q.clips[1].link);
+    }
+
+    #[test]
+    fn effects_survive_save_load() {
+        let (mut p, _) = media_project();
+        let id = p.clips[0].id;
+        p.clip_mut(id).unwrap().fx = Fx { scale: 1.5, rotation: 12.0, opacity: 0.5, ..Fx::default() };
+        let q = Project::from_text(&p.to_text()).expect("parse");
+        assert_eq!(q.clips[0].fx, p.clips[0].fx);
+        assert!(q.clips[1].fx.is_identity());
     }
 
     #[test]
