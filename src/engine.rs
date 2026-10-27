@@ -42,16 +42,19 @@ pub struct Engine {
     prepared: Option<Mapping>,
     playing: bool,
     tick: u64,
+    quality: u32,
 }
 
 impl Engine {
     pub fn new() -> Self {
-        Self { players: HashMap::new(), failed: HashSet::new(), active: None, prepared: None, playing: false, tick: 0 }
+        Self { players: HashMap::new(), failed: HashSet::new(), active: None, prepared: None, playing: false, tick: 0, quality: 2 }
     }
 
     /// Adds an already-open decoder (used right after import, which had to open the file anyway).
     pub fn insert(&mut self, media: u32, player: Player) {
         self.failed.remove(&media);
+        let mut player = player;
+        player.set_quality(self.quality);
         while self.players.len() >= POOL_MAX && !self.players.contains_key(&media) {
             let victim = self
                 .players
@@ -67,6 +70,14 @@ impl Engine {
             }
         }
         self.players.insert(media, Slot { player, used: self.tick });
+    }
+
+    /// Preview resolution divisor for every open decoder (1 = full, 2 = 1/2, 4 = 1/4).
+    pub fn set_quality(&mut self, div: u32) {
+        self.quality = div.max(1);
+        for s in self.players.values_mut() {
+            s.player.set_quality(self.quality);
+        }
     }
 
     fn pinned(&self, id: u32) -> bool {
@@ -106,13 +117,13 @@ impl Engine {
 
     /// Call once per frame. `jumped` = the playhead was moved by the user (or an edit happened),
     /// so decoders must be repositioned instead of just following the clock.
-    pub fn update(&mut self, ctx: &Context, proj: &Project, t: f64, playing: bool, jumped: bool) {
+    pub fn update(&mut self, ctx: &Context, proj: &Project, t: f64, playing: bool, jumped: bool, muted: bool) {
         self.tick += 1;
         let play_changed = playing != self.playing;
         self.playing = playing;
 
         let cur = proj
-            .main_clip_at(t)
+            .video_clip_at(t)
             .and_then(|c| c.media.map(|m| Mapping { media: m, map: c.src_off - c.start }));
 
         match cur {
@@ -153,6 +164,7 @@ impl Engine {
         if let Some(a) = self.active {
             if let Some(s) = self.players.get_mut(&a.media) {
                 s.used = self.tick;
+                s.player.set_muted(muted);
             }
         }
         if playing {
@@ -161,7 +173,7 @@ impl Engine {
     }
 
     fn preroll(&mut self, ctx: &Context, proj: &Project, t: f64) {
-        let Some(n) = proj.next_main_clip_after(t) else { return };
+        let Some(n) = proj.next_video_clip_after(t) else { return };
         if n.start - t > PREROLL {
             return;
         }
