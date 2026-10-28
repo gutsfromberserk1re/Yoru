@@ -17,11 +17,15 @@ use std::time::{Duration, Instant};
 
 mod assets;
 mod engine;
+mod fxrender;
+mod fxui;
 mod media;
 mod project;
+mod timeline;
 
 use assets::Assets;
-use project::{nearest, Clip, DragOp, Lane, Project};
+use project::{Clip, Lane, Project, NPARAM, PARAMS};
+use timeline::{timeline_panel, Ghost, Timeline, Tool};
 
 // ------------------------------------------------------------------ settings
 const PROJECT_NAME: &str = "Untitled";
@@ -302,507 +306,20 @@ fn slider(ui: &mut Ui, val: &mut f32, lo: f32, hi: f32, width: f32) {
     p.circle_filled(pos2(x, cy), 6.0, TEXT);
 }
 
-struct Param {
-    name: &'static str,
-    lo: f32,
-    hi: f32,
-    val: f32,
-    suffix: &'static str,
-}
-
-fn param_row(ui: &mut Ui, p: &mut Param) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        let (r, _) = ui.allocate_exact_size(vec2(84.0, 18.0), Sense::hover());
-        ui.painter()
-            .text(r.left_center(), Align2::LEFT_CENTER, p.name, FontId::monospace(11.0), MUTED);
-        let w = (ui.available_width() - 70.0).max(20.0);
-        slider(ui, &mut p.val, p.lo, p.hi, w);
-        let (r, _) = ui.allocate_exact_size(vec2(60.0, 20.0), Sense::hover());
-        ui.painter().rect_filled(r, 4.0, rgba(0, 0, 0, 77));
-        ui.painter().text(
-            r.center(),
-            Align2::CENTER_CENTER,
-            format!("{}{}", p.val as i32, p.suffix),
-            FontId::monospace(11.0),
-            TEXT,
-        );
-    });
-}
-
-// ------------------------------------------------------------------ timeline
-const RULER: f32 = 28.0;
-const PAD: f32 = 12.0;
-const LEFT: f32 = 6.0;
-const LABEL: f32 = 15.0;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool {
-    Select,
-    Ripple,
-    Slip,
-    Rect,
-    Razor,
-    Zoom,
-    Hand,
-}
-
-impl Tool {
-    fn ico(self) -> Ico {
-        match self {
-            Tool::Select => Ico::Select,
-            Tool::Ripple => Ico::Ripple,
-            Tool::Slip => Ico::Slip,
-            Tool::Rect => Ico::Rect,
-            Tool::Razor => Ico::Razor,
-            Tool::Zoom => Ico::Zoom,
-            Tool::Hand => Ico::Hand,
-        }
+/// Monitor picture for one frame: the raw video when no effect is active (and it is 16:9),
+/// otherwise the frame composited into a 16:9 canvas with the clip's effects applied.
+fn preview_image(f: &media::Frame, params: &[f32; NPARAM]) -> (ColorImage, f32) {
+    let asp = f.w as f32 / f.h.max(1) as f32;
+    let neutral = (0..NPARAM).all(|i| (params[i] - PARAMS[i].def).abs() < 1e-4);
+    if neutral && (asp - 16.0 / 9.0).abs() < 0.02 {
+        // alpha is always 255 after the RGBA conversion, so premultiplied == straight
+        return (ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba), asp);
     }
-}
-
-const TOOLS: [(Tool, &str); 7] = [
-    (Tool::Select, "Select (A)"),
-    (Tool::Ripple, "Trim (T)"),
-    (Tool::Slip, "Position (P)"),
-    (Tool::Rect, "Range (R)"),
-    (Tool::Razor, "Blade (B)"),
-    (Tool::Zoom, "Zoom (Z)"),
-    (Tool::Hand, "Hand (H)"),
-];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Zone {
-    Body,
-    Left,
-    Right,
-}
-
-/// An in-flight mouse drag on a clip. `pre` is both the undo snapshot and the origin every
-/// frame is recomputed from (so dragging never accumulates error).
-struct Drag {
-    zone: Zone,
-    id: u32,
-    grab_t: f64,
-    pre: Vec<Clip>,
-    tool: Tool,
-    moved: bool,
-    changed: bool,
-}
-
-struct Timeline {
-    pps: f64,
-    scroll: f64,
-    tool: Tool,
-    sel: Option<u32>,
-    scrub: bool,
-    panning: bool,
-    last_t: f64,
-    drag: Option<Drag>,
-    snap_line: Option<f64>,
-}
-
-impl Timeline {
-    fn new() -> Self {
-        Self {
-            pps: 10.0,
-            scroll: 0.0,
-            tool: Tool::Select,
-            sel: None,
-            scrub: false,
-            panning: false,
-            last_t: 0.0,
-            drag: None,
-            snap_line: None,
-        }
-    }
-
-    fn x_of(&self, r: Rect, t: f64) -> f32 {
-        r.left() + LEFT + ((t - self.scroll) * self.pps) as f32
-    }
-    fn t_of(&self, r: Rect, x: f32) -> f64 {
-        (x - r.left() - LEFT) as f64 / self.pps + self.scroll
-    }
-
-    fn lane(&self, lane: Lane, h: f32) -> (f32, f32) {
-        let avail = (h - RULER - 2.0 * PAD).max(120.0);
-        let conn = (avail * 0.20).clamp(40.0, 64.0);
-        let main = (avail * 0.36).clamp(64.0, 112.0);
-        let aud = (avail * 0.17).clamp(34.0, 58.0);
-        let yc = RULER + PAD;
-        let ym = yc + conn + 8.0;
-        let ya = ym + main + 8.0;
-        match lane {
-            Lane::Conn => (yc, conn),
-            Lane::Main => (ym, main),
-            Lane::Audio => (ya, aud),
-        }
-    }
-
-    fn zoom_at(&mut self, f: f64, anchor: f64) {
-        let dx = (anchor - self.scroll) * self.pps;
-        self.pps = (self.pps * f).clamp(2.0, 200.0);
-        self.scroll = (anchor - dx / self.pps).max(0.0);
-    }
-
-    /// Clip under the pointer and which part of it (body / trim handles).
-    fn hit(&self, proj: &Project, rect: Rect, pos: Pos2) -> Option<(usize, Zone)> {
-        let t = self.t_of(rect, pos.x);
-        let y = pos.y - rect.top();
-        for lane in [Lane::Conn, Lane::Main, Lane::Audio] {
-            let (ly, lh) = self.lane(lane, rect.height());
-            if y >= ly && y < ly + lh {
-                for (i, c) in proj.clips.iter().enumerate().rev() {
-                    if c.lane == lane && c.start <= t && t <= c.end() {
-                        let (x0, x1) = (self.x_of(rect, c.start), self.x_of(rect, c.end()));
-                        let edge = if x1 - x0 > 28.0 { 7.0 } else { 0.0 };
-                        let zone = if pos.x - x0 < edge {
-                            Zone::Left
-                        } else if x1 - pos.x < edge {
-                            Zone::Right
-                        } else {
-                            Zone::Body
-                        };
-                        return Some((i, zone));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Applies one frame of a drag (snapping included). True if the project differs from `d.pre`.
-    fn drag_step(&mut self, proj: &mut Project, d: &Drag, tt: f64, playhead: f64) -> bool {
-        let Some(o) = d.pre.iter().find(|c| c.id == d.id).cloned() else { return false };
-        let ids = proj.group_ids(d.id);
-        let thr = 8.0 / self.pps;
-        let mut targets = proj.snap_targets(&ids);
-        targets.push(playhead);
-        self.snap_line = None;
-
-        let op = match (d.zone, d.tool) {
-            (Zone::Body, Tool::Slip) => DragOp::Slip { delta: tt - d.grab_t },
-            (Zone::Body, _) => {
-                let mut ns = (tt - (d.grab_t - o.start)).max(0.0);
-                let head = nearest(&targets, ns, thr).map(|x| (x - ns, x));
-                let tail = nearest(&targets, ns + o.dur, thr).map(|x| (x - (ns + o.dur), x));
-                let pick = match (head, tail) {
-                    (Some(a), Some(b)) => Some(if a.0.abs() <= b.0.abs() { a } else { b }),
-                    (a, None) => a,
-                    (None, b) => b,
-                };
-                if let Some((delta, line)) = pick {
-                    ns += delta;
-                    self.snap_line = Some(line);
-                }
-                DragOp::Move { new_start: ns }
-            }
-            (Zone::Left, _) => {
-                let mut ns = tt;
-                if let Some(x) = nearest(&targets, ns, thr) {
-                    ns = x;
-                    self.snap_line = Some(x);
-                }
-                DragOp::TrimL { new_start: ns }
-            }
-            (Zone::Right, tool) => {
-                let mut ne = tt;
-                if let Some(x) = nearest(&targets, ne, thr) {
-                    ne = x;
-                    self.snap_line = Some(x);
-                }
-                DragOp::TrimR { new_end: ne, ripple: tool == Tool::Ripple }
-            }
-        };
-        proj.apply_drag(&d.pre, d.id, op)
-    }
-
-    /// Returns (edited, seeked).
-    fn show(&mut self, ui: &mut Ui, rect: Rect, t: &mut f64, proj: &mut Project, assets: &Assets) -> (bool, bool) {
-        let (mut edited, mut seeked) = (false, false);
-        let (hover, pressed, down, delta, scroll_y, zoom) = ui.input(|i| {
-            (
-                i.pointer.hover_pos(),
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.delta(),
-                i.raw_scroll_delta.y,
-                i.zoom_delta(),
-            )
-        });
-        let over = ui.rect_contains_pointer(rect);
-
-        // press
-        if over && pressed {
-            if let Some(pos) = hover {
-                let mut handled = false;
-                if pos.y - rect.top() >= RULER {
-                    if let Some((i, zone)) = self.hit(proj, rect, pos) {
-                        let id = proj.clips[i].id;
-                        let tt = self.t_of(rect, pos.x);
-                        if self.tool == Tool::Razor {
-                            edited |= proj.split(id, tt);
-                        } else {
-                            self.sel = Some(id);
-                            if matches!(self.tool, Tool::Select | Tool::Ripple | Tool::Slip) {
-                                let zone = if self.tool == Tool::Slip { Zone::Body } else { zone };
-                                self.drag = Some(Drag {
-                                    zone,
-                                    id,
-                                    grab_t: tt,
-                                    pre: proj.clips.clone(),
-                                    tool: self.tool,
-                                    moved: false,
-                                    changed: false,
-                                });
-                            }
-                        }
-                        handled = true;
-                    } else {
-                        self.sel = None;
-                    }
-                }
-                if !handled {
-                    if self.tool == Tool::Hand {
-                        self.panning = true;
-                    } else {
-                        self.scrub = true;
-                        *t = self.t_of(rect, pos.x).clamp(0.0, duration());
-                        seeked = true;
-                    }
-                }
-            }
-        }
-        // clip drag (move / trim / slip). Recomputed from the pre-drag state every frame.
-        if let Some(mut d) = self.drag.take() {
-            if down {
-                if let Some(p) = hover {
-                    let tt = self.t_of(rect, p.x);
-                    if d.moved || (tt - d.grab_t).abs() * self.pps > 3.0 {
-                        d.moved = true; // small dead zone so a plain click never edits
-                        d.changed = self.drag_step(proj, &d, tt, *t);
-                    }
-                }
-                self.drag = Some(d);
-            } else {
-                self.snap_line = None;
-                if d.changed {
-                    if d.zone == Zone::Body && d.tool != Tool::Slip {
-                        proj.resolve_overwrite(d.id);
-                    }
-                    proj.push_undo(d.pre);
-                    edited = true;
-                }
-            }
-        }
-        // cursor feedback
-        if let Some(d) = &self.drag {
-            ui.ctx().set_cursor_icon(if d.zone == Zone::Body { CursorIcon::Grabbing } else { CursorIcon::ResizeHorizontal });
-        } else if over && !self.scrub && matches!(self.tool, Tool::Select | Tool::Ripple) {
-            if let Some((_, z)) = hover.and_then(|p| self.hit(proj, rect, p)) {
-                if z != Zone::Body {
-                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                }
-            }
-        }
-        // drag
-        if self.scrub || self.panning {
-            if down {
-                if self.scrub {
-                    if let Some(p) = hover {
-                        *t = self.t_of(rect, p.x).clamp(0.0, duration());
-                        seeked = true;
-                    }
-                } else {
-                    self.scroll = (self.scroll - delta.x as f64 / self.pps).max(0.0);
-                }
-            } else {
-                self.scrub = false;
-                self.panning = false;
-            }
-        }
-        // wheel
-        if over {
-            if zoom != 1.0 {
-                if let Some(p) = hover {
-                    let a = self.t_of(rect, p.x);
-                    self.zoom_at(zoom as f64, a);
-                }
-            } else if scroll_y != 0.0 {
-                self.scroll = (self.scroll - scroll_y as f64 * 0.8 / self.pps).max(0.0);
-            }
-        }
-        // follow playhead when it moves out of view (playback / keyboard seek)
-        if !self.scrub && (*t - self.last_t).abs() > 1e-9 {
-            let vw = (rect.width() - LEFT) as f64 / self.pps;
-            if *t < self.scroll || *t > self.scroll + vw {
-                self.scroll = (*t - vw * 0.1).max(0.0);
-            }
-        }
-        self.last_t = *t;
-
-        self.paint(ui, rect, *t, if over && !self.scrub { hover } else { None }, proj, assets);
-        (edited, seeked)
-    }
-
-    fn paint(&self, ui: &Ui, rect: Rect, t: f64, hover: Option<Pos2>, proj: &Project, assets: &Assets) {
-        let p = ui.painter_at(rect);
-        let font = FontId::monospace(8.0);
-
-        // ruler
-        p.rect_filled(Rect::from_min_size(rect.min, vec2(rect.width(), RULER)), 0.0, rgba(40, 48, 70, 180));
-        p.rect_filled(
-            Rect::from_min_size(pos2(rect.left(), rect.top() + RULER - 1.0), vec2(rect.width(), 1.0)),
-            0.0,
-            rgba(110, 125, 170, 100),
-        );
-        let step = [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0]
-            .into_iter()
-            .find(|s| s * self.pps >= 90.0)
-            .unwrap_or(600.0);
-        let mut tt = (self.scroll / step).floor() * step;
-        let ry = rect.top() + RULER;
-        loop {
-            let x = self.x_of(rect, tt);
-            if x > rect.right() {
-                break;
-            }
-            p.line_segment([pos2(x, ry - 10.0), pos2(x, ry - 1.0)], Stroke::new(1.0, rgba(139, 148, 158, 140)));
-            let s = tt as u64;
-            p.text(
-                pos2(x + 4.0, rect.top() + (RULER - 6.0) / 2.0),
-                Align2::LEFT_CENTER,
-                format!("{:02}:{:02}:{:02}:00", s / 3600, s / 60 % 60, s % 60),
-                font.clone(),
-                rgba(139, 148, 158, 200),
-            );
-            let sub = Stroke::new(1.0, rgba(110, 125, 170, 100));
-            for k in 1..5 {
-                let tx = x + k as f32 * step as f32 * self.pps as f32 / 5.0;
-                p.line_segment([pos2(tx, ry - 5.0), pos2(tx, ry - 1.0)], sub);
-            }
-            tt += step;
-        }
-
-        // clips
-        for c in &proj.clips {
-            self.draw_clip(ui, &p, rect, c, self.sel == Some(c.id), &font, assets);
-        }
-
-        // snap guide
-        if let Some(st) = self.snap_line {
-            let x = self.x_of(rect, st);
-            p.line_segment(
-                [pos2(x, rect.top() + RULER), pos2(x, rect.bottom())],
-                Stroke::new(1.0, rgba(255, 214, 102, 220)),
-            );
-        }
-
-        // hover line
-        if let Some(h) = hover {
-            p.line_segment(
-                [pos2(h.x, rect.top() + RULER), pos2(h.x, rect.bottom())],
-                Stroke::new(1.0, rgba(201, 209, 217, 120)),
-            );
-        }
-
-        // playhead
-        let x = self.x_of(rect, t);
-        if x >= rect.left() && x <= rect.right() {
-            p.line_segment([pos2(x, rect.top() + 12.0), pos2(x, rect.bottom())], Stroke::new(1.5, TEXT));
-            p.add(Shape::convex_polygon(
-                vec![
-                    pos2(x - 5.0, rect.top() + 3.0),
-                    pos2(x + 5.0, rect.top() + 3.0),
-                    pos2(x, rect.top() + 11.0),
-                ],
-                TEXT,
-                Stroke::NONE,
-            ));
-        }
-    }
-
-    fn draw_clip(&self, ui: &Ui, p: &Painter, rect: Rect, c: &Clip, selected: bool, font: &FontId, assets: &Assets) {
-        let (y, hh) = self.lane(c.lane, rect.height());
-        let y = rect.top() + y;
-        let x0 = self.x_of(rect, c.start);
-        let x1 = self.x_of(rect, c.start + c.dur);
-        if x1 < rect.left() || x0 > rect.right() {
-            return; // culled
-        }
-        let r = Rect::from_min_max(pos2(x0 + 0.5, y), pos2((x1 - 0.5).max(x0 + 1.5), y + hh));
-        let p = p.with_clip_rect(r.intersect(p.clip_rect()));
-
-        match c.lane {
-            Lane::Audio => {
-                p.rect_filled(r, 0.0, rgba(40, 50, 70, 200));
-                let mid = y + LABEL + (hh - LABEL) / 2.0;
-                let amp = (hh - LABEL - 6.0) / 2.0;
-                let w = wave();
-                let mut m = Mesh::default();
-                let mut x = x0.max(rect.left());
-                let xe = x1.min(rect.right());
-                while x < xe {
-                    let tt = (x - x0) as f64 / self.pps + c.src_off;
-                    let a = match c.media {
-                        Some(mid) => assets
-                            .peak(mid, tt, tt + 2.0 / self.pps)
-                            .map_or(1.0, |pk| pk.min(1.0).powf(0.6) * amp),
-                        None => w[((tt * 20.0) as usize).min(w.len() - 1)] * amp,
-                    }
-                    .max(0.6);
-                    m.add_colored_rect(
-                        Rect::from_min_max(pos2(x, mid - a), pos2(x + 1.0, mid + a)),
-                        VISTA,
-                    );
-                    x += 2.0;
-                }
-                p.add(Shape::mesh(m));
-            }
-            _ if c.name.starts_with("Title") => {
-                let mut m = Mesh::default();
-                push_rect_gradient(&mut m, r, rgba(50, 64, 92, 255), rgba(30, 38, 56, 255));
-                p.add(Shape::mesh(m));
-            }
-            _ => {
-                let th = hh - LABEL;
-                let asp = c.media.and_then(|mid| assets.aspect(mid)).unwrap_or(16.0 / 9.0);
-                let tw = (th * asp).max(24.0);
-                let ty = y + LABEL;
-                let mut i = ((rect.left() - x0).max(0.0) / tw) as u32;
-                let mut x = x0 + i as f32 * tw;
-                let mut m = Mesh::default();
-                while x < x1.min(rect.right()) {
-                    let tile = Rect::from_min_size(pos2(x, ty), vec2(tw + 1.0, th));
-                    let src_t = c.src_off + ((x + tw * 0.5 - x0) as f64 / self.pps);
-                    match c.media.and_then(|mid| assets.thumb_at(mid, src_t)) {
-                        Some((tex, _)) => {
-                            p.image(tex.id(), tile, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                        }
-                        None => {
-                            let hue = thumb_hue(c.seed, i);
-                            push_rect_gradient(&mut m, tile, hsv(hue, 35.0, 55.0), hsv(hue, 45.0, 25.0));
-                        }
-                    }
-                    x += tw;
-                    i += 1;
-                }
-                p.add(Shape::mesh(m));
-            }
-        }
-        p.rect_filled(
-            Rect::from_min_size(pos2(x0, y), vec2(x1 - x0, LABEL)),
-            0.0,
-            rgba(40, 48, 70, 230),
-        );
-        if x1 - x0 > 40.0 {
-            let g = elided(ui, &c.name, font.clone(), TEXT, x1 - x0 - 12.0);
-            p.galley(pos2(x0 + 6.0, y + (LABEL - g.size().y) / 2.0), g, TEXT);
-        }
-        if selected {
-            ui.painter_at(rect).rect_stroke(r, 4.0, Stroke::new(2.0, TEXT));
-        }
-    }
+    let cw = f.w.max(320) & !1;
+    let ch = (cw * 9 / 16) & !1;
+    let mut buf = vec![0u8; cw * ch * 4];
+    fxrender::render(&f.rgba, f.w, f.h, params, &mut buf, cw, ch);
+    (ColorImage::from_rgba_premultiplied([cw, ch], &buf), cw as f32 / ch as f32)
 }
 
 fn level_meter(ui: &Ui, rect: Rect, l: f32, r: f32) {
@@ -840,6 +357,8 @@ fn level_meter(ui: &Ui, rect: Rect, l: f32, r: f32) {
 
 // ------------------------------------------------------------------ panels
 const FITS: [&str; 4] = ["Fit", "25%", "50%", "100%"];
+/// Playback resolution: decode + preview at full / half / quarter size (smoother on heavy footage).
+const QUALITIES: [(&str, u32); 3] = [("Full", 1), ("1/2", 2), ("1/4", 4)];
 
 fn monitor_panel(
     ui: &mut Ui,
@@ -847,6 +366,7 @@ fn monitor_panel(
     t: f64,
     playing: bool,
     fit: &mut usize,
+    quality: &mut usize,
     video: Option<(TextureId, f32)>,
 ) -> bool {
     let mut play = false;
@@ -860,6 +380,12 @@ fn monitor_panel(
                         ui.selectable_value(fit, i, *f);
                     }
                 });
+                ComboBox::from_id_salt("quality").selected_text(QUALITIES[*quality].0).show_ui(ui, |ui| {
+                    for (i, (name, _)) in QUALITIES.iter().enumerate() {
+                        ui.selectable_value(quality, i, *name);
+                    }
+                });
+                ui.label(RichText::new("Playback").size(10.0).color(MUTED));
             });
         });
 
@@ -903,125 +429,13 @@ fn monitor_panel(
     play
 }
 
-struct Inspector {
-    tab: usize,
-    sections: Vec<(&'static str, Vec<Param>)>,
-}
-
-impl Inspector {
-    fn new() -> Self {
-        let p = |name, lo, hi, val, suffix| Param { name, lo, hi, val, suffix };
-        Self {
-            tab: 0,
-            sections: vec![
-                (
-                    "Transform",
-                    vec![
-                        p("Position X", 0.0, 1920.0, 960.0, ""),
-                        p("Position Y", 0.0, 1080.0, 540.0, ""),
-                        p("Scale", 0.0, 400.0, 100.0, "%"),
-                        p("Rotation", -180.0, 180.0, 0.0, "\u{00B0}"),
-                    ],
-                ),
-                ("Compositing", vec![p("Opacity", 0.0, 100.0, 100.0, "%")]),
-                ("Speed", vec![p("Rate", 10.0, 400.0, 100.0, "%")]),
-            ],
-        }
-    }
-}
-
-fn graph_widget(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-    let p = ui.painter_at(rect);
-    let (w, h) = (rect.width(), rect.height());
-    let at = |fx: f32, fy: f32| pos2(rect.left() + w * fx, rect.top() + h * fy);
-
-    p.rect_filled(rect, 8.0, rgba(30, 35, 48, 180));
-    let grid = Stroke::new(1.0, rgba(110, 125, 170, 80));
-    for i in 1..5 {
-        let x = rect.left() + w * i as f32 / 5.0;
-        let y = rect.top() + 34.0 + (h - 52.0) * i as f32 / 5.0;
-        p.line_segment([pos2(x, rect.top() + 34.0), pos2(x, rect.bottom() - 18.0)], grid);
-        p.line_segment([pos2(rect.left() + 16.0, y), pos2(rect.right() - 16.0, y)], grid);
-    }
-    p.text(
-        pos2(rect.left() + 16.0, rect.top() + 19.0),
-        Align2::LEFT_CENTER,
-        "Value graph",
-        FontId::monospace(9.0),
-        MUTED,
-    );
-
-    let (a, b) = (at(0.10, 0.80), at(0.90, 0.24));
-    let (c1, c2) = (at(0.45, 0.80), at(0.55, 0.24));
-    let dash = Stroke::new(1.0, rgba(139, 148, 158, 120));
-    p.extend(Shape::dashed_line(&[a, c1], dash, 4.0, 3.0));
-    p.extend(Shape::dashed_line(&[b, c2], dash, 4.0, 3.0));
-    p.add(CubicBezierShape::from_points_stroke(
-        [a, c1, c2, b],
-        false,
-        Color32::TRANSPARENT,
-        Stroke::new(2.0, TEXT),
-    ));
-    for pt in [c1, c2] {
-        p.circle_filled(pt, 4.0, VISTA);
-    }
-    for pt in [a, b] {
-        p.add(Shape::convex_polygon(
-            vec![
-                pos2(pt.x, pt.y - 5.0),
-                pos2(pt.x + 5.0, pt.y),
-                pos2(pt.x, pt.y + 5.0),
-                pos2(pt.x - 5.0, pt.y),
-            ],
-            TEXT,
-            Stroke::NONE,
-        ));
-    }
-}
-
 fn placeholder(ui: &mut Ui, text: &str) {
     ui.centered_and_justified(|ui| {
         ui.label(RichText::new(text).color(MUTED).size(13.0));
     });
 }
 
-fn inspector_panel(ui: &mut Ui, ins: &mut Inspector) {
-    glass(14.0, 8.0, 14.0, 12.0).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
-        ui.spacing_mut().item_spacing.y = 4.0;
-        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Text", "Essential Graphics"]);
-        match ins.tab {
-            0 => {
-                ui.add_space(8.0);
-                let avail = ui.available_rect_before_wrap();
-                let lw = (avail.width() - 14.0) * 5.0 / 9.0;
-                let left = Rect::from_min_size(avail.min, vec2(lw, avail.height()));
-                let right = Rect::from_min_max(pos2(left.right() + 14.0, avail.top()), avail.max);
-                ui.allocate_ui_at_rect(left, |ui| {
-                    ui.spacing_mut().item_spacing.y = 7.0;
-                    ui.horizontal(|ui| {
-                        ui.label("2026-10-13_06-45-06.mp4");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(fmt_tc(duration())).color(MUTED));
-                        });
-                    });
-                    for (name, params) in ins.sections.iter_mut() {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(*name).color(POWDER).strong());
-                        for p in params.iter_mut() {
-                            param_row(ui, p);
-                        }
-                    }
-                });
-                ui.allocate_ui_at_rect(right, graph_widget);
-            }
-            1 => placeholder(ui, "Text"),
-            _ => placeholder(ui, "Essential Graphics"),
-        }
-    });
-}
-
+#[allow(dead_code)]
 const CLIP_NAMES: [&str; 10] = [
     "Cabana", "Mountain gold", "Jungle forest", "Hammock", "Waterfall", "Beach", "Pool", "Rocks", "Trail", "Canopy",
 ];
@@ -1039,18 +453,17 @@ struct Browser {
     sel: usize,
     search: String,
     fx_sel: Option<&'static str>,
-    media_sel: usize,
 }
 
 /// Returns the media id the user asked to add to the timeline (double-click).
-fn browser_panel(ui: &mut Ui, b: &mut Browser, proj: &Project) -> Option<u32> {
+fn browser_panel(ui: &mut Ui, b: &mut Browser, proj: &Project, assets: &Assets, drag: &mut Option<u32>) -> Option<u32> {
     let mut add = None;
     glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.spacing_mut().item_spacing.y = 8.0;
         tab_strip(ui, &mut b.tab, &["Clips", "Effects", "Media"]);
         match b.tab {
-            0 => thumb_grid(ui, &mut b.sel),
+            0 => add = media_grid(ui, proj, assets, &mut b.sel, drag),
             1 => {
                 ui.add(
                     TextEdit::singleline(&mut b.search)
@@ -1083,35 +496,101 @@ fn browser_panel(ui: &mut Ui, b: &mut Browser, proj: &Project) -> Option<u32> {
                     }
                 });
             }
-            _ => add = media_list(ui, proj, &mut b.media_sel),
+            _ => add = media_list(ui, proj, &mut b.sel, drag),
         }
     });
     add
 }
 
-fn media_list(ui: &mut Ui, proj: &Project, sel: &mut usize) -> Option<u32> {
+fn fmt_len(sec: f64) -> String {
+    let s = sec.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// The Clips tab: one card per imported file with its real thumbnail. Click selects,
+/// double-click appends to the timeline, dragging it onto a track places it there.
+fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
     if proj.media.is_empty() {
         placeholder(ui, "Drop video files onto the window to import them.");
         return None;
     }
-    ui.label(RichText::new("Double-click to add to the timeline").size(10.0).color(MUTED));
+    let mut add = None;
+    ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        let gap = 8.0;
+        let cell_w = ((ui.available_width() - gap) / 2.0).floor().max(60.0);
+        let thumb_h = (cell_w * 9.0 / 16.0).floor();
+        let cell_h = thumb_h + 22.0;
+        let rows = proj.media.len().div_ceil(2) as f32;
+        let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), rows * (cell_h + gap)), Sense::hover());
+        for (i, m) in proj.media.iter().enumerate() {
+            let x = area.left() + (i % 2) as f32 * (cell_w + gap);
+            let y = area.top() + (i / 2) as f32 * (cell_h + gap);
+            let cell = Rect::from_min_size(pos2(x, y), vec2(cell_w, cell_h));
+            let tr = Rect::from_min_size(cell.min, vec2(cell_w, thumb_h));
+            let resp = ui.interact(cell, ui.id().with(("media_cell", m.id)), Sense::click_and_drag());
+            let p = ui.painter();
+            match assets.thumb_at(m.id, 0.0) {
+                Some((tex, _)) => {
+                    p.image(tex.id(), tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None => rounded_gradient(p, tr, 4.0, hsv(thumb_hue(m.seed, 0), 35.0, 55.0), hsv(thumb_hue(m.seed, 0), 45.0, 25.0)),
+            }
+            let on = *sel == i;
+            p.rect_stroke(tr, 4.0, Stroke::new(if on { 2.0 } else { 1.0 }, if on { TEXT } else { rgba(110, 125, 170, 120) }));
+            if m.duration > 0.0 {
+                let badge = Rect::from_min_size(pos2(tr.right() - 44.0, tr.bottom() - 17.0), vec2(40.0, 13.0));
+                p.rect_filled(badge, 3.0, rgba(0, 0, 0, 150));
+                p.text(badge.center(), Align2::CENTER_CENTER, fmt_len(m.duration), FontId::monospace(8.0), TEXT);
+            }
+            let g = elided(ui, &m.name, FontId::monospace(9.0), if on { TEXT } else { MUTED }, cell_w);
+            p.galley(pos2(cell.left(), tr.bottom() + 4.0), g, MUTED);
+            if resp.clicked() {
+                *sel = i;
+            }
+            if resp.double_clicked() {
+                add = Some(m.id);
+            }
+            if resp.drag_started() {
+                *sel = i;
+                *drag = Some(m.id);
+            }
+        }
+    });
+    add
+}
+
+fn media_list(ui: &mut Ui, proj: &Project, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
+    if proj.media.is_empty() {
+        placeholder(ui, "Drop video files onto the window to import them.");
+        return None;
+    }
+    ui.label(RichText::new("Double-click to append - drag onto a track (Ctrl = insert)").size(10.0).color(MUTED));
     let mut add = None;
     ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
         for (i, m) in proj.media.iter().enumerate() {
             let len = if m.duration > 0.0 { fmt_tc(m.duration) } else { "--".into() };
             let text = format!("{}   {}{}", m.name, len, if m.has_audio { "" } else { "   (no audio)" });
-            let r = ui.selectable_label(*sel == i, text);
+            let r = ui.selectable_label(*sel == i, text).interact(Sense::click_and_drag());
             if r.clicked() {
                 *sel = i;
             }
             if r.double_clicked() {
                 add = Some(m.id);
             }
+            if r.drag_started() {
+                *sel = i;
+                *drag = Some(m.id);
+            }
         }
     });
     add
 }
 
+#[allow(dead_code)]
 fn thumb_grid(ui: &mut Ui, sel: &mut usize) {
     const GAP: f32 = 10.0;
     const LBL: f32 = 22.0;
@@ -1156,44 +635,6 @@ fn thumb_grid(ui: &mut Ui, sel: &mut usize) {
                 p.galley(pos2(x, y + th + 3.0 + (LBL - 3.0 - g.size().y) / 2.0), g, col);
             }
         });
-}
-
-/// Returns (edited, seeked).
-fn timeline_panel(
-    ui: &mut Ui,
-    tl: &mut Timeline,
-    t: &mut f64,
-    project: &str,
-    levels: (f32, f32),
-    proj: &mut Project,
-    assets: &Assets,
-) -> (bool, bool) {
-    let mut out = (false, false);
-    glass(12.0, 8.0, 12.0, 10.0).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
-        ui.spacing_mut().item_spacing.y = 6.0;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (tool, tip) in TOOLS {
-                let (_, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
-                paint_icon_btn(ui, &resp, tool.ico(), tl.tool == tool, 18.0);
-                if resp.on_hover_text(tip).clicked() {
-                    tl.tool = tool;
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(fmt_tc(duration())).color(MUTED));
-                ui.label(project);
-            });
-        });
-        let full = ui.available_rect_before_wrap();
-        let meter = Rect::from_min_max(pos2(full.right() - 36.0, full.top()), full.max);
-        let view = Rect::from_min_max(full.min, pos2(meter.left() - 6.0, full.bottom()));
-        ui.allocate_rect(full, Sense::hover());
-        out = tl.show(ui, view, t, proj, assets);
-        level_meter(ui, meter, levels.0, levels.1);
-    });
-    out
 }
 
 // ------------------------------------------------------------------ title bar
@@ -1279,7 +720,7 @@ struct App {
     levels: (f32, f32),
     fit: usize,
     timeline: Timeline,
-    inspector: Inspector,
+    inspector: fxui::Inspector,
     browser: Browser,
     proj: Project,
     engine: engine::Engine,
@@ -1288,6 +729,11 @@ struct App {
     tex_aspect: f32,
     assets: Assets,
     project_path: Option<std::path::PathBuf>,
+    quality_idx: usize,
+    applied_quality: usize,
+    drag_media: Option<u32>,
+    ghost: Option<Ghost>,
+    last_params: Option<[f32; NPARAM]>,
 }
 
 impl App {
@@ -1301,8 +747,8 @@ impl App {
             levels: (0.0, 0.0),
             fit: 0,
             timeline: Timeline::new(),
-            inspector: Inspector::new(),
-            browser: Browser { tab: 0, sel: 0, search: String::new(), fx_sel: None, media_sel: 0 },
+            inspector: fxui::Inspector::new(),
+            browser: Browser { tab: 0, sel: 0, search: String::new(), fx_sel: None },
             proj: Project::demo(),
             engine: engine::Engine::new(),
             jumped: false,
@@ -1310,6 +756,11 @@ impl App {
             tex_aspect: 16.0 / 9.0,
             assets: Assets::new(),
             project_path: None,
+            quality_idx: 1, // 1/2 resolution: snappy by default
+            applied_quality: 1,
+            drag_media: None,
+            ghost: None,
+            last_params: None,
         }
     }
 
@@ -1358,10 +809,10 @@ impl App {
                 }
                 self.tex = None;
                 self.t = 0.0;
-                self.timeline.sel = None;
+                self.timeline.sel.clear();
                 self.timeline.scroll = 0.0;
                 self.after_edit();
-                self.timeline.pps = (900.0 / duration()).clamp(2.0, 200.0);
+                self.timeline.fit(duration());
                 if let Some(stem) = path.file_stem() {
                     self.project = stem.to_string_lossy().into_owned();
                 }
@@ -1376,11 +827,8 @@ impl App {
     fn after_edit(&mut self) {
         set_duration(self.proj.end().max(10.0));
         self.t = self.t.min(duration());
-        if let Some(id) = self.timeline.sel {
-            if self.proj.clip(id).is_none() {
-                self.timeline.sel = None;
-            }
-        }
+        let proj = &self.proj;
+        self.timeline.sel.retain(|id| proj.clip(*id).is_some());
         self.jumped = true;
         self.dirty = true;
     }
@@ -1420,40 +868,25 @@ impl App {
         }
     }
 
+    /// Previous (-1) / next (+1) cut on any track.
+    fn edit_point(&self, dir: i32) -> f64 {
+        let tg = self.proj.snap_targets(&[]);
+        if dir < 0 {
+            tg.into_iter().filter(|e| *e < self.t - 1e-3).fold(0.0, f64::max)
+        } else {
+            tg.into_iter().filter(|e| *e > self.t + 1e-3).fold(f64::INFINITY, f64::min).min(duration())
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &Context) {
         if ctx.wants_keyboard_input() {
             return;
         }
         let k = |key: Key, m: Modifiers| ctx.input_mut(|i| i.consume_key(m, key));
-        let (none, cmd) = (Modifiers::NONE, Modifiers::COMMAND);
+        let (none, cmd, shift) = (Modifiers::NONE, Modifiers::COMMAND, Modifiers::SHIFT);
 
-        if k(Key::B, cmd) || k(Key::K, cmd) {
-            if self.proj.cut_at(self.t) {
-                self.after_edit();
-            }
-        }
-        // undo / redo
-        if k(Key::Z, cmd | Modifiers::SHIFT) || k(Key::Y, cmd) {
-            if self.proj.redo() {
-                self.after_edit();
-            }
-        } else if k(Key::Z, cmd) {
-            if self.proj.undo() {
-                self.after_edit();
-            }
-        }
-        // delete: Delete = lift (leave a gap), Shift+Delete = ripple (close the gap)
-        let ripple = k(Key::Delete, Modifiers::SHIFT) || k(Key::Backspace, Modifiers::SHIFT);
-        let lift = !ripple && (k(Key::Delete, none) || k(Key::Backspace, none));
-        if ripple || lift {
-            if let Some(id) = self.timeline.sel {
-                if self.proj.delete(id, ripple) {
-                    self.timeline.sel = None;
-                    self.after_edit();
-                }
-            }
-        }
-        if k(Key::S, cmd | Modifiers::SHIFT) {
+        // ---- file / history
+        if k(Key::S, cmd | shift) {
             self.save_project(true);
         } else if k(Key::S, cmd) {
             self.save_project(false);
@@ -1461,6 +894,49 @@ impl App {
         if k(Key::O, cmd) {
             self.open_project(ctx);
         }
+        if k(Key::Z, cmd | shift) || k(Key::Y, cmd) {
+            if self.proj.redo() {
+                self.after_edit();
+            }
+        } else if k(Key::Z, cmd) && self.proj.undo() {
+            self.after_edit();
+        }
+
+        // ---- editing
+        if (k(Key::K, cmd) || k(Key::B, cmd)) && self.proj.cut_at(self.t) {
+            self.after_edit(); // Add Edit
+        }
+        if k(Key::A, cmd) {
+            self.timeline.sel = self.proj.clips.iter().map(|c| c.id).collect();
+        }
+        if k(Key::L, cmd) {
+            let sel = self.timeline.sel.clone();
+            if self.proj.unlink(&sel) {
+                self.dirty = true;
+            }
+        }
+        // Delete = lift (leave a gap), Shift+Delete = ripple (close the gap)
+        let ripple = k(Key::Delete, shift) || k(Key::Backspace, shift);
+        let lift = !ripple && (k(Key::Delete, none) || k(Key::Backspace, none));
+        if ripple || lift {
+            let sel = self.timeline.sel.clone();
+            if self.proj.delete_many(&sel, ripple) {
+                self.timeline.sel.clear();
+                self.after_edit();
+            }
+        }
+        // `,` insert / `.` overwrite the media selected in the browser at the playhead (on V1)
+        let insert = k(Key::Comma, none);
+        let overwrite = k(Key::Period, none);
+        if insert || overwrite {
+            if let Some(m) = self.proj.media.get(self.browser.sel).map(|m| m.id) {
+                if self.proj.place_media(m, Lane::V1, self.t, insert).is_some() {
+                    self.after_edit();
+                }
+            }
+        }
+
+        // ---- transport
         if k(Key::Space, none) {
             self.toggle_play();
         }
@@ -1479,18 +955,27 @@ impl App {
         if k(Key::ArrowLeft, none) {
             self.seek(self.t - 1.0 / FPS);
         }
+        if k(Key::ArrowUp, none) {
+            let e = self.edit_point(-1);
+            self.seek(e);
+        }
+        if k(Key::ArrowDown, none) {
+            let e = self.edit_point(1);
+            self.seek(e);
+        }
         if k(Key::Home, none) {
             self.seek(0.0);
         }
         if k(Key::End, none) {
             self.seek(duration());
         }
+
+        // ---- tools (Premiere layout)
         for (key, tool) in [
-            (Key::A, Tool::Select),
-            (Key::T, Tool::Ripple),
-            (Key::P, Tool::Slip),
-            (Key::R, Tool::Rect),
-            (Key::B, Tool::Razor),
+            (Key::V, Tool::Select),
+            (Key::B, Tool::Ripple),
+            (Key::N, Tool::Rect),
+            (Key::Y, Tool::Slip),
             (Key::C, Tool::Razor),
             (Key::Z, Tool::Zoom),
             (Key::H, Tool::Hand),
@@ -1499,13 +984,17 @@ impl App {
                 self.timeline.tool = tool;
             }
         }
+        if k(Key::S, none) {
+            self.timeline.snap = !self.timeline.snap;
+        }
         if k(Key::Equals, none) || k(Key::Plus, none) {
-            let t = self.t;
-            self.timeline.zoom_at(1.25, t);
+            self.timeline.zoom_step(1.5, self.t);
         }
         if k(Key::Minus, none) {
-            let t = self.t;
-            self.timeline.zoom_at(0.8, t);
+            self.timeline.zoom_step(1.0 / 1.5, self.t);
+        }
+        if k(Key::Backslash, none) {
+            self.timeline.fit(self.proj.end().max(1.0));
         }
     }
 }
@@ -1565,19 +1054,25 @@ impl eframe::App for App {
             self.set_rate(0);
             self.after_edit();
             self.timeline.scroll = 0.0;
-            self.timeline.pps = (900.0 / duration()).clamp(2.0, 200.0);
+            self.timeline.fit(duration());
         }
 
         // playback engine: follow the playhead, switch decoders at cuts, pre-roll the next clip
         let jumped = std::mem::take(&mut self.jumped);
-        self.engine.update(ctx, &self.proj, self.t, self.rate == 1, jumped);
-        if let Some(f) = self.engine.poll(self.t) {
-            // alpha is always 255 after the RGBA conversion, so premultiplied == straight
-            let img = ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba);
-            self.tex_aspect = f.w as f32 / f.h.max(1) as f32;
-            match &mut self.tex {
-                Some(t) => t.set(img, TextureOptions::LINEAR),
-                None => self.tex = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
+        let muted = self.proj.audio_muted_at(self.t);
+        self.engine.update(ctx, &self.proj, self.t, self.rate == 1, jumped, muted);
+        // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
+        let new_frame = self.engine.poll(self.t).is_some();
+        let params = self.proj.video_clip_at(self.t).map(|c| c.fx.eval(c.fx_time(self.t)));
+        if new_frame || params != self.last_params {
+            self.last_params = params;
+            if let (Some(f), Some(pr)) = (self.engine.current(), params) {
+                let (img, aspect) = preview_image(f, &pr);
+                self.tex_aspect = aspect;
+                match &mut self.tex {
+                    Some(t) => t.set(img, TextureOptions::LINEAR),
+                    None => self.tex = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
+                }
             }
         }
         if !self.engine.is_active() {
@@ -1607,8 +1102,9 @@ impl eframe::App for App {
 
         let (mut edited, mut seeked, mut play) = (false, false, false);
         let mut add_media: Option<u32> = None;
+        let mut fx_changed = false;
         {
-            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, .. } = self;
+            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, ghost, .. } = self;
             let playing = *rate > 0;
 
             TopBottomPanel::bottom("bottom")
@@ -1625,10 +1121,10 @@ impl eframe::App for App {
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
                         .show_inside(ui, |ui| {
-                            add_media = browser_panel(ui, browser, proj);
+                            add_media = browser_panel(ui, browser, proj, assets, drag_media);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets);
+                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref());
                         edited |= r.0;
                         seeked |= r.1;
                     });
@@ -1643,9 +1139,11 @@ impl eframe::App for App {
                         .width_range(360.0..=1100.0)
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
-                        .show_inside(ui, |ui| inspector_panel(ui, inspector));
+                        .show_inside(ui, |ui| {
+                            fx_changed |= fxui::inspector_panel(ui, inspector, proj, &timeline.sel, *t);
+                        });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        play |= monitor_panel(ui, &label, *t, playing, fit, video);
+                        play |= monitor_panel(ui, &label, *t, playing, fit, quality_idx, video);
                     });
                 });
         }
@@ -1653,6 +1151,50 @@ impl eframe::App for App {
             if self.proj.append_media(id) {
                 edited = true;
             }
+        }
+        if fx_changed {
+            self.dirty = true;
+        }
+        if let Some(g) = self.inspector.goto.take() {
+            self.seek(g); // keyframe navigation
+        }
+        // playback resolution changed: every open decoder rescales, then we re-seek to refill
+        if self.quality_idx != self.applied_quality {
+            self.applied_quality = self.quality_idx;
+            self.engine.set_quality(QUALITIES[self.quality_idx].1);
+            self.jumped = true;
+            ctx.request_repaint();
+        }
+        // media dragged from the browser: ghost clip on the timeline, drop = overwrite (Ctrl = insert)
+        if let Some(mid) = self.drag_media {
+            let pointer = ctx.input(|i| i.pointer.hover_pos());
+            let released = ctx.input(|i| i.pointer.any_released());
+            let target = pointer.and_then(|p| self.timeline.drop_target(p, &self.proj, self.t));
+            let info = self.proj.media(mid).map(|m| (m.name.clone(), m.duration.max(1.0)));
+            self.ghost = match (target, &info) {
+                (Some((lane, start)), Some((name, dur))) => Some(Ghost { lane, start, dur: *dur, name: name.clone() }),
+                _ => None,
+            };
+            if let (Some(p), Some((name, _))) = (pointer, &info) {
+                egui::Area::new(Id::new("media_drag_label"))
+                    .fixed_pos(p + vec2(14.0, 14.0))
+                    .order(Order::Tooltip)
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(name).monospace().size(10.0).color(TEXT));
+                    });
+            }
+            if released {
+                if let Some((lane, start)) = target {
+                    let insert = ctx.input(|i| i.modifiers.command);
+                    if self.proj.place_media(mid, lane, start, insert).is_some() {
+                        edited = true;
+                    }
+                }
+                self.drag_media = None;
+                self.ghost = None;
+            }
+            ctx.request_repaint();
         }
         if edited {
             self.after_edit();

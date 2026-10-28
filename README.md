@@ -2,17 +2,37 @@
 
 A video editor written in Rust (egui + FFmpeg).
 
-## Controls
+## Getting media in
+Drag video files onto the window, or drag clips from the **Clips** tab onto a track
+(Ctrl while dropping = insert instead of overwrite). Double-click a clip to append it.
+
+## Timeline (Premiere-style)
 | | |
 |---|---|
-| Import | drag video files onto the window (they are appended to the timeline) |
-| Play / pause | Space  (J / K / L shuttle) |
-| Select / Trim / Position(slip) / Razor | V / T / P / B tools; click clips, drag body to move, drag edges to trim |
-| Blade at playhead | Ctrl+K (or Ctrl+B) |
+| Tools | V select, B ripple edit, N rolling edit, Y slip, C razor, Z zoom, H hand |
+| Select | click, Shift-click, drag a box; Alt-click selects a clip without its linked audio |
+| Move / trim | drag a clip (also between tracks); drag its edges to trim |
+| Add edit (blade all tracks) | Ctrl+K  (Razor tool + Shift = all tracks) |
 | Delete / ripple delete | Delete / Shift+Delete |
+| Snapping | S toggles (magnet pill); snaps to clip edges and the playhead |
+| Zoom | + / - , Alt+wheel or Ctrl+wheel at the cursor, \\ fits the project |
+| Play / shuttle | Space, J K L, arrow keys step a frame, Up/Down jump between cuts |
+| Insert / overwrite at playhead | `,` / `.` with a clip selected in the browser |
+| Track buttons | L locks a track, E hides a video track, M mutes an audio track |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) |
-| Save / Save as / Open | Ctrl+S / Ctrl+Shift+S / Ctrl+O  (`.yoru` files) |
+| Unlink video + audio | Ctrl+L |
+| Save / Save as / Open | Ctrl+S / Ctrl+Shift+S / Ctrl+O (`.yoru` files) |
+
+## Effect Controls
+Select a video clip. Every value has a stopwatch: click it to animate, then change values at
+different playhead positions to create keyframes (diamond button adds/removes one, arrows jump
+between them). The value graph shows the curve: drag keys, double-click to add one, right-click to
+remove, click a diamond to pick its easing.
+
+## Playback resolution
+The **Playback** menu above the monitor (Full, 1/2, 1/4) lowers the decode + preview resolution for
+smoother playback on heavy footage. Default is 1/2.
 
 ## Build
-`cargo build --release` needs FFmpeg dev libraries (CI installs them with vcpkg, see
-`.github/workflows/build.yml`). Unit tests for the editing logic: `cargo test project::`.
+`cargo build --release` needs the FFmpeg development libraries (CI installs them with vcpkg, see
+`.github/workflows/build.yml`). Unit tests: `cargo test`.

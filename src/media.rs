@@ -29,7 +29,7 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRe
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-const MAX_PREVIEW_W: u32 = 1280;
+const MAX_PREVIEW_W: u32 = 1920; // 'Full' playback resolution cap
 const VIDEO_QUEUE: usize = 8;
 
 // ------------------------------------------------------------------ public data
@@ -57,6 +57,8 @@ fn rational(r: ffmpeg::Rational) -> f64 {
 enum Cmd {
     Seek(f64, u64),
     Play(bool),
+    /// Preview resolution divisor: 1 = full, 2 = half, 4 = quarter.
+    Quality(u32),
 }
 
 pub struct VideoWorker {
@@ -71,6 +73,9 @@ pub struct VideoWorker {
     gen: u64,
     w: u32,
     h: u32,
+    src_w: u32,
+    src_h: u32,
+    max_w: u32,
 }
 
 impl VideoWorker {
@@ -108,8 +113,37 @@ impl VideoWorker {
             gen: 0,
             w,
             h,
+            src_w: sw,
+            src_h: sh,
+            max_w,
         };
         Ok((me, info))
+    }
+
+    /// Changes the output size on the fly (rebuilds the scaler). Frames already queued keep
+    /// their old size; the caller re-seeks so new ones arrive at the new size.
+    pub fn rescale(&mut self, div: u32) {
+        let div = div.clamp(1, 8);
+        let full = self.src_w.min(self.max_w);
+        let w = ((full / div) & !1).max(2);
+        let h = ((((self.src_h as u64 * w as u64) / self.src_w.max(1) as u64) as u32) & !1).max(2);
+        if (w, h) == (self.w, self.h) {
+            return;
+        }
+        if let Ok(sc) = scaling::Context::get(
+            self.dec.format(),
+            self.src_w,
+            self.src_h,
+            format::Pixel::RGBA,
+            w,
+            h,
+            scaling::Flags::BILINEAR,
+        ) {
+            self.scaler = sc;
+            self.rgba = VFrame::new(format::Pixel::RGBA, w, h);
+            self.w = w;
+            self.h = h;
+        }
     }
 
     pub fn seek(&mut self, t: f64, gen: u64) {
@@ -171,9 +205,11 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
         // 1. commands - block only when there is genuinely nothing to do
         let busy = playing || target.is_some() || out.is_some();
         let mut seek = None;
+        let mut quality = None;
         let mut apply = |c: Cmd, playing: &mut bool| match c {
             Cmd::Play(p) => *playing = p,
             Cmd::Seek(t, g) => seek = Some((t, g)), // coalesce: only the newest seek matters
+            Cmd::Quality(d) => quality = Some(d),
         };
         if busy {
             loop {
@@ -188,6 +224,9 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
                 Ok(c) => apply(c, &mut playing),
                 Err(_) => return,
             }
+        }
+        if let Some(d) = quality {
+            w.rescale(d);
         }
         if let Some((t, g)) = seek {
             w.seek(t, g);
@@ -271,6 +310,7 @@ struct AudioShared {
     buf: Mutex<AudioBuf>,
     clock: Clock,
     playing: AtomicBool,
+    muted: AtomicBool,
     peak_l: AtomicU32, // positive f32 bit patterns order like the floats -> fetch_max = peak hold
     peak_r: AtomicU32,
 }
@@ -281,6 +321,7 @@ impl AudioShared {
             buf: Mutex::new(AudioBuf { q: VecDeque::with_capacity(1 << 17), epoch: 0, next_t: 0.0, eof: false }),
             clock: Clock { base: Instant::now(), t: AtomicU64::new(0), ns: AtomicU64::new(0), run: AtomicBool::new(false) },
             playing: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
             peak_l: AtomicU32::new(0),
             peak_r: AtomicU32::new(0),
         }
@@ -495,6 +536,7 @@ where
             let ts = info.timestamp();
             let lat = ts.playback.duration_since(&ts.callback).map_or(0.0, |d| d.as_secs_f64());
             let frames = data.len() / ch;
+            let muted = sh.muted.load(Relaxed);
             let mut b = sh.lock();
             let t0 = b.next_t;
             let (mut pl, mut pr) = (0f32, 0f32);
@@ -503,8 +545,8 @@ where
                 if b.q.len() < 2 {
                     break;
                 }
-                let l = b.q.pop_front().unwrap_or(0.0);
-                let r = b.q.pop_front().unwrap_or(0.0);
+                let (l, r) = (b.q.pop_front().unwrap_or(0.0), b.q.pop_front().unwrap_or(0.0));
+                let (l, r) = if muted { (0.0, 0.0) } else { (l, r) }; // still consumed: stays in sync
                 pl = pl.max(l.abs());
                 pr = pr.max(r.abs());
                 if ch == 1 {
@@ -623,6 +665,16 @@ impl Player {
             need_first: true,
             audio: open_audio(path),
         })
+    }
+
+    pub fn set_quality(&mut self, div: u32) {
+        let _ = self.cmd.send(Cmd::Quality(div));
+    }
+
+    pub fn set_muted(&self, on: bool) {
+        if let Some(a) = &self.audio {
+            a.sh.muted.store(on, Relaxed);
+        }
     }
 
     pub fn has_audio(&self) -> bool {
