@@ -294,13 +294,13 @@ fn unescape_gfx(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
-        if ch == '\\\\' {
+        if ch == '\\' {
             match chars.next() {
-                Some('n') => out.push('\\n'),
-                Some('t') => out.push('\\t'),
-                Some('\\\\') => out.push('\\\\'),
-                Some(other) => { out.push('\\\\'); out.push(other); }
-                None => out.push('\\\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some(other) => { out.push('\\'); out.push(other); }
+                None => out.push('\\'),
             }
         } else {
             out.push(ch);
