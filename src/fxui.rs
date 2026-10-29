@@ -71,22 +71,26 @@ fn effect_controls(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[
         ui.label(RichText::new("Playhead is outside this clip: values shown at its nearest frame.").size(9.0).color(MUTED));
     }
 
-    let graph_h = 190.0;
-    let list_h = (ui.available_height() - graph_h - 30.0).max(110.0);
-    ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
-        let mut group = "";
-        for i in 0..NPARAM {
-            if PARAMS[i].group != group {
-                group = PARAMS[i].group;
-                ui.add_space(6.0);
-                ui.label(RichText::new(group).color(POWDER).strong());
-            }
-            param_row(ui, ins, &mut fx, i, ts, &clip, &mut changed);
-        }
+    // Keep the controls and value graph side by side, like a proper editing inspector, instead
+    // of pushing the graph below every parameter row.
+    ui.columns(2, |columns| {
+        let list_h = columns[0].available_height().max(140.0);
+        ScrollArea::vertical()
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(&mut columns[0], |ui| {
+                let mut group = "";
+                for i in 0..NPARAM {
+                    if PARAMS[i].group != group {
+                        group = PARAMS[i].group;
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(group).color(POWDER).strong());
+                    }
+                    param_row(ui, ins, &mut fx, i, ts, &clip, &mut changed);
+                }
+            });
+        graph(&mut columns[1], ins, &mut fx, &clip, ts, &mut changed);
     });
-
-    ui.add_space(6.0);
-    graph(ui, ins, &mut fx, &clip, ts, &mut changed);
 
     if reset {
         fx = Fx::default();
@@ -122,21 +126,14 @@ fn add_graphic_button(ui: &mut Ui, proj: &mut Project, sel: &mut Vec<u32>, t: f6
     false
 }
 
-fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
-    let mut created = false;
-    ui.horizontal(|ui| {
-        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Text);
-        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
-        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
-    });
-    ui.add_space(8.0);
+fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, _t: f64) -> bool {
     let Some((id, mut gfx)) = selected_graphic(proj, sel) else {
-        placeholder(ui, "Create a title or shape, or select a graphic clip on the timeline.");
-        return created;
+        placeholder(ui, "Select a text graphic, or create one in Essential Graphics.");
+        return false;
     };
     if gfx.kind != GfxKind::Text {
         ui.label(RichText::new("The selected item is a shape. Use Essential Graphics for its appearance.").color(MUTED));
-        return created;
+        return false;
     }
     ui.label(RichText::new("TEXT").color(MUTED).strong());
     let pre = proj.clips.clone();
@@ -163,18 +160,19 @@ fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Ve
         if ins.session.is_none() { ins.session = Some(pre); }
         if let Some(c) = proj.clip_mut(id) { c.gfx = Some(gfx); }
     }
-    created || changed
+    changed
 }
 
 fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
     let mut created = false;
+    ui.label(RichText::new("CREATE GRAPHIC").color(MUTED).strong());
     ui.horizontal(|ui| {
         created |= add_graphic_button(ui, proj, sel, t, GfxKind::Text);
         created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
         created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
     });
     ui.separator();
-    ui.label(RichText::new("GRAPHICS IN PROJECT").color(MUTED).strong());
+    ui.label(RichText::new("GRAPHIC LAYERS").color(MUTED).strong());
     let graphics: Vec<(u32, String, bool)> = proj.clips.iter().filter(|c| c.gfx.is_some())
         .map(|c| (c.id, c.name.clone(), sel.contains(&c.id))).collect();
     ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
@@ -192,14 +190,18 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     let pre = proj.clips.clone();
     let mut changed = false;
     ui.label(RichText::new(match gfx.kind { GfxKind::Text => "TEXT APPEARANCE", GfxKind::Rect => "RECTANGLE", GfxKind::Ellipse => "ELLIPSE" }).color(MUTED).strong());
-    ui.horizontal(|ui| {
-        ui.label("Canvas width");
-        changed |= ui.add(egui::DragValue::new(&mut gfx.w).clamp_range(1.0..=1920.0).speed(2.0)).changed();
-    });
-    ui.horizontal(|ui| {
-        ui.label("Canvas height");
-        changed |= ui.add(egui::DragValue::new(&mut gfx.h).clamp_range(1.0..=1080.0).speed(2.0)).changed();
-    });
+    // Width and height affect the geometry of a shape. Text is laid out from its content and
+    // font size, so showing canvas dimensions for text would be misleading (and do nothing).
+    if gfx.kind != GfxKind::Text {
+        ui.horizontal(|ui| {
+            ui.label("Width");
+            changed |= ui.add(egui::DragValue::new(&mut gfx.w).clamp_range(1.0..=1920.0).speed(2.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Height");
+            changed |= ui.add(egui::DragValue::new(&mut gfx.h).clamp_range(1.0..=1080.0).speed(2.0)).changed();
+        });
+    }
     let mut col = Color32::from_rgba_unmultiplied(gfx.color[0], gfx.color[1], gfx.color[2], gfx.color[3]);
     ui.horizontal(|ui| { ui.label("Fill"); changed |= ui.color_edit_button_srgba(&mut col).changed(); });
     gfx.color = col.to_array();
@@ -284,23 +286,36 @@ fn param_row(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, i: usize, ts: f64, c
 
         let mut v = fx.value(i, ts);
         let before = v;
-        let w = (ui.available_width() - 122.0).max(36.0);
+        let w = (ui.available_width() - 138.0).max(36.0);
         slider(ui, &mut v, def.lo, def.hi, w);
+
+        let drag_speed = match i {
+            0 | 1 => 0.5, // position: pixel-ish units per pointer point
+            2 | 4 | 6 | 7 => 0.2,
+            _ => 0.1,
+        };
+        let value_resp = ui
+            .add_sized(
+                [62.0, 18.0],
+                egui::DragValue::new(&mut v)
+                    .clamp_range(def.lo..=def.hi)
+                    .speed(drag_speed)
+                    .fixed_decimals(0)
+                    .suffix(def.suffix),
+            )
+            .on_hover_text("Click to type a value; drag horizontally to scrub it");
+        if value_resp.clicked() {
+            // Make a single click enter numeric-edit mode. A drag still scrubs the value.
+            ui.memory_mut(|memory| memory.request_focus(value_resp.id));
+        }
+        if value_resp.changed() {
+            ins.sel_param = i;
+        }
         if (v - before).abs() > 1e-4 {
             fx.set_value(i, ts, v);
             ins.sel_param = i;
             *changed = true;
         }
-
-        let (br, _) = ui.allocate_exact_size(vec2(46.0, 18.0), Sense::hover());
-        ui.painter().rect_filled(br, 4.0, rgba(8, 14, 36, 200));
-        ui.painter().text(
-            br.center(),
-            Align2::CENTER_CENTER,
-            format!("{}{}", v.round() as i32, def.suffix),
-            FontId::monospace(10.0),
-            TEXT,
-        );
 
         // previous key / add-remove key / next key
         let (pr, presp) = ui.allocate_exact_size(vec2(10.0, 16.0), Sense::click());
@@ -341,7 +356,7 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
     let i = ins.sel_param.min(NPARAM - 1);
     let def = &PARAMS[i];
     ui.label(RichText::new(format!("Value graph  -  {}", def.name)).size(10.0).color(MUTED));
-    let h = (ui.available_height() - 30.0).clamp(70.0, 170.0);
+    let h = (ui.available_height() - 58.0).clamp(110.0, 360.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click_and_drag());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 6.0, rgba(8, 14, 36, 170));

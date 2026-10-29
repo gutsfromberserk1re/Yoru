@@ -208,6 +208,14 @@ impl Engine {
         self.active.is_some()
     }
 
+    /// Duration of one frame in the active source, used for accurate paused frame stepping.
+    pub fn frame_step(&self) -> f64 {
+        self.active
+            .and_then(|a| self.players.get(&a.media))
+            .map(|s| 1.0 / s.player.info.fps.max(1.0))
+            .unwrap_or(1.0 / 30.0)
+    }
+
     /// Newly decoded frame for timeline time `t`, if the picture changed.
     pub fn poll(&mut self, t: f64) -> Option<&Frame> {
         let a = self.active?;

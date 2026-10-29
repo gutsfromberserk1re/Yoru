@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const MAX_PREVIEW_W: u32 = 1920; // 'Full' playback resolution cap
-const VIDEO_QUEUE: usize = 8;
+const VIDEO_QUEUE: usize = 3; // keep only a few decoded frames ahead for low-latency preview
 
 // ------------------------------------------------------------------ public data
 pub struct Frame {
@@ -195,15 +195,18 @@ impl VideoWorker {
 }
 
 fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: Context, fps: f64) {
-    let half = 0.5 / fps;
+    let half = 0.5 / fps.max(1.0);
+    let frame_interval = Duration::from_secs_f64(1.0 / fps.max(1.0));
     let mut playing = false;
     let mut target: Option<f64> = Some(0.0); // decode-and-discard until this time
     let mut out: Option<Frame> = None; // finished frame waiting for queue space
+    let mut next_frame_at: Option<Instant> = None;
     let mut eof = false;
 
     loop {
         // 1. commands - block only when there is genuinely nothing to do
         let busy = playing || target.is_some() || out.is_some();
+        let was_playing = playing;
         let mut seek = None;
         let mut quality = None;
         let mut apply = |c: Cmd, playing: &mut bool| match c {
@@ -228,10 +231,15 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
         if let Some(d) = quality {
             w.rescale(d);
         }
+        if was_playing != playing {
+            // Resume immediately, then pace subsequent frames near the source frame rate.
+            next_frame_at = None;
+        }
         if let Some((t, g)) = seek {
             w.seek(t, g);
             target = Some(t);
             out = None;
+            next_frame_at = None;
             eof = false;
         }
 
@@ -259,6 +267,23 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
         if !playing && target.is_none() {
             continue;
         }
+
+        // Decode at roughly the clip's frame rate instead of burning CPU decoding hundreds of
+        // frames per second. Poll commands every few milliseconds while waiting so pause/seek
+        // remains responsive. When decoding itself falls behind, skip the wait and let the bounded
+        // frame queue drop stale preview frames.
+        if playing {
+            if let Some(deadline) = next_frame_at {
+                let now = Instant::now();
+                if deadline > now {
+                    std::thread::sleep((deadline - now).min(Duration::from_millis(4)));
+                    continue;
+                }
+            }
+        }
+        let decode_slot = next_frame_at
+            .filter(|deadline| *deadline <= Instant::now())
+            .unwrap_or_else(Instant::now);
         match w.next_frame() {
             Some(f) => {
                 if let Some(t) = target {
@@ -268,6 +293,11 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
                     target = None;
                 }
                 out = Some(f);
+                if playing {
+                    let due = decode_slot + frame_interval;
+                    let now = Instant::now();
+                    next_frame_at = Some(if due > now { due } else { now });
+                }
             }
             None => eof = true,
         }
@@ -727,26 +757,46 @@ impl Player {
         }
     }
 
-    /// Pull finished frames and pick the one for time `t`. True if `current` changed.
+    /// Pull finished frames and display the newest frame that is due at `t`.
+    ///
+    /// Important: do not copy every decoded frame into `pending`. The decoder runs on a worker
+    /// and can decode faster than real time; an unbounded UI-side queue therefore grows forever
+    /// and makes the preview increasingly late. Keep only a small look-ahead window, replacing
+    /// obsolete due frames with the newest due frame, just like a real-time preview monitor.
     pub fn poll(&mut self, t: f64) -> bool {
-        while let Ok(f) = self.frames.try_recv() {
-            if f.gen == self.gen {
-                self.pending.push_back(f);
-            }
-        }
+        let eps = 0.5 / self.info.fps.max(1.0);
+        let due = t + eps;
         let mut changed = false;
-        if self.need_first {
-            if let Some(f) = self.pending.pop_front() {
+
+        // Consume frames that have become due since the previous UI tick.
+        while self.pending.front().map_or(false, |f| f.pts <= due) {
+            self.current = self.pending.pop_front();
+            self.need_first = false;
+            changed = true;
+        }
+
+        while let Ok(f) = self.frames.try_recv() {
+            if f.gen != self.gen {
+                continue; // stale frame from before the most recent seek
+            }
+
+            if self.need_first {
+                // The seek worker has already discarded frames before the requested time.
                 self.current = Some(f);
                 self.need_first = false;
                 changed = true;
+            } else if f.pts <= due {
+                // Several frames may have arrived since the previous UI tick. Keep the newest
+                // due frame rather than rendering each stale frame one by one.
+                self.current = Some(f);
+                changed = true;
+            } else if self.pending.len() < VIDEO_QUEUE {
+                // Preserve a short, bounded look-ahead for smooth motion. Once full, drop later
+                // future frames rather than letting decoder speed create an ever-growing delay.
+                self.pending.push_back(f);
             }
         }
-        let eps = 0.5 / self.info.fps;
-        while self.pending.front().map_or(false, |f| f.pts <= t + eps) {
-            self.current = self.pending.pop_front();
-            changed = true;
-        }
+
         changed
     }
 }

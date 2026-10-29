@@ -953,10 +953,16 @@ impl App {
             self.shuttle(-1);
         }
         if k(Key::ArrowRight, none) {
-            self.seek(self.t + 1.0 / FPS);
+            // Frame stepping is deterministic: stop transport first and move exactly one source
+            // frame, not one hard-coded 30 fps frame for every clip.
+            if self.rate != 0 { self.set_rate(0); }
+            let step = self.engine.frame_step();
+            self.seek(self.t + step);
         }
         if k(Key::ArrowLeft, none) {
-            self.seek(self.t - 1.0 / FPS);
+            if self.rate != 0 { self.set_rate(0); }
+            let step = self.engine.frame_step();
+            self.seek(self.t - step);
         }
         if k(Key::ArrowUp, none) {
             let e = self.edit_point(-1);
@@ -1014,9 +1020,12 @@ impl eframe::App for App {
             let now = Instant::now();
             let dt = now.duration_since(self.last).as_secs_f64();
             self.last = now;
-            // sound card = master clock at 1x; wall clock otherwise (no audio / shuttle)
+            // The audio device is the master clock at 1x; wall clock otherwise. Do not clamp
+            // to the existing playhead: that value can be a little ahead of the device clock and
+            // would freeze the playhead (and video) until the clock catches up. Allow at most a
+            // tiny correction backwards to absorb callback/latency jitter without visible jumps.
             let audio_t = if self.rate == 1 { self.engine.clock() } else { None };
-            let nt = audio_t.map_or(self.t + self.rate as f64 * dt, |c| c.max(self.t));
+            let nt = audio_t.map_or(self.t + self.rate as f64 * dt, |c| c.max(self.t - 0.01));
             if self.rate == 1 {
                 self.set_time(nt);
             } else {
