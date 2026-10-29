@@ -61,14 +61,37 @@ jobs:
         continue-on-error: true
         run: cargo test --release
 
-      # ---- package: exe + FFmpeg DLLs ----
+      # ---- package: app, decoder DLLs, and the standalone FFmpeg export/proxy CLI ----
       - name: Package
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\yoru.exe dist\
           Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" dist\
           Copy-Item README.md dist\
+
+          # The Rust decoder links to vcpkg's FFmpeg DLLs. Export and proxy creation use a
+          # separate static CLI build so end users do not need to install FFmpeg themselves.
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-9.0.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg-cli.zip
+          Expand-Archive -Path ffmpeg-cli.zip -DestinationPath ffmpeg-cli -Force
+          $ffmpeg = Get-ChildItem ffmpeg-cli -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
+          if (-not $ffmpeg) { throw "The FFmpeg CLI archive did not contain ffmpeg.exe" }
+          Copy-Item $ffmpeg.FullName dist\ffmpeg.exe
+          $docs = Get-ChildItem ffmpeg-cli -Recurse -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|README)' }
+          foreach ($doc in $docs) {
+            $destName = "FFmpeg_" + $doc.Name
+            if (-not (Test-Path (Join-Path dist $destName))) { Copy-Item $doc.FullName (Join-Path dist $destName) }
+          }
+          @'
+          FFmpeg CLI build bundled with Yoru
+          Source project: https://github.com/BtbN/FFmpeg-Builds
+          Asset: ffmpeg-n9.0-latest-win64-gpl-9.0.zip (Windows x86_64, static GPL build)
+          Used for MP4 export and preview-proxy creation. The decoder bindings also use the FFmpeg
+          libraries installed from vcpkg during the build. Consult the bundled FFmpeg license files
+          and build project's licensing information before redistributing modified packages.
+          '@ | Set-Content -Encoding UTF8 (Join-Path dist "FFmpeg-BUILD-NOTICE.txt")
           Compress-Archive -Path dist\* -DestinationPath yoru-windows-x64.zip -Force
 
       - uses: actions/upload-artifact@v4
