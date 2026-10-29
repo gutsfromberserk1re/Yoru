@@ -13,6 +13,7 @@ use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, ecolor::Hsva, *};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod assets;
@@ -454,20 +455,46 @@ const EFFECTS: [(&str, &[&str]); 6] = [
 struct Browser {
     tab: usize,
     sel: usize,
+    view: usize, // 0 = thumbnail grid, 1 = compact list
     search: String,
     fx_sel: Option<&'static str>,
 }
 
 /// Returns the media id the user asked to add to the timeline (double-click).
-fn browser_panel(ui: &mut Ui, b: &mut Browser, proj: &Project, assets: &Assets, drag: &mut Option<u32>) -> Option<u32> {
+fn browser_panel(
+    ui: &mut Ui,
+    b: &mut Browser,
+    proj: &Project,
+    assets: &Assets,
+    drag: &mut Option<u32>,
+    import_requested: &mut bool,
+) -> Option<u32> {
     let mut add = None;
     glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.spacing_mut().item_spacing.y = 8.0;
-        tab_strip(ui, &mut b.tab, &["Clips", "Effects", "Media"]);
+        // The Project bin owns the imported media pool. Grid/list are two views of the same
+        // assets, not separate panels; Effects remains its own tab.
+        tab_strip(ui, &mut b.tab, &["Project", "Effects"]);
         match b.tab {
-            0 => add = media_grid(ui, proj, assets, &mut b.sel, drag),
-            1 => {
+            0 => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Project bin").size(10.0).color(MUTED));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.selectable_label(b.view == 1, "List").clicked() { b.view = 1; }
+                        if ui.selectable_label(b.view == 0, "Grid").clicked() { b.view = 0; }
+                        if ui.button("+ Import").on_hover_text("Import video files into the Project bin").clicked() {
+                            *import_requested = true;
+                        }
+                    });
+                });
+                add = if b.view == 0 {
+                    media_grid(ui, proj, assets, &mut b.sel, drag)
+                } else {
+                    media_list(ui, proj, &mut b.sel, drag)
+                };
+            }
+            _ => {
                 ui.add(
                     TextEdit::singleline(&mut b.search)
                         .hint_text("Search effects")
@@ -499,7 +526,6 @@ fn browser_panel(ui: &mut Ui, b: &mut Browser, proj: &Project, assets: &Assets, 
                     }
                 });
             }
-            _ => add = media_list(ui, proj, &mut b.sel, drag),
         }
     });
     add
@@ -518,7 +544,7 @@ fn fmt_len(sec: f64) -> String {
 /// double-click appends to the timeline, dragging it onto a track places it there.
 fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
     if proj.media.is_empty() {
-        placeholder(ui, "Drop video files onto the window to import them.");
+        placeholder(ui, "Click + Import, or drop video files onto the window.");
         return None;
     }
     let mut add = None;
@@ -568,7 +594,7 @@ fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, dra
 
 fn media_list(ui: &mut Ui, proj: &Project, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
     if proj.media.is_empty() {
-        placeholder(ui, "Drop video files onto the window to import them.");
+        placeholder(ui, "Click + Import, or drop video files onto the window.");
         return None;
     }
     ui.label(RichText::new("Double-click to append - drag onto a track (Ctrl = insert)").size(10.0).color(MUTED));
@@ -713,6 +739,71 @@ fn title_bar(ui: &mut Ui, ctx: &Context, title: &str, maximized: bool) {
     }
 }
 
+// ------------------------------------------------------------------ recovery / autosave
+/// Per-user data folder, independent of the directory from which Yoru was launched.
+fn yoru_data_dir() -> PathBuf {
+    if cfg!(windows) {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(base).join("Yoru");
+        }
+    }
+    if let Some(base) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(base).join("yoru");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local").join("share").join("yoru");
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("." )).join(".yoru")
+}
+
+fn autosave_file() -> PathBuf {
+    yoru_data_dir().join("autosave.yoru")
+}
+
+/// Replace a file via a staged write, retaining the old copy if replacement fails.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("yoru.tmp");
+    let backup = path.with_extension("yoru.bak");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    // Unix rename replaces an existing destination. Windows does not, so preserve the
+    // previous autosave as a backup while installing the new one.
+    if path.exists() {
+        let _ = std::fs::remove_file(&backup);
+        if let Err(e) = std::fs::rename(path, &backup) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(&backup);
+    Ok(())
+}
+
+fn recoverable_autosave_path(path: &Path) -> Option<PathBuf> {
+    let backup = path.with_extension("yoru.bak");
+    [path.to_path_buf(), backup].into_iter().find(|candidate| {
+        std::fs::read_to_string(candidate)
+            .ok()
+            .and_then(|text| Project::from_text(&text).ok())
+            .is_some()
+    })
+}
+
 // ------------------------------------------------------------------ app
 struct App {
     project: String,
@@ -737,10 +828,18 @@ struct App {
     drag_media: Option<u32>,
     ghost: Option<Ghost>,
     last_params: Option<[f32; NPARAM]>,
+    autosave_path: PathBuf,
+    last_change: Instant,
+    last_autosave: Instant,
+    recovery_offer: bool,
 }
 
 impl App {
     fn new() -> Self {
+        set_duration(10.0);
+        let now = Instant::now();
+        let autosave_path = autosave_file();
+        let recovery_offer = recoverable_autosave_path(&autosave_path).is_some();
         Self {
             project: PROJECT_NAME.into(),
             dirty: false,
@@ -751,8 +850,8 @@ impl App {
             fit: 0,
             timeline: Timeline::new(),
             inspector: fxui::Inspector::new(),
-            browser: Browser { tab: 0, sel: 0, search: String::new(), fx_sel: None },
-            proj: Project::demo(),
+            browser: Browser { tab: 0, sel: 0, view: 0, search: String::new(), fx_sel: None },
+            proj: Project::new(),
             engine: engine::Engine::new(),
             jumped: false,
             tex: None,
@@ -764,6 +863,10 @@ impl App {
             drag_media: None,
             ghost: None,
             last_params: None,
+            autosave_path,
+            last_change: now,
+            last_autosave: now,
+            recovery_offer,
         }
     }
 
@@ -777,6 +880,78 @@ impl App {
         rfd::FileDialog::new().add_filter("Yoru project", &["yoru"])
     }
 
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.last_change = Instant::now();
+    }
+
+    fn maybe_autosave(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        // Save shortly after edits stop, with a 20-second upper bound even while the user
+        // continuously drags a control or performs a long sequence of edits.
+        let idle = self.last_change.elapsed() >= Duration::from_secs(2)
+            && self.last_change > self.last_autosave;
+        let periodic = self.last_autosave.elapsed() >= Duration::from_secs(20);
+        if idle || periodic {
+            match write_atomic(&self.autosave_path, &self.proj.to_text()) {
+                Ok(()) => self.last_autosave = Instant::now(),
+                Err(e) => eprintln!("Yoru autosave failed at {}: {e}", self.autosave_path.display()),
+            }
+        }
+    }
+
+    fn clear_autosave(&self) {
+        let _ = std::fs::remove_file(&self.autosave_path);
+        let _ = std::fs::remove_file(self.autosave_path.with_extension("yoru.bak"));
+        let _ = std::fs::remove_file(self.autosave_path.with_extension("yoru.tmp"));
+    }
+
+    fn rebuild_media_runtime(&mut self, ctx: &Context) {
+        self.engine = engine::Engine::new();
+        self.assets = Assets::new();
+        for m in &self.proj.media {
+            self.assets.spawn(ctx, m.id, &m.path, m.duration, m.has_audio);
+            match media::Player::open(&m.path, ctx.clone()) {
+                Ok(player) => self.engine.insert(m.id, player),
+                Err(e) => eprintln!("cannot reopen media {}: {e}", m.path.display()),
+            }
+        }
+    }
+
+    fn recover_autosave(&mut self, ctx: &Context) {
+        let source = recoverable_autosave_path(&self.autosave_path)
+            .unwrap_or_else(|| self.autosave_path.clone());
+        let loaded = std::fs::read_to_string(&source)
+            .map_err(|e| e.to_string())
+            .and_then(|text| Project::from_text(&text));
+        match loaded {
+            Ok(project) => {
+                self.set_rate(0);
+                self.proj = project;
+                self.rebuild_media_runtime(ctx);
+                self.tex = None;
+                self.t = 0.0;
+                self.timeline.sel.clear();
+                self.timeline.scroll = 0.0;
+                self.project = "Recovered Project".into();
+                self.project_path = None;
+                self.dirty = true;
+                self.last_change = Instant::now();
+                self.last_autosave = Instant::now();
+                self.recovery_offer = false;
+                set_duration(self.proj.end().max(10.0));
+                self.timeline.fit(duration());
+                self.jumped = true;
+            }
+            Err(e) => {
+                eprintln!("cannot recover Yoru autosave: {e}");
+                self.recovery_offer = false;
+            }
+        }
+    }
+
     fn save_project(&mut self, save_as: bool) {
         let path = match (&self.project_path, save_as) {
             (Some(p), false) => Some(p.clone()),
@@ -786,13 +961,16 @@ impl App {
         if path.extension().is_none() {
             path.set_extension("yoru");
         }
-        match std::fs::write(&path, self.proj.to_text()) {
+        match write_atomic(&path, &self.proj.to_text()) {
             Ok(()) => {
                 if let Some(stem) = path.file_stem() {
                     self.project = stem.to_string_lossy().into_owned();
                 }
                 self.project_path = Some(path);
                 self.dirty = false;
+                self.last_autosave = Instant::now();
+                self.clear_autosave();
+                self.recovery_offer = false;
             }
             Err(e) => eprintln!("cannot save {}: {e}", path.display()),
         }
@@ -805,11 +983,7 @@ impl App {
             Ok(p) => {
                 self.set_rate(0);
                 self.proj = p;
-                self.engine = engine::Engine::new();
-                self.assets = Assets::new();
-                for m in &self.proj.media {
-                    self.assets.spawn(ctx, m.id, &m.path, m.duration, m.has_audio);
-                }
+                self.rebuild_media_runtime(ctx);
                 self.tex = None;
                 self.t = 0.0;
                 self.timeline.sel.clear();
@@ -821,6 +995,9 @@ impl App {
                 }
                 self.project_path = Some(path);
                 self.dirty = false;
+                self.last_autosave = Instant::now();
+                self.clear_autosave();
+                self.recovery_offer = false;
             }
             Err(e) => eprintln!("cannot open {}: {e}", path.display()),
         }
@@ -833,7 +1010,7 @@ impl App {
         let proj = &self.proj;
         self.timeline.sel.retain(|id| proj.clip(*id).is_some());
         self.jumped = true;
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     /// Clock-driven move (playback tick): never touches the decoder.
@@ -915,7 +1092,7 @@ impl App {
         if k(Key::L, cmd) {
             let sel = self.timeline.sel.clone();
             if self.proj.unlink(&sel) {
-                self.dirty = true;
+                self.after_edit();
             }
         }
         // Delete = lift (leave a gap), Shift+Delete = ripple (close the gap)
@@ -1043,6 +1220,35 @@ impl eframe::App for App {
         }
         self.handle_keys(ctx);
 
+        // Keep an on-disk recovery copy even if the application is later terminated abruptly.
+        self.maybe_autosave();
+
+        // A small recovery prompt is shown only when a valid unsaved project was found on disk.
+        if self.recovery_offer {
+            let mut choice = 0; // 1 = recover, 2 = discard
+            Window::new("Recover unsaved work?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Yoru found an autosave from an earlier session.");
+                    ui.label("Would you like to restore the timeline and media list?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Recover project").clicked() { choice = 1; }
+                        if ui.button("Discard autosave").clicked() { choice = 2; }
+                    });
+                });
+            match choice {
+                1 => self.recover_autosave(ctx),
+                2 => {
+                    self.clear_autosave();
+                    self.recovery_offer = false;
+                }
+                _ => {}
+            }
+        }
+
         self.assets.pump(ctx);
 
         // drop video files onto the window: import into the media pool and append to the timeline
@@ -1118,6 +1324,7 @@ impl eframe::App for App {
 
         let (mut edited, mut seeked, mut play) = (false, false, false);
         let mut add_media: Option<u32> = None;
+        let mut import_requested = false;
         let mut fx_changed = false;
         {
             let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, ghost, .. } = self;
@@ -1137,7 +1344,7 @@ impl eframe::App for App {
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
                         .show_inside(ui, |ui| {
-                            add_media = browser_panel(ui, browser, proj, assets, drag_media);
+                            add_media = browser_panel(ui, browser, proj, assets, drag_media, &mut import_requested);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
                         let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref());
@@ -1163,13 +1370,44 @@ impl eframe::App for App {
                     });
                 });
         }
+        // Import goes into the Project bin only. Users can then drag or double-click media
+        // when they actually want it on the timeline.
+        if import_requested {
+            let files = rfd::FileDialog::new()
+                .add_filter("Video media", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg"])
+                .pick_files();
+            if let Some(paths) = files {
+                let mut imported_any = false;
+                for path in paths {
+                    if self.proj.media.iter().any(|m| m.path == path) {
+                        continue; // do not duplicate an already-imported source
+                    }
+                    match media::Player::open(&path, ctx.clone()) {
+                        Ok(player) => {
+                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            let (dur, audio) = (player.info.duration, player.has_audio());
+                            let id = self.proj.add_media(path.clone(), name, dur, audio);
+                            self.assets.spawn(ctx, id, &path, dur, audio);
+                            self.engine.insert(id, player);
+                            self.browser.sel = self.proj.media.iter().position(|m| m.id == id).unwrap_or(0);
+                            imported_any = true;
+                        }
+                        Err(e) => eprintln!("cannot import {}: {e}", path.display()),
+                    }
+                }
+                if imported_any {
+                    self.mark_dirty();
+                }
+            }
+        }
+
         if let Some(id) = add_media {
             if self.proj.append_media(id) {
                 edited = true;
             }
         }
         if fx_changed {
-            self.dirty = true;
+            self.mark_dirty();
             set_duration(self.proj.end().max(10.0));
         }
         if let Some(g) = self.inspector.goto.take() {

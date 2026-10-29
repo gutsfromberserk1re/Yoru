@@ -427,7 +427,12 @@ impl Project {
         }
     }
 
-    /// Placeholder project shown until real media is imported.
+    /// A clean project for normal application startup.
+    pub fn new() -> Self {
+        Self::empty()
+    }
+
+    /// Demo timeline retained for development tests and sample fixtures only.
     pub fn demo() -> Self {
         let mut p = Project::empty();
         let story = [
@@ -624,8 +629,8 @@ impl Project {
         let start = start.max(0.0);
 
         let pre = self.clips.clone();
-        if self.clips.iter().all(|c| c.media.is_none()) {
-            self.clips.clear(); // first real import replaces the placeholder project
+        if self.clips.iter().all(|c| c.media.is_none() && c.gfx.is_none()) {
+            self.clips.clear(); // discard legacy/demo placeholders, but preserve created graphics
         }
         if insert {
             self.cut_inner(start);
@@ -1115,6 +1120,13 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_project_starts_empty() {
+        let p = Project::new();
+        assert!(p.media.is_empty());
+        assert!(p.clips.is_empty());
+    }
 
     fn media_project() -> (Project, u32) {
         let mut p = Project::demo();

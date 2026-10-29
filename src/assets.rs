@@ -5,7 +5,7 @@
 //! thumbnails to the GPU a few per frame (never a hitch) and the timeline draws whatever has
 //! arrived so far, so clips fill in progressively while you keep working.
 
-use crate::media::{AudioWorker, VideoWorker};
+use crate::media::{AudioWorker, VideoDecodeStep, VideoWorker};
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -127,8 +127,16 @@ fn thumbs_job(path: PathBuf, media: u32, duration: f64, tx: Sender<Msg>, ctx: Co
     let (mut t, mut last) = (0.0f64, f64::NEG_INFINITY);
     while t < dur {
         w.seek(t, 0);
-        // first frame after a seek = the keyframe at/before t: fast, no decode-forward needed
-        if let Some(f) = w.next_frame() {
+        // Seek to the frame nearest t. Pre-target frames are discarded before RGBA conversion,
+        // keeping thumbnail extraction fast even for long-GOP source footage.
+        let f = loop {
+            match w.next_frame(Some((t, 0.5 / info.fps.max(1.0)))) {
+                VideoDecodeStep::Frame(f) => break Some(f),
+                VideoDecodeStep::Skipped => continue,
+                VideoDecodeStep::End => break None,
+            }
+        };
+        if let Some(f) = f {
             if f.pts - last > 0.01 {
                 last = f.pts;
                 if tx.send(Msg::Thumb { media, pts: f.pts, w: f.w, h: f.h, rgba: f.rgba }).is_err() {

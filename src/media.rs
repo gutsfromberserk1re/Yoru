@@ -41,6 +41,14 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// One decoder step. `Skipped` means a frame was decoded but intentionally not converted/presented;
+/// the worker loop should check for newer seek commands before decoding again.
+pub enum VideoDecodeStep {
+    Frame(Frame),
+    Skipped,
+    End,
+}
+
 #[derive(Clone, Copy)]
 pub struct Info {
     pub w: u32,
@@ -62,6 +70,7 @@ enum Cmd {
 }
 
 pub struct VideoWorker {
+    path: PathBuf,
     ictx: format::context::Input,
     dec: ffmpeg::decoder::Video,
     scaler: scaling::Context,
@@ -102,6 +111,7 @@ impl VideoWorker {
         let dur = ictx.duration();
         let info = Info { w, h, fps, duration: if dur > 0 { dur as f64 / 1_000_000.0 } else { 0.0 } };
         let me = Self {
+            path: path.to_path_buf(),
             ictx,
             dec,
             scaler,
@@ -147,23 +157,42 @@ impl VideoWorker {
     }
 
     pub fn seek(&mut self, t: f64, gen: u64) {
-        let ts = (t.max(0.0) * 1_000_000.0) as i64;
-        let _ = self.ictx.seek(ts, ..ts); // lands on the previous keyframe
+        let t = t.max(0.0);
+        let ts = (t * 1_000_000.0) as i64;
+        if let Err(err) = self.ictx.seek(ts, ..ts) {
+            // Some containers don't support timestamp seeking reliably. Reopen from the start as
+            // a fallback; the decode loop will scan to the requested PTS while discarding frames
+            // before RGBA conversion, rather than leaving the preview stuck at its old position.
+            eprintln!("video seek to {t:.3}s failed ({}): {err}; reopening source", self.path.display());
+            let path = self.path.clone();
+            let cap = self.max_w;
+            let div = (self.src_w.min(self.max_w) / self.w.max(1)).max(1);
+            if let Ok((mut fresh, _)) = Self::open_sized(&path, cap) {
+                fresh.rescale(div);
+                *self = fresh;
+            }
+        }
         self.dec.flush();
         self.flushed = false;
         self.gen = gen;
     }
 
-    pub fn next_frame(&mut self) -> Option<Frame> {
+    /// Decode a single presentation step. While seeking, discard frames before the target *before*
+    /// scaling them to RGBA and copying pixels. Return after each skipped decoded frame so the
+    /// worker can coalesce a newer seek request instead of being stuck scanning an obsolete target.
+    pub fn next_frame(&mut self, discard_before: Option<(f64, f64)>) -> VideoDecodeStep {
         loop {
             if self.dec.receive_frame(&mut self.raw).is_ok() {
-                if let Some(f) = self.convert() {
-                    return Some(f);
+                let pts = self.raw.timestamp().or(self.raw.pts()).unwrap_or(0) as f64 * self.tb;
+                if let Some((target, half_frame)) = discard_before {
+                    if pts + half_frame < target {
+                        return VideoDecodeStep::Skipped;
+                    }
                 }
-                continue;
+                return self.convert(pts).map(VideoDecodeStep::Frame).unwrap_or(VideoDecodeStep::Skipped);
             }
             if self.flushed {
-                return None;
+                return VideoDecodeStep::End;
             }
             let mut pkt = Packet::empty();
             match pkt.read(&mut self.ictx) {
@@ -180,9 +209,8 @@ impl VideoWorker {
         }
     }
 
-    fn convert(&mut self) -> Option<Frame> {
+    fn convert(&mut self, pts: f64) -> Option<Frame> {
         self.scaler.run(&self.raw, &mut self.rgba).ok()?;
-        let pts = self.raw.timestamp().or(self.raw.pts()).unwrap_or(0) as f64 * self.tb;
         let (w, h) = (self.w as usize, self.h as usize);
         let stride = self.rgba.stride(0);
         let data = self.rgba.data(0);
@@ -284,12 +312,11 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
         let decode_slot = next_frame_at
             .filter(|deadline| *deadline <= Instant::now())
             .unwrap_or_else(Instant::now);
-        match w.next_frame() {
-            Some(f) => {
-                if let Some(t) = target {
-                    if f.pts + half < t {
-                        continue;
-                    }
+        // While seeking, let the decoder discard pre-target frames before doing RGBA conversion.
+        // The first returned frame is therefore the closest usable frame to the requested time.
+        match w.next_frame(target.map(|t| (t, half))) {
+            VideoDecodeStep::Frame(f) => {
+                if target.is_some() {
                     target = None;
                 }
                 out = Some(f);
@@ -299,7 +326,8 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
                     next_frame_at = Some(if due > now { due } else { now });
                 }
             }
-            None => eof = true,
+            VideoDecodeStep::Skipped => continue,
+            VideoDecodeStep::End => eof = true,
         }
     }
 }
@@ -392,6 +420,7 @@ impl AudioShared {
 
 // ================================================================== AUDIO DECODE WORKER
 pub struct AudioWorker {
+    path: PathBuf,
     ictx: format::context::Input,
     dec: ffmpeg::decoder::Audio,
     rs: resampling::Context,
@@ -427,6 +456,7 @@ impl AudioWorker {
         }
         let rs = make_resampler(&dec, rate)?;
         Ok(Some(Self {
+            path: path.to_path_buf(),
             ictx,
             dec,
             rs,
@@ -441,8 +471,18 @@ impl AudioWorker {
     }
 
     pub fn seek(&mut self, t: f64) {
-        let ts = (t.max(0.0) * 1_000_000.0) as i64;
-        let _ = self.ictx.seek(ts, ..ts);
+        let t = t.max(0.0);
+        let ts = (t * 1_000_000.0) as i64;
+        if let Err(err) = self.ictx.seek(ts, ..ts) {
+            // Fall back to decoding from the beginning if this container cannot seek. `skip_until`
+            // trims the samples before t, so audio still aligns with the requested preview time.
+            eprintln!("audio seek to {t:.3}s failed ({}): {err}; reopening source", self.path.display());
+            let path = self.path.clone();
+            let rate = self.rate;
+            if let Ok(Some(fresh)) = Self::open(&path, rate) {
+                *self = fresh;
+            }
+        }
         self.dec.flush();
         if let Ok(rs) = make_resampler(&self.dec, self.rate) {
             self.rs = rs; // drop resampler history from before the jump
@@ -740,8 +780,12 @@ impl Player {
         self.gen += 1;
         self.pending.clear();
         self.need_first = true;
-        let _ = self.cmd.send(Cmd::Seek(t, self.gen));
-        self.seek_audio(t);
+        // Old frames can already be waiting in the bounded channel when the user seeks or steps.
+        // Drain them now so the newly requested frame doesn't wait behind stale pictures. Any
+        // old frame that races with this drain is still rejected by the generation check in poll().
+        while self.frames.try_recv().is_ok() {}
+        let _ = self.cmd.send(Cmd::Seek(t.max(0.0), self.gen));
+        self.seek_audio(t.max(0.0));
     }
 
     /// Start/stop real-time playback. `resync` re-aligns audio to that source time (exact resume).
