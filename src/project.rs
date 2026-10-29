@@ -340,6 +340,12 @@ pub struct Clip {
     pub seed: u32,
     pub media: Option<u32>,
     pub fx: Fx,
+    /// Optional title/shape overlay rendered over the clip.
+    pub gfx: Option<Gfx>,
+    /// Audio controls stored as percent gain and seconds of linear fades.
+    pub audio_gain: f32,
+    pub fade_in: f64,
+    pub fade_out: f64,
 }
 
 impl Clip {

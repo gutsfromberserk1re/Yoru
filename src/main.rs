@@ -10,7 +10,7 @@
 #![allow(unknown_lints, float_literal_f32_fallback, deprecated)]
 
 use eframe::egui::text::LayoutJob;
-use eframe::egui::{self, ecolor::Hsva, epaint::CubicBezierShape, *};
+use eframe::egui::{self, ecolor::Hsva, *};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
