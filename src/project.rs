@@ -269,6 +269,60 @@ impl Fx {
     }
 }
 
+// ---------------------------------------------------------------- title / shape graphics
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GfxKind { Text, Rect, Ellipse }
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Gfx {
+    pub kind: GfxKind,
+    pub text: String,
+    pub w: f32,
+    pub h: f32,
+    pub color: [u8; 4],
+    pub outline: f32,
+    pub outline_color: [u8; 4],
+    pub mono: bool,
+    pub size: f32,
+    pub pad: f32,
+    pub bg: [u8; 4],
+    pub align: u8,
+    pub shadow: bool,
+}
+
+fn unescape_gfx(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\\\' {
+            match chars.next() {
+                Some('n') => out.push('\\n'),
+                Some('t') => out.push('\\t'),
+                Some('\\\\') => out.push('\\\\'),
+                Some(other) => { out.push('\\\\'); out.push(other); }
+                None => out.push('\\\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+impl Gfx {
+    pub fn title(text: impl Into<String>) -> Self {
+        Self { kind: GfxKind::Text, text: text.into(), w: 640.0, h: 160.0,
+            color: [245, 247, 255, 255], outline: 0.0, outline_color: [0, 0, 0, 255],
+            mono: false, size: 64.0, pad: 16.0, bg: [0, 0, 0, 0], align: 1, shadow: true }
+    }
+    pub fn rect() -> Self {
+        Self { kind: GfxKind::Rect, text: String::new(), w: 480.0, h: 240.0,
+            color: [60, 120, 240, 210], outline: 3.0, outline_color: [245, 247, 255, 255],
+            mono: false, size: 48.0, pad: 0.0, bg: [0, 0, 0, 0], align: 1, shadow: false }
+    }
+    pub fn ellipse() -> Self { Self { kind: GfxKind::Ellipse, ..Self::rect() } }
+}
+
 // ---------------------------------------------------------------- clips & media
 #[derive(Clone, Debug)]
 pub struct Clip {
@@ -401,7 +455,33 @@ impl Project {
             seed,
             media: None,
             fx: Fx::default(),
+            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
         });
+    }
+
+    /// Creates an editable title/shape overlay clip at the playhead and records one undo step.
+    pub fn add_graphic(&mut self, t: f64, gfx: Gfx, name: &str) -> u32 {
+        let pre = self.clips.clone();
+        let id = self.alloc();
+        let dur = 5.0;
+        self.clips.push(Clip {
+            id, link: 0, lane: Lane::V(2), start: t.max(0.0), dur, src_off: 0.0,
+            src_len: f64::INFINITY, name: name.to_string(), seed: id % 9 + 1,
+            media: None, fx: Fx::default(), gfx: Some(gfx),
+            audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
+        });
+        self.push_undo(pre);
+        id
+    }
+
+    pub fn audio_gain_at(&self, t: f64) -> f32 {
+        let Some(v) = self.video_clip_at(t) else { return 1.0 };
+        let Some(a) = self.clips.iter().find(|a| a.link != 0 && a.link == v.link && !a.lane.is_video()) else { return 1.0 };
+        if self.hidden[a.lane.slot()] { return 0.0; }
+        let mut g = (a.audio_gain / 100.0).clamp(0.0, 4.0);
+        if a.fade_in > 0.0 { g *= ((t - a.start) / a.fade_in).clamp(0.0, 1.0) as f32; }
+        if a.fade_out > 0.0 { g *= ((a.end() - t) / a.fade_out).clamp(0.0, 1.0) as f32; }
+        g
     }
 
     fn alloc(&mut self) -> u32 {
@@ -455,13 +535,13 @@ impl Project {
     pub fn video_clip_at(&self, t: f64) -> Option<&Clip> {
         self.clips
             .iter()
-            .filter(|c| c.lane.is_video() && !self.hidden[c.lane.slot()] && c.start <= t && t < c.end())
+            .filter(|c| c.lane.is_video() && c.media.is_some() && !self.hidden[c.lane.slot()] && c.start <= t && t < c.end())
             .max_by_key(|c| c.lane.slot())
     }
     pub fn next_video_clip_after(&self, t: f64) -> Option<&Clip> {
         self.clips
             .iter()
-            .filter(|c| c.lane.is_video() && !self.hidden[c.lane.slot()] && c.start > t)
+            .filter(|c| c.lane.is_video() && c.media.is_some() && !self.hidden[c.lane.slot()] && c.start > t)
             .min_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal))
     }
     /// True when the audio track linked to the active video clip is muted.
@@ -564,6 +644,7 @@ impl Project {
             seed,
             media: Some(media_id),
             fx: Fx::default(),
+            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
         });
         let mut movers = vec![vid];
         if with_audio {
@@ -580,6 +661,7 @@ impl Project {
                 seed: 0,
                 media: Some(media_id),
                 fx: Fx::default(),
+                gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
             });
             movers.push(aid);
         }
@@ -871,7 +953,7 @@ impl Project {
     // ---------------------------------------------------------------- save / load
     /// Plain-text project format (tab separated; names/paths are the last field of a line).
     pub fn to_text(&self) -> String {
-        let mut s = String::from("YORU 3\n");
+        let mut s = String::from("YORU 4\n");
         s += &format!("N\t{}\n", self.next_id);
         for m in &self.media {
             s += &format!(
@@ -903,6 +985,17 @@ impl Project {
             s += &format!("\t{}\n", c.name);
         }
         for c in &self.clips {
+            if let Some(g) = &c.gfx {
+                let kind = match g.kind { GfxKind::Text => 0, GfxKind::Rect => 1, GfxKind::Ellipse => 2 };
+                let esc = g.text.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
+                s += &format!("G\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    c.id, kind, g.w, g.h, g.color[0], g.color[1], g.color[2], g.color[3],
+                    g.outline, g.outline_color[0], g.outline_color[1], g.outline_color[2], g.outline_color[3],
+                    g.mono as u8, g.size, g.pad, g.bg[0], g.bg[1], g.bg[2], g.bg[3], g.align, g.shadow as u8, esc);
+            }
+            s += &format!("A\t{}\t{}\t{}\t{}\n", c.id, c.audio_gain, c.fade_in, c.fade_out);
+        }
+        for c in &self.clips {
             for (pi, keys) in c.fx.keys.iter().enumerate() {
                 for k in keys {
                     s += &format!("K\t{}\t{}\t{}\t{}\t{}\n", c.id, pi, k.t, k.v, k.ease.id());
@@ -918,6 +1011,7 @@ impl Project {
             Some("YORU 1") => 1,
             Some("YORU 2") => 2,
             Some("YORU 3") => 3,
+            Some("YORU 4") => 4,
             _ => return Err("not a Yoru project file".into()),
         };
         let mut p = Project::empty();
@@ -926,7 +1020,7 @@ impl Project {
                 continue;
             }
             let bad = || format!("line {}: damaged record", n + 2);
-            let f: Vec<&str> = line.splitn(19, '\t').collect();
+            let f: Vec<&str> = if line.starts_with("C\t") { line.splitn(19, '\t').collect() } else { line.splitn(32, '\t').collect() };
             match f[0] {
                 "N" => p.next_id = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
                 "M" if f.len() >= 7 => p.media.push(Media {
@@ -940,7 +1034,7 @@ impl Project {
                 "C" if (ver == 1 && f.len() == 11) || (ver >= 2 && f.len() == 19) => {
                     let media: u32 = f[9].parse().map_err(|_| bad())?;
                     let mut fx = Fx::default();
-                    if ver == 3 {
+                    if ver >= 3 {
                         for (i, slot) in fx.base.iter_mut().enumerate() {
                             *slot = f[10 + i].parse().map_err(|_| bad())?;
                         }
@@ -956,8 +1050,32 @@ impl Project {
                         seed: f[8].parse().map_err(|_| bad())?,
                         media: if media == 0 { None } else { Some(media) },
                         fx,
+                        gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
                         name: f[f.len() - 1].to_string(),
                     });
+                }
+                "A" if f.len() == 5 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == id) {
+                        c.audio_gain = f[2].parse().map_err(|_| bad())?;
+                        c.fade_in = f[3].parse().map_err(|_| bad())?;
+                        c.fade_out = f[4].parse().map_err(|_| bad())?;
+                    }
+                }
+                "G" if f.len() >= 24 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    let kind = match f[2].parse::<u8>().map_err(|_| bad())? {
+                        0 => GfxKind::Text, 1 => GfxKind::Rect, 2 => GfxKind::Ellipse, _ => return Err(bad()),
+                    };
+                    let unesc = unescape_gfx(&f[23..].join("\t"));
+                    let color = [f[5].parse().map_err(|_| bad())?, f[6].parse().map_err(|_| bad())?, f[7].parse().map_err(|_| bad())?, f[8].parse().map_err(|_| bad())?];
+                    let outline_color = [f[10].parse().map_err(|_| bad())?, f[11].parse().map_err(|_| bad())?, f[12].parse().map_err(|_| bad())?, f[13].parse().map_err(|_| bad())?];
+                    let bg = [f[17].parse().map_err(|_| bad())?, f[18].parse().map_err(|_| bad())?, f[19].parse().map_err(|_| bad())?, f[20].parse().map_err(|_| bad())?];
+                    let g = Gfx { kind, text: unesc, w: f[3].parse().map_err(|_| bad())?, h: f[4].parse().map_err(|_| bad())?,
+                        color, outline: f[9].parse().map_err(|_| bad())?, outline_color, mono: f[14] == "1",
+                        size: f[15].parse().map_err(|_| bad())?, pad: f[16].parse().map_err(|_| bad())?,
+                        bg, align: f[21].parse().map_err(|_| bad())?, shadow: f[22] == "1" };
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == id) { c.gfx = Some(g); }
                 }
                 "K" if f.len() == 6 => {
                     let cid: u32 = f[1].parse().map_err(|_| bad())?;
@@ -1117,4 +1235,26 @@ mod tests {
         assert_eq!(q.clips[0].link, q.clips[1].link);
         assert_eq!(q.clips[1].lane, Lane::A1);
     }
+    #[test]
+    fn graphics_and_audio_settings_survive_save_load_and_undo() {
+        let mut p = Project::empty();
+        let mut g = Gfx::title("hello\nworld");
+        g.color = [12, 34, 56, 200];
+        g.outline = 2.5;
+        let id = p.add_graphic(3.0, g.clone(), "Title");
+        let c = p.clip_mut(id).unwrap();
+        c.audio_gain = 82.0;
+        c.fade_in = 0.75;
+        c.fade_out = 1.25;
+        let q = Project::from_text(&p.to_text()).expect("graphics project parses");
+        assert_eq!(q.clip(id).unwrap().gfx.as_ref(), Some(&g));
+        assert_eq!(q.clip(id).unwrap().audio_gain, 82.0);
+        assert_eq!(q.clip(id).unwrap().fade_in, 0.75);
+        assert_eq!(q.clip(id).unwrap().fade_out, 1.25);
+        assert!(p.undo());
+        assert!(p.clip(id).is_none());
+        assert!(p.redo());
+        assert_eq!(p.clip(id).unwrap().gfx.as_ref(), Some(&g));
+    }
+
 }

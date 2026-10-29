@@ -117,7 +117,7 @@ impl Engine {
 
     /// Call once per frame. `jumped` = the playhead was moved by the user (or an edit happened),
     /// so decoders must be repositioned instead of just following the clock.
-    pub fn update(&mut self, ctx: &Context, proj: &Project, t: f64, playing: bool, jumped: bool, muted: bool) {
+    pub fn update(&mut self, ctx: &Context, proj: &Project, t: f64, playing: bool, jumped: bool, muted: bool, gain: f32) {
         self.tick += 1;
         let play_changed = playing != self.playing;
         self.playing = playing;
@@ -165,6 +165,7 @@ impl Engine {
             if let Some(s) = self.players.get_mut(&a.media) {
                 s.used = self.tick;
                 s.player.set_muted(muted);
+                s.player.set_volume(gain);
             }
         }
         if playing {

@@ -311,6 +311,7 @@ struct AudioShared {
     clock: Clock,
     playing: AtomicBool,
     muted: AtomicBool,
+    gain: AtomicU32, // linear playback gain, updated without locking the audio FIFO
     peak_l: AtomicU32, // positive f32 bit patterns order like the floats -> fetch_max = peak hold
     peak_r: AtomicU32,
 }
@@ -322,6 +323,7 @@ impl AudioShared {
             clock: Clock { base: Instant::now(), t: AtomicU64::new(0), ns: AtomicU64::new(0), run: AtomicBool::new(false) },
             playing: AtomicBool::new(false),
             muted: AtomicBool::new(false),
+            gain: AtomicU32::new(1.0f32.to_bits()),
             peak_l: AtomicU32::new(0),
             peak_r: AtomicU32::new(0),
         }
@@ -537,6 +539,7 @@ where
             let lat = ts.playback.duration_since(&ts.callback).map_or(0.0, |d| d.as_secs_f64());
             let frames = data.len() / ch;
             let muted = sh.muted.load(Relaxed);
+            let gain = f32::from_bits(sh.gain.load(Relaxed)).clamp(0.0, 4.0);
             let mut b = sh.lock();
             let t0 = b.next_t;
             let (mut pl, mut pr) = (0f32, 0f32);
@@ -546,7 +549,7 @@ where
                     break;
                 }
                 let (l, r) = (b.q.pop_front().unwrap_or(0.0), b.q.pop_front().unwrap_or(0.0));
-                let (l, r) = if muted { (0.0, 0.0) } else { (l, r) }; // still consumed: stays in sync
+                let (l, r) = if muted { (0.0, 0.0) } else { (l * gain, r * gain) }; // still consumed: stays in sync
                 pl = pl.max(l.abs());
                 pr = pr.max(r.abs());
                 if ch == 1 {
@@ -672,9 +675,12 @@ impl Player {
     }
 
     pub fn set_muted(&self, on: bool) {
-        if let Some(a) = &self.audio {
-            a.sh.muted.store(on, Relaxed);
-        }
+        if let Some(a) = &self.audio { a.sh.muted.store(on, Relaxed); }
+    }
+
+    /// Set real-time linear audio gain (0..4). Safe to call during playback.
+    pub fn set_volume(&self, gain: f32) {
+        if let Some(a) = &self.audio { a.sh.gain.store(gain.clamp(0.0, 4.0).to_bits(), Relaxed); }
     }
 
     pub fn has_audio(&self) -> bool {

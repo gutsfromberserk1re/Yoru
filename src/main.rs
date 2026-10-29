@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 mod assets;
 mod engine;
 mod fxrender;
+mod gfxdraw;
 mod fxui;
 mod media;
 mod project;
@@ -368,6 +369,7 @@ fn monitor_panel(
     fit: &mut usize,
     quality: &mut usize,
     video: Option<(TextureId, f32)>,
+    overlays: &[gfxdraw::Overlay],
 ) -> bool {
     let mut play = false;
     glass(14.0, 8.0, 14.0, 10.0).show(ui, |ui| {
@@ -408,6 +410,7 @@ fn monitor_panel(
             );
         }
         ui.painter().rect_stroke(r, 6.0, Stroke::new(1.0, rgba(110, 125, 170, 120)));
+        gfxdraw::draw_overlays(ui.painter(), r, overlays);
 
         let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), bar_h), Sense::hover());
         let s = fmt_tc(t);
@@ -1060,7 +1063,7 @@ impl eframe::App for App {
         // playback engine: follow the playhead, switch decoders at cuts, pre-roll the next clip
         let jumped = std::mem::take(&mut self.jumped);
         let muted = self.proj.audio_muted_at(self.t);
-        self.engine.update(ctx, &self.proj, self.t, self.rate == 1, jumped, muted);
+        self.engine.update(ctx, &self.proj, self.t, self.rate == 1, jumped, muted, self.proj.audio_gain_at(self.t));
         // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
         let new_frame = self.engine.poll(self.t).is_some();
         let params = self.proj.video_clip_at(self.t).map(|c| c.fx.eval(c.fx_time(self.t)));
@@ -1080,6 +1083,10 @@ impl eframe::App for App {
         }
         let aspect = self.tex_aspect;
         let video = self.tex.as_ref().map(|t| (t.id(), aspect));
+        let overlays: Vec<gfxdraw::Overlay> = self.proj.clips.iter()
+            .filter(|c| c.gfx.is_some() && c.lane.is_video() && !self.proj.hidden[c.lane.slot()] && c.start <= self.t && self.t < c.end())
+            .filter_map(|c| c.gfx.clone().map(|gfx| gfxdraw::Overlay { gfx, v: c.fx.eval(c.fx_time(self.t)) }))
+            .collect();
         let label = self.project.clone();
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1140,10 +1147,10 @@ impl eframe::App for App {
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
                         .show_inside(ui, |ui| {
-                            fx_changed |= fxui::inspector_panel(ui, inspector, proj, &timeline.sel, *t);
+                            fx_changed |= fxui::inspector_panel(ui, inspector, proj, &mut timeline.sel, *t);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        play |= monitor_panel(ui, &label, *t, playing, fit, quality_idx, video);
+                        play |= monitor_panel(ui, &label, *t, playing, fit, quality_idx, video, &overlays);
                     });
                 });
         }
@@ -1154,6 +1161,7 @@ impl eframe::App for App {
         }
         if fx_changed {
             self.dirty = true;
+            set_duration(self.proj.end().max(10.0));
         }
         if let Some(g) = self.inspector.goto.take() {
             self.seek(g); // keyframe navigation

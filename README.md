@@ -29,6 +29,20 @@ different playhead positions to create keyframes (diamond button adds/removes on
 between them). The value graph shows the curve: drag keys, double-click to add one, right-click to
 remove, click a diamond to pick its easing.
 
+
+## Titles, shapes, and Essential Graphics
+The inspector's **Text** tab creates editable title clips, rectangles, and ellipses at the playhead.
+**Essential Graphics** edits fill/outline colors, opacity, shape dimensions, text background, padding,
+font mode, alignment, and shadow. Graphic clips render over the monitor preview and use the same
+keyframed transform controls as video clips.
+
+## Audio controls
+Select an audio clip and open the **Audio** tab to adjust gain (0–400%) and linear fade-in/fade-out
+durations. Playback gain is applied by the audio output callback without restarting playback.
+
+Graphics and audio settings are saved in the YORU 4 project format; YORU 1–3 projects remain readable.
+They are included in the existing clip-snapshot undo/redo history.
+
 ## Playback resolution
 The **Playback** menu above the monitor (Full, 1/2, 1/4) lowers the decode + preview resolution for
 smoother playback on heavy footage. Default is 1/2.

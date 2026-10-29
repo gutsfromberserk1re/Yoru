@@ -3,7 +3,7 @@
 //! clip's `Fx`; a slider/graph drag becomes a single undo step.
 
 use super::*;
-use crate::project::{Ease, Fx, NPARAM, PARAMS};
+use crate::project::{Ease, Fx, Gfx, GfxKind, NPARAM, PARAMS};
 
 pub struct Inspector {
     pub tab: usize,
@@ -25,19 +25,25 @@ impl Inspector {
 const KEY_BLUE: Color32 = Color32::from_rgb(120, 170, 255);
 
 /// Returns true if an effect value changed this frame.
-pub fn inspector_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32], t: f64) -> bool {
+pub fn inspector_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
     let mut changed = false;
     glass(14.0, 8.0, 14.0, 12.0).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.spacing_mut().item_spacing.y = 4.0;
-        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Text", "Essential Graphics"]);
+        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Text", "Essential Graphics", "Audio"]);
         ui.add_space(6.0);
-        if ins.tab == 0 {
-            changed = effect_controls(ui, ins, proj, sel, t);
-        } else {
-            placeholder(ui, "Not available yet.");
+        match ins.tab {
+            0 => changed = effect_controls(ui, ins, proj, sel, t),
+            1 => changed = text_panel(ui, ins, proj, sel, t),
+            2 => changed = graphics_panel(ui, ins, proj, sel, t),
+            _ => changed = audio_panel(ui, ins, proj, sel, t),
         }
     });
+    // A continuous gesture (slider drag / keyframe drag) is one undo step. Text edits and
+    // discrete controls commit immediately because the pointer is already up.
+    if ins.session.is_some() && !ui.input(|i| i.pointer.any_down()) {
+        if let Some(pre) = ins.session.take() { proj.push_undo(pre); }
+    }
     changed
 }
 
@@ -94,11 +100,146 @@ fn effect_controls(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[
             c.fx = fx;
         }
     }
-    // one undo step per gesture: close it once the mouse is up
-    if ins.session.is_some() && !ui.input(|i| i.pointer.any_down()) {
-        if let Some(pre) = ins.session.take() {
-            proj.push_undo(pre);
+    changed
+}
+
+fn selected_graphic(proj: &Project, sel: &[u32]) -> Option<(u32, crate::project::Gfx)> {
+    sel.iter().find_map(|id| proj.clip(*id).and_then(|c| c.gfx.clone().map(|g| (*id, g))))
+}
+
+fn add_graphic_button(ui: &mut Ui, proj: &mut Project, sel: &mut Vec<u32>, t: f64, kind: GfxKind) -> bool {
+    let (name, gfx) = match kind {
+        GfxKind::Text => ("Title", Gfx::title("Your title")),
+        GfxKind::Rect => ("Rectangle", Gfx::rect()),
+        GfxKind::Ellipse => ("Ellipse", Gfx::ellipse()),
+    };
+    if ui.button(format!("+ {name}")).clicked() {
+        let id = proj.add_graphic(t, gfx, name);
+        sel.clear();
+        sel.push(id);
+        return true;
+    }
+    false
+}
+
+fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
+    let mut created = false;
+    ui.horizontal(|ui| {
+        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Text);
+        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
+        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
+    });
+    ui.add_space(8.0);
+    let Some((id, mut gfx)) = selected_graphic(proj, sel) else {
+        placeholder(ui, "Create a title or shape, or select a graphic clip on the timeline.");
+        return created;
+    };
+    if gfx.kind != GfxKind::Text {
+        ui.label(RichText::new("The selected item is a shape. Use Essential Graphics for its appearance.").color(MUTED));
+        return created;
+    }
+    ui.label(RichText::new("TEXT").color(MUTED).strong());
+    let pre = proj.clips.clone();
+    let mut changed = false;
+    ui.label("Content");
+    changed |= ui.add(egui::TextEdit::multiline(&mut gfx.text).desired_rows(3).desired_width(f32::INFINITY)).changed();
+    ui.horizontal(|ui| {
+        ui.label("Font size");
+        changed |= ui.add(egui::Slider::new(&mut gfx.size, 8.0..=240.0)).changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label("Font");
+        changed |= ui.selectable_value(&mut gfx.mono, false, "Sans").changed();
+        changed |= ui.selectable_value(&mut gfx.mono, true, "Mono").changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label("Alignment");
+        changed |= ui.selectable_value(&mut gfx.align, 0, "Left").changed();
+        changed |= ui.selectable_value(&mut gfx.align, 1, "Center").changed();
+        changed |= ui.selectable_value(&mut gfx.align, 2, "Right").changed();
+    });
+    changed |= ui.checkbox(&mut gfx.shadow, "Drop shadow").changed();
+    if changed {
+        if ins.session.is_none() { ins.session = Some(pre); }
+        if let Some(c) = proj.clip_mut(id) { c.gfx = Some(gfx); }
+    }
+    created || changed
+}
+
+fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
+    let mut created = false;
+    ui.horizontal(|ui| {
+        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Text);
+        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
+        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
+    });
+    ui.separator();
+    ui.label(RichText::new("GRAPHICS IN PROJECT").color(MUTED).strong());
+    let graphics: Vec<(u32, String, bool)> = proj.clips.iter().filter(|c| c.gfx.is_some())
+        .map(|c| (c.id, c.name.clone(), sel.contains(&c.id))).collect();
+    ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+        for (id, name, selected) in graphics {
+            if ui.selectable_label(selected, format!("◇  {name}")).clicked() {
+                sel.clear(); sel.push(id);
+            }
         }
+    });
+    ui.separator();
+    let Some((id, mut gfx)) = selected_graphic(proj, sel) else {
+        placeholder(ui, "Select a graphic to edit its appearance.");
+        return created;
+    };
+    let pre = proj.clips.clone();
+    let mut changed = false;
+    ui.label(RichText::new(match gfx.kind { GfxKind::Text => "TEXT APPEARANCE", GfxKind::Rect => "RECTANGLE", GfxKind::Ellipse => "ELLIPSE" }).color(MUTED).strong());
+    ui.horizontal(|ui| {
+        ui.label("Canvas width");
+        changed |= ui.add(egui::DragValue::new(&mut gfx.w).clamp_range(1.0..=1920.0).speed(2.0)).changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label("Canvas height");
+        changed |= ui.add(egui::DragValue::new(&mut gfx.h).clamp_range(1.0..=1080.0).speed(2.0)).changed();
+    });
+    let mut col = Color32::from_rgba_unmultiplied(gfx.color[0], gfx.color[1], gfx.color[2], gfx.color[3]);
+    ui.horizontal(|ui| { ui.label("Fill"); changed |= ui.color_edit_button_srgba(&mut col).changed(); });
+    gfx.color = col.to_array();
+    let mut outcol = Color32::from_rgba_unmultiplied(gfx.outline_color[0], gfx.outline_color[1], gfx.outline_color[2], gfx.outline_color[3]);
+    ui.horizontal(|ui| { ui.label("Outline"); changed |= ui.color_edit_button_srgba(&mut outcol).changed(); });
+    gfx.outline_color = outcol.to_array();
+    ui.horizontal(|ui| {
+        ui.label("Outline width");
+        changed |= ui.add(egui::Slider::new(&mut gfx.outline, 0.0..=24.0)).changed();
+    });
+    if gfx.kind == GfxKind::Text {
+        let mut bg = Color32::from_rgba_unmultiplied(gfx.bg[0], gfx.bg[1], gfx.bg[2], gfx.bg[3]);
+        ui.horizontal(|ui| { ui.label("Text background"); changed |= ui.color_edit_button_srgba(&mut bg).changed(); });
+        gfx.bg = bg.to_array();
+        ui.horizontal(|ui| { ui.label("Padding"); changed |= ui.add(egui::Slider::new(&mut gfx.pad, 0.0..=80.0)).changed(); });
+        changed |= ui.checkbox(&mut gfx.shadow, "Drop shadow").changed();
+    }
+    if changed {
+        if ins.session.is_none() { ins.session = Some(pre); }
+        if let Some(c) = proj.clip_mut(id) { c.gfx = Some(gfx); }
+    }
+    created || changed
+}
+
+fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32], _t: f64) -> bool {
+    let Some(clip) = sel.iter().find_map(|id| proj.clip(*id).filter(|c| !c.lane.is_video()).cloned()) else {
+        placeholder(ui, "Select an audio clip on A1, A2 or A3.");
+        return false;
+    };
+    let pre = proj.clips.clone();
+    let (mut gain, mut fade_in, mut fade_out) = (clip.audio_gain, clip.fade_in, clip.fade_out);
+    let mut changed = false;
+    ui.label(RichText::new(&clip.name).color(TEXT).strong());
+    ui.horizontal(|ui| { ui.label("Volume"); changed |= ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%")).changed(); });
+    ui.horizontal(|ui| { ui.label("Fade in"); changed |= ui.add(egui::DragValue::new(&mut fade_in).clamp_range(0.0..=clip.dur).speed(0.05).suffix(" s")).changed(); });
+    ui.horizontal(|ui| { ui.label("Fade out"); changed |= ui.add(egui::DragValue::new(&mut fade_out).clamp_range(0.0..=clip.dur).speed(0.05).suffix(" s")).changed(); });
+    ui.label(RichText::new("Gain and fades apply during playback; fades are linear.").size(10.0).color(MUTED));
+    if changed {
+        if ins.session.is_none() { ins.session = Some(pre); }
+        if let Some(c) = proj.clip_mut(clip.id) { c.audio_gain = gain; c.fade_in = fade_in; c.fade_out = fade_out; }
     }
     changed
 }
