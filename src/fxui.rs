@@ -3,7 +3,7 @@
 //! clip's `Fx`; a slider/graph drag becomes a single undo step.
 
 use super::*;
-use crate::project::{Ease, EffectKind, Fx, Gfx, GfxKind, NPARAM, PARAMS, TransitionKind};
+use crate::project::{AudioPreset, Ease, EffectKind, Fx, Gfx, GfxKind, Key, NPARAM, PARAMS, TransitionKind};
 
 pub struct Inspector {
     pub tab: usize,
@@ -260,6 +260,84 @@ fn add_graphic_button(ui: &mut Ui, proj: &mut Project, sel: &mut Vec<u32>, t: f6
     false
 }
 
+fn set_text_track(fx: &mut Fx, index: usize, keys: &[(f64, f32, Ease)]) {
+    if index >= NPARAM { return; }
+    fx.keys[index].clear();
+    for &(t, v, ease) in keys {
+        fx.keys[index].push(Key { t: t.max(0.0), v: v.clamp(PARAMS[index].lo, PARAMS[index].hi), ease });
+    }
+}
+
+fn apply_text_animation(clip: &mut Clip, preset: &str) {
+    let base = clip.fx.base;
+    let start = clip.src_off.max(0.0);
+    let end = start + clip.dur.max(0.1);
+    let d = clip.dur.min(0.7).max(0.18);
+    let x = base[0];
+    let y = base[1];
+    let scale = base[2];
+    let opacity = base[4];
+    match preset {
+        "Fade In" => set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]),
+        "Rise Up" => {
+            set_text_track(&mut clip.fx, 1, &[(start, (y + 90.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Slide Left" => {
+            set_text_track(&mut clip.fx, 0, &[(start, (x - 180.0).clamp(0.0,1920.0), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Slide Right" => {
+            set_text_track(&mut clip.fx, 0, &[(start, (x + 180.0).clamp(0.0,1920.0), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Drop In" => {
+            set_text_track(&mut clip.fx, 1, &[(start, (y - 130.0).clamp(0.0,1080.0), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Pop In" => {
+            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.78).clamp(1.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Fade Out" => set_text_track(&mut clip.fx, 4, &[(end - d, opacity, Ease::Linear), (end, 0.0, Ease::EaseIn)]),
+        "Float In" => {
+            set_text_track(&mut clip.fx, 1, &[(start, (y + 28.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Zoom In" => {
+            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.55).clamp(0.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Soft Zoom" => {
+            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.94).clamp(0.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Bounce In" => {
+            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.72).clamp(0.0,400.0), Ease::EaseOut), (start + d * 0.72, (scale * 1.12).clamp(0.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseInOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d * 0.55, opacity, Ease::EaseOut)]);
+        }
+        "Slam In" => {
+            set_text_track(&mut clip.fx, 2, &[(start, (scale * 1.38).clamp(0.0,400.0), Ease::EaseIn), (start + d, scale, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(0.0,1080.0), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d * 0.55, opacity, Ease::EaseOut)]);
+        }
+        "Rotate In" => {
+            let r = base[3];
+            set_text_track(&mut clip.fx, 3, &[(start, (r - 35.0).clamp(-180.0,180.0), Ease::EaseOut), (start + d, r, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
+        }
+        "Drift Up" => set_text_track(&mut clip.fx, 1, &[(start, (y + 45.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
+        "Drift Down" => set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
+        "Scale Pulse" => set_text_track(&mut clip.fx, 2, &[(start, scale, Ease::EaseOut), (start + d * 0.5, (scale * 1.10).clamp(0.0,400.0), Ease::EaseInOut), (start + d, scale, Ease::EaseOut)]),
+        "Soft Reveal" => {
+            // A gentle left-to-right entrance built from transform/opacity keys, not per-character typing.
+            set_text_track(&mut clip.fx, 0, &[(start, (x - 30.0).clamp(0.0,1920.0), Ease::Linear), (start + d, x, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::Linear)]);
+        }
+        _ => {}
+    }
+}
+
 fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, _t: f64) -> bool {
     let Some((id, mut gfx)) = selected_graphic(proj, sel) else {
         placeholder(ui, "Select a text graphic, or create one in Essential Graphics.");
@@ -290,9 +368,23 @@ fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Ve
         changed |= ui.selectable_value(&mut gfx.align, 2, "Right").changed();
     });
     changed |= ui.checkbox(&mut gfx.shadow, "Drop shadow").changed();
+    ui.separator();
+    ui.label(RichText::new("TEXT ANIMATION PRESETS").color(MUTED).strong());
+    ui.label(RichText::new("Presets create editable transform keyframes on this title clip.").size(9.0).color(MUTED));
+    let mut apply_anim: Option<&'static str> = None;
+    ui.horizontal_wrapped(|ui| {
+        for name in ["Fade In", "Rise Up", "Slide Left", "Slide Right", "Drop In", "Pop In", "Float In", "Fade Out", "Zoom In", "Soft Zoom", "Bounce In", "Slam In", "Rotate In", "Drift Up", "Drift Down", "Scale Pulse", "Soft Reveal"] {
+            if ui.small_button(name).clicked() { apply_anim = Some(name); }
+        }
+    });
     if changed {
-        if ins.session.is_none() { ins.session = Some(pre); }
+        if ins.session.is_none() { ins.session = Some(pre.clone()); }
         if let Some(c) = proj.clip_mut(id) { c.gfx = Some(gfx); }
+    }
+    if let Some(preset) = apply_anim {
+        if ins.session.is_none() { ins.session = Some(pre.clone()); }
+        if let Some(c) = proj.clip_mut(id) { apply_text_animation(c, preset); }
+        changed = true;
     }
     changed
 }
@@ -370,7 +462,17 @@ fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32]
     let (mut gain, mut fade_in, mut fade_out) = (clip.audio_gain_at(local_t), clip.fade_in, clip.fade_out);
     let mut changed = false;
     let mut gain_changed = false;
+    let mut audio_preset = clip.audio_preset;
+    let mut apply_audio_preset = false;
     ui.label(RichText::new(&clip.name).color(TEXT).strong());
+    ui.horizontal(|ui| {
+        ui.label("Audio preset");
+        ComboBox::from_id_salt(("audio_preset", clip.id))
+            .selected_text(audio_preset.label())
+            .show_ui(ui, |ui| for preset in AudioPreset::ALL { ui.selectable_value(&mut audio_preset, preset, preset.label()); });
+        if ui.small_button("Apply").clicked() { apply_audio_preset = true; changed = true; }
+    });
+    ui.label(RichText::new("Audio tone presets render on export; live monitor filtering is not available yet.").size(9.0).color(MUTED));
     ui.horizontal(|ui| {
         ui.label("Volume");
         let slider_changed = ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%")).changed();
@@ -402,6 +504,7 @@ fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32]
         if ins.session.is_none() { ins.session = Some(pre); }
         if let Some(c) = proj.clip_mut(clip.id) {
             if gain_changed { c.set_audio_gain_at(local_t, gain); }
+            if apply_audio_preset { c.audio_preset = audio_preset; }
             c.fade_in = fade_in;
             c.fade_out = fade_out;
         }

@@ -165,11 +165,170 @@ fn apply_effects(src: &[u8], sw: usize, sh: usize, effects: &[EffectInstance], t
             },
             EffectKind::FadeIn => scale_luma(input, (time / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32),
             EffectKind::FadeOut => scale_luma(input, ((duration - time) / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32),
+            EffectKind::Vignette => vignette(input, sw, sh, p[0], p[1]),
+            EffectKind::Pixelate => pixelate(input, sw, sh, p[0].round().max(2.0) as usize),
+            EffectKind::Sepia => tone_mix(input, 0, p[0], 6.0),
+            EffectKind::Grayscale => tone_mix(input, 1, p[0], 6.0),
+            EffectKind::Invert => tone_mix(input, 2, p[0], 6.0),
+            EffectKind::Posterize => tone_mix(input, 3, p[0], p[0].round().max(2.0)),
+            EffectKind::FilmGrain => film_grain(input, sw, sh, p[0], p[1], time),
+            EffectKind::Scanlines => scanlines(input, sw, sh, p[0], p[1].round().max(2.0) as usize),
+            EffectKind::Mirror => {
+                if p[0] < 0.5 { map_pixels(input, sw, sh, |x, y| (sw as f32 - 1.0 - x, y)) }
+                else { map_pixels(input, sw, sh, |x, y| (x, sh as f32 - 1.0 - y)) }
+            }
+            EffectKind::EdgeDetect => edge_detect(input, sw, sh, p[0]),
+            EffectKind::ColorTemperature => color_temperature(input, p[0], p[1]),
+            EffectKind::VHS => vhs(input, sw, sh, p[0], p[1], time),
         };
         current = Some(next);
     }
     current
 }
+
+fn vignette(src: &[u8], sw: usize, sh: usize, strength: f32, radius: f32) -> Vec<u8> {
+    if sw == 0 || sh == 0 { return src.to_vec(); }
+    let mut out = src.to_vec();
+    let (cx, cy) = (sw as f32 * 0.5, sh as f32 * 0.5);
+    let norm = (cx * cx + cy * cy).sqrt().max(1.0);
+    let threshold = radius.clamp(0.1, 1.0);
+    let strength = strength.clamp(0.0, 1.0);
+    for y in 0..sh { for x in 0..sw {
+        let d = (((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt() / norm).clamp(0.0, 1.0);
+        let u = ((d - threshold) / (1.0 - threshold).max(0.001)).clamp(0.0, 1.0);
+        let smooth = u * u * (3.0 - 2.0 * u);
+        let factor = 1.0 - strength * smooth;
+        let i = (y * sw + x) * 4;
+        for c in 0..3 { out[i+c] = (src[i+c] as f32 * factor).round().clamp(0.0, 255.0) as u8; }
+    }}
+    out
+}
+
+fn pixelate(src: &[u8], sw: usize, sh: usize, block: usize) -> Vec<u8> {
+    if sw == 0 || sh == 0 { return src.to_vec(); }
+    let block = block.clamp(2, 64);
+    let mut out = src.to_vec();
+    let mut y0 = 0;
+    while y0 < sh {
+        let mut x0 = 0;
+        let y1 = (y0 + block).min(sh);
+        while x0 < sw {
+            let x1 = (x0 + block).min(sw);
+            let mut sums = [0u64; 4];
+            let mut count = 0u64;
+            for y in y0..y1 { for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                for c in 0..4 { sums[c] += src[i+c] as u64; }
+                count += 1;
+            }}
+            let avg: [u8; 4] = std::array::from_fn(|c| (sums[c] / count.max(1)) as u8);
+            for y in y0..y1 { for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                out[i..i+4].copy_from_slice(&avg);
+            }}
+            x0 = x1;
+        }
+        y0 = y1;
+    }
+    out
+}
+
+/// mode: 0 sepia, 1 grayscale, 2 invert, 3 posterize.
+fn tone_mix(src: &[u8], mode: u8, amount: f32, levels: f32) -> Vec<u8> {
+    let mut out = src.to_vec();
+    let a = (amount / 100.0).clamp(0.0, 1.0);
+    let levels = levels.round().clamp(2.0, 32.0);
+    for px in out.chunks_exact_mut(4) {
+        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let target = match mode {
+            0 => [r*0.393 + g*0.769 + b*0.189, r*0.349 + g*0.686 + b*0.168, r*0.272 + g*0.534 + b*0.131],
+            1 => { let l = 0.2126*r + 0.7152*g + 0.0722*b; [l, l, l] },
+            2 => [255.0-r, 255.0-g, 255.0-b],
+            _ => [r, g, b].map(|v| ((v/255.0*(levels-1.0)).round()/(levels-1.0)*255.0)),
+        };
+        for c in 0..3 { px[c] = (if mode == 3 { target[c] } else { [r,g,b][c]*(1.0-a)+target[c]*a }).round().clamp(0.0,255.0) as u8; }
+    }
+    out
+}
+
+fn film_grain(src: &[u8], sw: usize, sh: usize, amount: f32, size: f32, time: f64) -> Vec<u8> {
+    let mut out = src.to_vec();
+    let tile = size.round().clamp(1.0, 4.0) as usize;
+    let frame = (time.max(0.0) * 24.0).floor() as u64;
+    for y in 0..sh { for x in 0..sw {
+        let bx = (x / tile) as u64;
+        let by = (y / tile) as u64;
+        let seed = bx.wrapping_mul(0x9E3779B185EBCA87) ^ by.wrapping_mul(0xC2B2AE3D27D4EB4F) ^ frame.wrapping_mul(0x165667B19E3779F9);
+        let hash = seed.wrapping_mul(0x27D4EB2F165667C5) ^ (seed >> 29);
+        let noise = (((hash >> 32) & 0xffff) as f32 / 32767.5 - 1.0) * amount.clamp(0.0, 50.0) * 1.25;
+        let i = (y * sw + x) * 4;
+        for c in 0..3 { out[i+c] = (src[i+c] as f32 + noise).round().clamp(0.0,255.0) as u8; }
+    }}
+    out
+}
+
+fn scanlines(src: &[u8], sw: usize, sh: usize, intensity: f32, spacing: usize) -> Vec<u8> {
+    let mut out = src.to_vec();
+    let spacing = spacing.clamp(2, 12);
+    let factor = 1.0 - intensity.clamp(0.0, 100.0) / 100.0;
+    for y in (0..sh).step_by(spacing) { for x in 0..sw {
+        let i = (y * sw + x) * 4;
+        for c in 0..3 { out[i+c] = (src[i+c] as f32 * factor).round().clamp(0.0,255.0) as u8; }
+    }}
+    out
+}
+
+fn edge_detect(src: &[u8], sw: usize, sh: usize, amount: f32) -> Vec<u8> {
+    if sw < 3 || sh < 3 || amount <= 0.0 { return src.to_vec(); }
+    let mut out = src.to_vec();
+    let mix = (amount / 100.0).clamp(0.0, 1.0);
+    let luma = |x: usize, y: usize| {
+        let i = (y * sw + x) * 4;
+        0.2126 * src[i] as f32 + 0.7152 * src[i + 1] as f32 + 0.0722 * src[i + 2] as f32
+    };
+    for y in 1..sh-1 { for x in 1..sw-1 {
+        let gx = -luma(x-1,y-1) + luma(x+1,y-1) - 2.0*luma(x-1,y) + 2.0*luma(x+1,y) - luma(x-1,y+1) + luma(x+1,y+1);
+        let gy = -luma(x-1,y-1) - 2.0*luma(x,y-1) - luma(x+1,y-1) + luma(x-1,y+1) + 2.0*luma(x,y+1) + luma(x+1,y+1);
+        let edge = (gx*gx + gy*gy).sqrt().clamp(0.0, 255.0);
+        let i = (y * sw + x) * 4;
+        for c in 0..3 { out[i+c] = (src[i+c] as f32 * (1.0-mix) + edge * mix).round().clamp(0.0,255.0) as u8; }
+    }}
+    out
+}
+
+fn color_temperature(src: &[u8], temperature: f32, tint: f32) -> Vec<u8> {
+    let mut out = src.to_vec();
+    let warm = temperature.clamp(-100.0, 100.0) * 0.75;
+    let magenta = tint.clamp(-100.0, 100.0) * 0.35;
+    for px in out.chunks_exact_mut(4) {
+        px[0] = (px[0] as f32 + warm + magenta).round().clamp(0.0,255.0) as u8;
+        px[1] = (px[1] as f32 - magenta * 0.65).round().clamp(0.0,255.0) as u8;
+        px[2] = (px[2] as f32 - warm + magenta).round().clamp(0.0,255.0) as u8;
+    }
+    out
+}
+
+fn vhs(src: &[u8], sw: usize, sh: usize, amount: f32, tracking: f32, time: f64) -> Vec<u8> {
+    if sw == 0 || sh == 0 { return src.to_vec(); }
+    let a = (amount.clamp(0.0,100.0) / 100.0);
+    let jitter = a * (tracking.clamp(0.0,100.0) * 0.09 + 2.0);
+    let chroma = a * 2.0;
+    let mut out = src.to_vec();
+    for y in 0..sh {
+        let row_shift = ((y as f32 * 0.13 + time as f32 * 17.0).sin() * jitter).round();
+        let line = if y % 3 == 0 { 1.0 - a * 0.24 } else { 1.0 };
+        for x in 0..sw {
+            let i = (y * sw + x) * 4;
+            let red = sample(src, sw, sh, x as f32 + row_shift + chroma, y as f32)[0] as f32;
+            let blue = sample(src, sw, sh, x as f32 + row_shift - chroma, y as f32)[2] as f32;
+            out[i] = (red * line).round().clamp(0.0,255.0) as u8;
+            out[i+1] = (src[i+1] as f32 * line).round().clamp(0.0,255.0) as u8;
+            out[i+2] = (blue * line).round().clamp(0.0,255.0) as u8;
+        }
+    }
+    out
+}
+
 
 fn sample(src: &[u8], sw: usize, sh: usize, x: f32, y: f32) -> [u8; 4] {
     let (x, y) = (x.clamp(0.0, sw.saturating_sub(1) as f32), y.clamp(0.0, sh.saturating_sub(1) as f32));
@@ -343,6 +502,16 @@ mod tests {
         fx.base[4] = 0.0;
         render(&src, 4, 4, &fx.eval(0.0), &mut dst, 4, 4);
         assert!(dst.chunks_exact(4).all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0));
+    }
+
+    #[test]
+    fn every_registered_effect_renders_a_well_sized_frame() {
+        let src: Vec<u8> = (0..16 * 12 * 4).map(|i| (i * 17 % 256) as u8).collect();
+        for kind in EffectKind::ALL {
+            let effect = EffectInstance::new(kind, 0.2);
+            let out = apply_effects(&src, 16, 12, &[effect], 0.2, 1.0).expect("one enabled effect produces a frame");
+            assert_eq!(out.len(), src.len(), "effect {:?} returned a different frame size", kind);
+        }
     }
 
     #[test]

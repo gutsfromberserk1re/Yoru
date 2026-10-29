@@ -274,14 +274,22 @@ impl Fx {
 pub enum EffectKind {
     Wave, Ripple, Twirl, GaussianBlur, LensBlur, MotionBlur, Glow, Sharpen, RgbSplit,
     Flash, FadeIn, FadeOut,
+    // New kinds are appended so IDs in existing YORU projects remain stable.
+    Vignette, Pixelate, Sepia, Grayscale, Invert, Posterize, FilmGrain, Scanlines,
+    // YORU 8+ additions are append-only so persisted effect IDs remain stable.
+    Mirror, EdgeDetect, ColorTemperature, VHS,
 }
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 12] = [
+    pub const ALL: [EffectKind; 24] = [
         EffectKind::Wave, EffectKind::Ripple, EffectKind::Twirl,
         EffectKind::GaussianBlur, EffectKind::LensBlur, EffectKind::MotionBlur,
         EffectKind::Glow, EffectKind::Sharpen, EffectKind::RgbSplit,
         EffectKind::Flash, EffectKind::FadeIn, EffectKind::FadeOut,
+        EffectKind::Vignette, EffectKind::Pixelate, EffectKind::Sepia,
+        EffectKind::Grayscale, EffectKind::Invert, EffectKind::Posterize,
+        EffectKind::FilmGrain, EffectKind::Scanlines,
+        EffectKind::Mirror, EffectKind::EdgeDetect, EffectKind::ColorTemperature, EffectKind::VHS,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -290,14 +298,23 @@ impl EffectKind {
             Self::MotionBlur => "Directional Motion Blur", Self::Glow => "Glow",
             Self::Sharpen => "Sharpen", Self::RgbSplit => "RGB Split",
             Self::Flash => "Flash", Self::FadeIn => "Fade In", Self::FadeOut => "Fade Out",
+            Self::Vignette => "Vignette", Self::Pixelate => "Pixelate",
+            Self::Sepia => "Sepia Tone", Self::Grayscale => "Black & White",
+            Self::Invert => "Invert Colors", Self::Posterize => "Posterize",
+            Self::FilmGrain => "Film Grain", Self::Scanlines => "Scanlines",
+            Self::Mirror => "Mirror", Self::EdgeDetect => "Edge Detect",
+            Self::ColorTemperature => "Color Temperature", Self::VHS => "VHS / Tape",
         }
     }
     pub fn category(self) -> &'static str {
         match self {
             Self::Wave | Self::Ripple | Self::Twirl | Self::RgbSplit => "Distortion",
             Self::GaussianBlur | Self::LensBlur | Self::MotionBlur | Self::Sharpen => "Blur & Sharpen",
-            Self::Glow => "Light & Stylize",
+            Self::Glow | Self::Vignette | Self::FilmGrain | Self::Scanlines => "Light & Texture",
             Self::Flash | Self::FadeIn | Self::FadeOut => "Transitions",
+            Self::Pixelate | Self::Mirror => "Stylize",
+            Self::Sepia | Self::Grayscale | Self::Invert | Self::Posterize | Self::ColorTemperature => "Color Looks",
+            Self::EdgeDetect | Self::VHS => "Retro & Detail",
         }
     }
     pub fn id(self) -> u8 { Self::ALL.iter().position(|e| *e == self).unwrap_or(0) as u8 }
@@ -316,6 +333,16 @@ impl EffectKind {
             Self::RgbSplit => &RGB_PARAMS,
             Self::Flash => &FLASH_PARAMS,
             Self::FadeIn | Self::FadeOut => &FADE_PARAMS,
+            Self::Vignette => &VIGNETTE_PARAMS,
+            Self::Pixelate => &PIXELATE_PARAMS,
+            Self::Sepia | Self::Grayscale | Self::Invert => &AMOUNT_PARAMS,
+            Self::Posterize => &POSTERIZE_PARAMS,
+            Self::FilmGrain => &GRAIN_PARAMS,
+            Self::Scanlines => &SCANLINE_PARAMS,
+            Self::Mirror => &MIRROR_PARAMS,
+            Self::EdgeDetect => &EDGE_PARAMS,
+            Self::ColorTemperature => &TEMPERATURE_PARAMS,
+            Self::VHS => &VHS_PARAMS,
         }
     }
     pub fn defaults(self) -> [f32; 4] {
@@ -375,6 +402,31 @@ static FLASH_PARAMS: [EffectParamDef; 3] = [
     EffectParamDef { name: "Start", min: 0.0, max: 3600.0, default: 0.0, suffix: " s" },
 ];
 static FADE_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Duration", min: 0.02, max: 10.0, default: 1.0, suffix: " s" }];
+static VIGNETTE_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Strength", min: 0.0, max: 1.0, default: 0.55, suffix: "" },
+    EffectParamDef { name: "Radius", min: 0.1, max: 1.0, default: 0.68, suffix: "" },
+];
+static PIXELATE_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Block size", min: 2.0, max: 64.0, default: 12.0, suffix: " px" }];
+static AMOUNT_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Amount", min: 0.0, max: 100.0, default: 100.0, suffix: "%" }];
+static POSTERIZE_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Levels", min: 2.0, max: 32.0, default: 6.0, suffix: "" }];
+static GRAIN_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Amount", min: 0.0, max: 50.0, default: 10.0, suffix: "" },
+    EffectParamDef { name: "Grain size", min: 1.0, max: 4.0, default: 1.0, suffix: "×" },
+];
+static SCANLINE_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Intensity", min: 0.0, max: 100.0, default: 30.0, suffix: "%" },
+    EffectParamDef { name: "Spacing", min: 2.0, max: 12.0, default: 3.0, suffix: " px" },
+];
+static MIRROR_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Axis", min: 0.0, max: 1.0, default: 0.0, suffix: " (0=H, 1=V)" }];
+static EDGE_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Amount", min: 0.0, max: 100.0, default: 75.0, suffix: "%" }];
+static TEMPERATURE_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Temperature", min: -100.0, max: 100.0, default: 15.0, suffix: "" },
+    EffectParamDef { name: "Tint", min: -100.0, max: 100.0, default: 0.0, suffix: "" },
+];
+static VHS_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Amount", min: 0.0, max: 100.0, default: 45.0, suffix: "%" },
+    EffectParamDef { name: "Tracking", min: 0.0, max: 100.0, default: 25.0, suffix: "%" },
+];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct EffectKey {
@@ -445,11 +497,16 @@ impl EffectInstance {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TransitionKind { Dissolve, DipToBlack, WipeLeft, Flash }
+pub enum TransitionKind { Dissolve, DipToBlack, WipeLeft, Flash, WipeRight, WipeUp, WipeDown, CircleIris, DiagonalWipe, DiamondIris }
 impl TransitionKind {
-    pub const ALL: [TransitionKind; 4] = [Self::Dissolve, Self::DipToBlack, Self::WipeLeft, Self::Flash];
+    pub const ALL: [TransitionKind; 10] = [Self::Dissolve, Self::DipToBlack, Self::WipeLeft, Self::Flash, Self::WipeRight, Self::WipeUp, Self::WipeDown, Self::CircleIris, Self::DiagonalWipe, Self::DiamondIris];
     pub fn label(self) -> &'static str {
-        match self { Self::Dissolve => "Cross Dissolve", Self::DipToBlack => "Dip to Black", Self::WipeLeft => "Wipe Left", Self::Flash => "Flash Transition" }
+        match self {
+            Self::Dissolve => "Cross Dissolve", Self::DipToBlack => "Dip to Black", Self::WipeLeft => "Wipe Left",
+            Self::Flash => "Flash Transition", Self::WipeRight => "Wipe Right", Self::WipeUp => "Wipe Up",
+            Self::WipeDown => "Wipe Down", Self::CircleIris => "Circle Iris",
+            Self::DiagonalWipe => "Diagonal Wipe", Self::DiamondIris => "Diamond Iris",
+        }
     }
     pub fn id(self) -> u8 { Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as u8 }
     pub fn from_id(id: u8) -> Option<Self> { Self::ALL.get(id as usize).copied() }
@@ -463,6 +520,24 @@ pub struct Transition {
 }
 impl Transition {
     pub fn new(kind: TransitionKind) -> Self { Self { kind, duration: 0.8, enabled: true } }
+}
+
+// Non-destructive audio processing presets. They are applied by the export mixer; raw source media is unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioPreset { Neutral, Voice, MusicBed, Cinematic, Telephone, LoFi, Underwater, Podcast, BassBoost, BrightVoice, Reverb, Muffled }
+impl AudioPreset {
+    pub const ALL: [AudioPreset; 12] = [Self::Neutral, Self::Voice, Self::MusicBed, Self::Cinematic, Self::Telephone, Self::LoFi, Self::Underwater, Self::Podcast, Self::BassBoost, Self::BrightVoice, Self::Reverb, Self::Muffled];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Neutral => "Neutral", Self::Voice => "Voice Clear", Self::MusicBed => "Music Bed",
+            Self::Cinematic => "Cinematic", Self::Telephone => "Telephone / Radio",
+            Self::LoFi => "Lo-Fi", Self::Underwater => "Underwater",
+            Self::Podcast => "Podcast / Spoken Word", Self::BassBoost => "Bass Boost",
+            Self::BrightVoice => "Bright Voice", Self::Reverb => "Room Reverb", Self::Muffled => "Muffled / Distant",
+        }
+    }
+    pub fn id(self) -> u8 { Self::ALL.iter().position(|p| *p == self).unwrap_or(0) as u8 }
+    pub fn from_id(id: u8) -> Option<Self> { Self::ALL.get(id as usize).copied() }
 }
 
 // ---------------------------------------------------------------- title / shape graphics
@@ -544,6 +619,7 @@ pub struct Clip {
     pub gfx: Option<Gfx>,
     /// Audio controls stored as percent gain and seconds of linear fades.
     pub audio_gain: f32,
+    pub audio_preset: AudioPreset,
     pub fade_in: f64,
     pub fade_out: f64,
     /// Clip-local gain automation (seconds from the start of this timeline clip).
@@ -711,7 +787,7 @@ impl Project {
             fx: Fx::default(),
             effects: Vec::new(),
             transition_in: None,
-            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
+            gfx: None, audio_gain: 100.0, audio_preset: AudioPreset::Neutral, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
         });
     }
 
@@ -724,7 +800,7 @@ impl Project {
             id, link: 0, lane: Lane::V(2), start: t.max(0.0), dur, src_off: 0.0,
             src_len: f64::INFINITY, name: name.to_string(), seed: id % 9 + 1,
             media: None, fx: Fx::default(), effects: Vec::new(), transition_in: None, gfx: Some(gfx),
-            audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
+            audio_gain: 100.0, audio_preset: AudioPreset::Neutral, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
         });
         self.push_undo(pre);
         id
@@ -949,7 +1025,7 @@ impl Project {
             fx: Fx::default(),
             effects: Vec::new(),
             transition_in: None,
-            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
+            gfx: None, audio_gain: 100.0, audio_preset: AudioPreset::Neutral, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
         });
         let mut movers = vec![vid];
         if with_audio {
@@ -968,7 +1044,7 @@ impl Project {
                 fx: Fx::default(),
                 effects: Vec::new(),
                 transition_in: None,
-                gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
+                gfx: None, audio_gain: 100.0, audio_preset: AudioPreset::Neutral, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
             });
             movers.push(aid);
         }
@@ -1260,7 +1336,7 @@ impl Project {
     // ---------------------------------------------------------------- save / load
     /// Plain-text project format (tab separated; names/paths are the last field of a line).
     pub fn to_text(&self) -> String {
-        let mut s = String::from("YORU 7\n");
+        let mut s = String::from("YORU 9\n");
         s += &format!("N\t{}\n", self.next_id);
         for m in &self.media {
             s += &format!(
@@ -1299,6 +1375,7 @@ impl Project {
                     g.mono as u8, g.size, g.pad, g.bg[0], g.bg[1], g.bg[2], g.bg[3], g.align, g.shadow as u8, esc);
             }
             s += &format!("A\t{}\t{}\t{}\t{}\n", c.id, c.audio_gain, c.fade_in, c.fade_out);
+            s += &format!("AP\t{}\t{}\n", c.id, c.audio_preset.id());
             for key in &c.audio_keys {
                 s += &format!("AK\t{}\t{}\t{}\t{}\n", c.id, key.t, key.v, key.ease.id());
             }
@@ -1335,6 +1412,8 @@ impl Project {
             Some("YORU 5") => 5,
             Some("YORU 6") => 6,
             Some("YORU 7") => 7,
+            Some("YORU 8") => 8,
+            Some("YORU 9") => 9,
             _ => return Err("not a Yoru project file".into()),
         };
         let mut p = Project::empty();
@@ -1376,7 +1455,7 @@ impl Project {
                         fx,
                         effects: Vec::new(),
                         transition_in: None,
-                        gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
+                        gfx: None, audio_gain: 100.0, audio_preset: AudioPreset::Neutral, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
                         name: f[f.len() - 1].to_string(),
                     });
                 }
@@ -1391,6 +1470,11 @@ impl Project {
                         c.fade_in = f[3].parse().map_err(|_| bad())?;
                         c.fade_out = f[4].parse().map_err(|_| bad())?;
                     }
+                }
+                "AP" if ver >= 8 && f.len() == 3 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    let preset = AudioPreset::from_id(f[2].parse().map_err(|_| bad())?).ok_or_else(bad)?;
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == id) { c.audio_preset = preset; }
                 }
                 "E" if ver >= 5 && f.len() == 9 => {
                     let cid: u32 = f[1].parse().map_err(|_| bad())?;
@@ -1649,28 +1733,40 @@ mod tests {
 
 
     #[test]
-    fn yoru7_proxy_transition_effect_and_audio_keys_round_trip() {
+    fn yoru9_proxy_transition_effect_and_audio_keys_round_trip() {
         let (mut p, media_id) = media_project();
         p.set_proxy_path(media_id, Some(PathBuf::from("proxies/a.mp4")));
         let video_id = p.clips.iter().find(|c| c.lane.is_video()).unwrap().id;
         let audio_id = p.clips.iter().find(|c| !c.lane.is_video()).unwrap().id;
         {
             let video = p.clip_mut(video_id).unwrap();
-            video.transition_in = Some(Transition { kind: TransitionKind::Dissolve, duration: 0.6, enabled: true });
+            video.transition_in = Some(Transition { kind: TransitionKind::DiamondIris, duration: 0.6, enabled: true });
             let mut effect = EffectInstance::new(EffectKind::Wave, 0.0);
             effect.keys[0].push(EffectKey { t: 0.0, v: 5.0, ease: Ease::Linear });
             effect.keys[0].push(EffectKey { t: 1.0, v: 32.0, ease: Ease::EaseOut });
             video.effects.push(effect);
         }
         p.clip_mut(audio_id).unwrap().audio_keys.push(EffectKey { t: 0.5, v: 82.0, ease: Ease::EaseInOut });
+        p.clip_mut(audio_id).unwrap().audio_preset = AudioPreset::Podcast;
 
         let saved = p.to_text();
-        assert!(saved.starts_with("YORU 7\n"));
-        let q = Project::from_text(&saved).expect("YORU 7 project parses");
+        assert!(saved.starts_with("YORU 9\n"));
+        let q = Project::from_text(&saved).expect("YORU 9 project parses");
         assert_eq!(q.media(media_id).unwrap().proxy_path.as_deref(), Some(Path::new("proxies/a.mp4")));
-        assert_eq!(q.clip(video_id).unwrap().transition_in.unwrap().kind, TransitionKind::Dissolve);
+        assert_eq!(q.clip(video_id).unwrap().transition_in.unwrap().kind, TransitionKind::DiamondIris);
         assert_eq!(q.clip(video_id).unwrap().effects[0].keys[0].len(), 2);
         assert_eq!(q.clip(audio_id).unwrap().audio_keys[0].v, 82.0);
+        assert_eq!(q.clip(audio_id).unwrap().audio_preset, AudioPreset::Podcast);
+    }
+
+    #[test]
+    fn yoru8_projects_still_load_after_v9_expansion() {
+        let (p, _) = media_project();
+        let old_text = p.to_text().replacen("YORU 9\n", "YORU 8\n", 1);
+        let q = Project::from_text(&old_text).expect("YORU 8 project remains readable");
+        for c in &q.clips {
+            assert_eq!(c.audio_preset, AudioPreset::Neutral);
+        }
     }
 
     #[test]
@@ -1680,12 +1776,27 @@ mod tests {
         let before = p.clips.clone();
         p.clip_mut(id).unwrap().effects.push(EffectInstance::new(EffectKind::Wave, 0.75));
         p.clip_mut(id).unwrap().effects.push(EffectInstance::new(EffectKind::GaussianBlur, 0.75));
+        p.clip_mut(id).unwrap().effects.push(EffectInstance::new(EffectKind::VHS, 0.9));
         let saved = p.to_text();
         let q = Project::from_text(&saved).expect("effect project parses");
         assert_eq!(q.clip(id).unwrap().effects, p.clip(id).unwrap().effects);
         p.push_undo(before);
         assert!(p.undo());
         assert!(p.clip(id).unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn expanded_effect_and_transition_ids_are_append_only() {
+        assert_eq!(EffectKind::from_id(0), Some(EffectKind::Wave));
+        assert_eq!(EffectKind::from_id(11), Some(EffectKind::FadeOut));
+        assert_eq!(EffectKind::from_id(19), Some(EffectKind::Scanlines));
+        assert_eq!(EffectKind::from_id(23), Some(EffectKind::VHS));
+        assert_eq!(TransitionKind::from_id(0), Some(TransitionKind::Dissolve));
+        assert_eq!(TransitionKind::from_id(7), Some(TransitionKind::CircleIris));
+        assert_eq!(TransitionKind::from_id(9), Some(TransitionKind::DiamondIris));
+        assert_eq!(AudioPreset::from_id(6), Some(AudioPreset::Underwater));
+        assert_eq!(AudioPreset::from_id(7), Some(AudioPreset::Podcast));
+        assert_eq!(AudioPreset::from_id(11), Some(AudioPreset::Muffled));
     }
 
 }

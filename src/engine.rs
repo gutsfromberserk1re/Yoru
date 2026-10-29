@@ -74,7 +74,7 @@ impl Engine {
 
     /// Drop a decoder so the next update reopens it from the current preview path (proxy or source).
     pub fn invalidate_media(&mut self, media: u32) {
-        if let Some(slot) = self.players.remove(&media) {
+        if let Some(mut slot) = self.players.remove(&media) {
             slot.player.set_playing(false, None);
         }
         self.failed.remove(&media);

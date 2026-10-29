@@ -453,10 +453,13 @@ fn placeholder(ui: &mut Ui, text: &str) {
 const CLIP_NAMES: [&str; 10] = [
     "Cabana", "Mountain gold", "Jungle forest", "Hammock", "Waterfall", "Beach", "Pool", "Rocks", "Trail", "Canopy",
 ];
-const EFFECTS: [(&str, &[&str]); 4] = [
+const EFFECTS: [(&str, &[&str]); 7] = [
     ("Distortion", &["Wave Warp", "Ripple", "Twirl", "RGB Split"]),
     ("Blur & Sharpen", &["Gaussian Blur", "Lens Blur", "Directional Motion Blur", "Sharpen"]),
-    ("Light & Stylize", &["Glow"]),
+    ("Light & Texture", &["Glow", "Vignette", "Film Grain", "Scanlines"]),
+    ("Color Looks", &["Sepia Tone", "Black & White", "Invert Colors", "Posterize", "Color Temperature"]),
+    ("Retro & Detail", &["VHS / Tape", "Edge Detect"]),
+    ("Stylize", &["Pixelate", "Mirror"]),
     ("Transitions", &["Flash", "Fade In", "Fade Out"]),
 ];
 

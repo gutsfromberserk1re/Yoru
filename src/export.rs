@@ -1,6 +1,6 @@
 //! Offline export pipeline using a bundled FFmpeg command-line build.
 //! The UI stays responsive while FFmpeg renders in a worker thread.
-use crate::project::{Clip, EffectInstance, EffectKind, GfxKind, Project, TransitionKind};
+use crate::project::{AudioPreset, Clip, EffectInstance, EffectKind, GfxKind, Project, TransitionKind};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -189,6 +189,53 @@ fn filters_for_effect(effect: &EffectInstance, clip_duration: f64) -> Vec<String
             let factor = format!("min(max(({}-T)/max(({}),0.02),0),1)", num(clip_duration), p(0));
             vec![format!("geq=r='r(X,Y)*({factor})':g='g(X,Y)*({factor})':b='b(X,Y)*({factor})':a='alpha(X,Y)'")]
         }
+        EffectKind::Vignette => {
+            let dist = "(hypot(X-W/2,Y-H/2)/max(hypot(W/2,H/2),1))";
+            let u = format!("min(max((({dist})-({}))/max(1-({}),0.01),0),1)", p(1), p(1));
+            let factor = format!("(1-min(max(({}),0),1)*({u})*({u})*(3-2*({u})))", p(0));
+            vec![format!("geq=r='r(X,Y)*({factor})':g='g(X,Y)*({factor})':b='b(X,Y)*({factor})':a='alpha(X,Y)'")]
+        }
+        EffectKind::Pixelate => {
+            let block = effect.params[0].round().clamp(2.0, 64.0) as u32;
+            vec![format!("scale=w='max(2,trunc(iw/{block}))':h='max(2,trunc(ih/{block}))':flags=neighbor,scale=w='max(2,iw*{block})':h='max(2,ih*{block})':flags=neighbor")]
+        }
+        EffectKind::Sepia => {
+            let a = (effect.params[0] / 100.0).clamp(0.0, 1.0);
+            vec![format!("colorchannelmixer=rr={}:rg={}:rb={}:gr={}:gg={}:gb={}:br={}:bg={}:bb={}",
+                fnum(1.0-0.607*a), fnum(0.769*a), fnum(0.189*a), fnum(0.349*a), fnum(1.0-0.314*a), fnum(0.168*a), fnum(0.272*a), fnum(0.534*a), fnum(1.0-0.869*a))]
+        }
+        EffectKind::Grayscale => vec![format!("hue=s='max(0,1-({})/100)'", p(0).replace('T', "t"))],
+        EffectKind::Invert => {
+            let a = (effect.params[0] / 100.0).clamp(0.0, 1.0);
+            vec![format!("lutrgb=r='val*(1-{a})+(255-val)*{a}':g='val*(1-{a})+(255-val)*{a}':b='val*(1-{a})+(255-val)*{a}'")]
+        }
+        EffectKind::Posterize => {
+            let levels = effect.params[0].round().clamp(2.0, 32.0) as u32;
+            let denom = levels - 1;
+            vec![format!("lutrgb=r='round(val*{denom}/255)*255/{denom}':g='round(val*{denom}/255)*255/{denom}':b='round(val*{denom}/255)*255/{denom}'")]
+        }
+        EffectKind::FilmGrain => vec![format!("noise=alls={}:allf=t+u", num((effect.params[0] * 0.8).clamp(0.0, 40.0)))],
+        EffectKind::Scanlines => {
+            let amount = format!("({}/100)", fnum(effect.params[0].clamp(0.0, 100.0)));
+            let spacing = effect.params[1].round().clamp(2.0, 12.0) as u32;
+            let factor = format!("(1-{amount}*eq(mod(Y,{spacing}),0))");
+            vec![format!("geq=r='r(X,Y)*({factor})':g='g(X,Y)*({factor})':b='b(X,Y)*({factor})':a='alpha(X,Y)'")]
+        }
+        EffectKind::Mirror => if effect.params[0] < 0.5 { vec!["hflip".to_string()] } else { vec!["vflip".to_string()] },
+        EffectKind::EdgeDetect => {
+            let a = (effect.params[0] / 100.0).clamp(0.0, 1.0);
+            vec![format!("edgedetect=low={}:high={}:mode=colormix", num((0.02 + (1.0-a)*0.18) as f64), num((0.08 + (1.0-a)*0.52) as f64))]
+        }
+        EffectKind::ColorTemperature => {
+            let temp = (effect.params[0] / 100.0).clamp(-1.0, 1.0);
+            let tint = (effect.params[1] / 100.0).clamp(-1.0, 1.0);
+            vec![format!("colorbalance=rs={}:gs={}:bs={}:rm={}:gm={}:bm={}", fnum(temp*0.35+tint*0.12), fnum(-tint*0.18), fnum(-temp*0.35+tint*0.12), fnum(temp*0.22), fnum(-tint*0.14), fnum(-temp*0.22))]
+        }
+        EffectKind::VHS => {
+            let a = (effect.params[0] / 100.0).clamp(0.0, 1.0);
+            let track = (effect.params[1] / 100.0).clamp(0.0, 1.0);
+            vec![format!("noise=alls={}:allf=t+u", num((a*14.0) as f64)), format!("chromashift=cbh={}:crh={}", num((a*3.0+track*2.0) as f64), num(-(a*3.0+track*2.0) as f64)), format!("eq=contrast={}:saturation={}:eval=frame", num((1.0+a*0.18) as f64), num((1.0+a*0.22) as f64))]
+        }
     }
 }
 
@@ -222,39 +269,70 @@ fn transform_filters(clip: &Clip, settings: &ExportSettings) -> Vec<String> {
 
 fn graphic_filter(clip: &Clip, duration: f64, settings: &ExportSettings, label: &str) -> String {
     let g = clip.gfx.as_ref().expect("graphic clip");
-    let v = clip.fx.eval(clip.src_off);
-    let cx = v[0] / 1920.0 * settings.width as f32;
-    let cy = v[1] / 1080.0 * settings.height as f32;
-    let scale = (v[2] / 100.0).max(0.0);
-    let opacity = (v[4] / 100.0).clamp(0.0, 1.0);
-    let w = (g.w * scale * settings.width as f32 / 1920.0).max(1.0);
-    let h = (g.h * scale * settings.height as f32 / 1080.0).max(1.0);
-    let x = cx - w * 0.5;
-    let y = cy - h * 0.5;
+    let base_scale = (clip.fx.base[2] / 100.0).max(0.0);
+    let rotation = clip.fx.base[3];
+    let px = clip_param_expr(clip, 0, clip.src_off).replace('T', "t");
+    let py = clip_param_expr(clip, 1, clip.src_off).replace('T', "t");
+    let sc = clip_param_expr(clip, 2, clip.src_off).replace('T', "t");
+    let op = clip_param_expr(clip, 4, clip.src_off).replace('T', "t");
+    let cx = format!("(({px})/1920*iw)");
+    let cy = format!("(({py})/1080*ih)");
+    let w = format!("max(1,{}*({sc})/100*iw/1920)", num(g.w as f64));
+    let h = format!("max(1,{}*({sc})/100*ih/1080)", num(g.h as f64));
+    let x = format!("({cx})-({w})/2");
+    let y = format!("({cy})-({h})/2");
+    let static_w = (g.w * base_scale * settings.width as f32 / 1920.0).max(1.0);
+    let static_h = (g.h * base_scale * settings.height as f32 / 1080.0).max(1.0);
+    let font_size = format!("max(1,{}*({sc})/100*h/1080)", num(g.size as f64));
     let mut chain = format!("color=c=black@0.0:s={}x{}:r={}:d={},format=rgba", settings.width, settings.height, settings.fps, num(duration));
     match g.kind {
         GfxKind::Rect | GfxKind::Ellipse => {
-            chain.push_str(&format!(",drawbox=x={}:y={}:w={}:h={}:color={}:t=fill", num(x as f64), num(y as f64), num(w as f64), num(h as f64), alpha(g.color)));
+            chain.push_str(&format!(",drawbox=x='{}':y='{}':w='{}':h='{}':color={}:t=fill", x, y, w, h, alpha(g.color)));
             if g.outline > 0.0 {
-                let ow = (g.outline * scale * settings.width as f32 / 1920.0).max(1.0);
-                chain.push_str(&format!(",drawbox=x={}:y={}:w={}:h={}:color={}:t={}", num(x as f64), num(y as f64), num(w as f64), num(h as f64), alpha(g.outline_color), (ow.round().max(1.0) as u32)));
+                let ow = (g.outline * base_scale * settings.width as f32 / 1920.0).max(1.0);
+                chain.push_str(&format!(",drawbox=x='({})-{}':y='({})-{}':w='({})+{}':h='({})+{}':color={}:t={}",
+                    x, num(ow as f64), y, num(ow as f64), w, num((2.0*ow) as f64), h, num((2.0*ow) as f64), alpha(g.outline_color), (ow.round().max(1.0) as u32)));
             }
             if g.kind == GfxKind::Ellipse {
-                chain.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(pow((X-{})/{}/2,2)+pow((Y-{})/{}/2,2),1),alpha(X,Y),0)'", num(cx as f64), num(w as f64), num(cy as f64), num(h as f64)));
+                let pxg = clip_param_expr(clip, 0, clip.src_off);
+                let pyg = clip_param_expr(clip, 1, clip.src_off);
+                let cxg = format!("(({pxg})/1920*W)");
+                let cyg = format!("(({pyg})/1080*H)");
+                let sg = clip_param_expr(clip, 2, clip.src_off);
+                let wg = format!("max(1,{}*({sg})/100*W/1920)", num(g.w as f64));
+                let hg = format!("max(1,{}*({sg})/100*H/1080)", num(g.h as f64));
+                chain.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(pow((X-{})/({})*2,2)+pow((Y-{})/({})*2,2),1),alpha(X,Y),0)'", cxg, wg, cyg, hg));
             }
         }
         GfxKind::Text => {
-            let font_size = (g.size * scale * settings.height as f32 / 1080.0).max(1.0);
             let font = "C\\:/Windows/Fonts/arial.ttf";
             if g.bg[3] > 0 {
-                chain.push_str(&format!(",drawbox=x={}:y={}:w={}:h={}:color={}:t=fill", num(x as f64), num(y as f64), num(w as f64), num(h as f64), alpha(g.bg)));
+                chain.push_str(&format!(",drawbox=x='{}':y='{}':w='{}':h='{}':color={}:t=fill", x, y, w, h, alpha(g.bg)));
             }
-            let x_expr = match g.align { 0 => format!("{}", num(x as f64)), 2 => format!("{}-text_w", num(cx as f64 + w * 0.5)), _ => format!("{}-text_w/2", num(cx as f64)) };
-            chain.push_str(&format!(",drawtext=fontfile='{}':text='{}':fontcolor={}:fontsize={}:x={}:y='{}-text_h/2':borderw={}:bordercolor={}:shadowx={}:shadowy={}", font, filter_text(&g.text), alpha(g.color), num(font_size as f64), x_expr, num(cy as f64), num(g.outline as f64), alpha(g.outline_color), if g.shadow { "2" } else { "0" }, if g.shadow { "2" } else { "0" }));
+            let cx_text = format!("(({px})/1920*w)");
+            let cy_text = format!("(({py})/1080*h)");
+            let x_text = format!("({cx_text})-text_w/2");
+            // `cx_text` is the graphic center; the text alignment is relative to the
+            // graphic box. Keep these as FFmpeg expressions (Strings) instead of doing
+            // mixed f32/f64 arithmetic in Rust during filter construction.
+            let x_expr = match g.align {
+                0 => format!("({cx_text})-({w})/2"),
+                2 => format!("({cx_text})+({w})/2-text_w"),
+                _ => format!("({cx_text})-text_w/2"),
+            };
+            chain.push_str(&format!(",drawtext=fontfile='{}':text='{}':fontcolor={}:fontsize='{}':x='{}':y='({})-text_h/2':borderw={}:bordercolor={}:shadowx={}:shadowy={}",
+                font, filter_text(&g.text), alpha(g.color), font_size, x_expr, cy_text,
+                num(g.outline as f64), alpha(g.outline_color), if g.shadow { "2" } else { "0" }, if g.shadow { "2" } else { "0" }));
         }
     }
-    if opacity < 0.999 { chain.push_str(&format!(",colorchannelmixer=aa={}", num(opacity as f64))); }
+    if rotation.abs() > 0.01 {
+        chain.push_str(&format!(",rotate={}:ow=rotw(iw):oh=roth(ih):fillcolor=black@0", num(rotation as f64 * std::f64::consts::PI / 180.0)));
+    }
+    // geq uses uppercase T for frame time. This keeps opacity keyframes in exported graphic layers.
+    let opg = clip_param_expr(clip, 4, clip.src_off);
+    chain.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*min(max(({})/100,0),1)'", opg));
     chain.push_str(&format!(",setpts=PTS-STARTPTS+{}/TB[{}]", num(clip.start), label));
+    let _ = (static_w, static_h, op);
     chain
 }
 
@@ -308,6 +386,12 @@ pub fn build_args(project: &Project, output: &Path, settings: &ExportSettings, s
                     TransitionKind::DipToBlack => filters.push(format!("fade=t=in:st=0:d={d}:color=black")),
                     TransitionKind::WipeLeft => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(X,W*min(T/{d},1)),alpha(X,Y),0)'")),
                     TransitionKind::Flash => filters.push(format!("fade=t=in:st=0:d={d}:color=white")),
+                    TransitionKind::WipeRight => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gte(X,W*(1-min(T/{d},1))),alpha(X,Y),0)'")),
+                    TransitionKind::WipeUp => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gte(Y,H*(1-min(T/{d},1))),alpha(X,Y),0)'")),
+                    TransitionKind::WipeDown => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(Y,H*min(T/{d},1)),alpha(X,Y),0)'")),
+                    TransitionKind::CircleIris => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-W/2,Y-H/2),hypot(W/2,H/2)*min(T/{d},1)),alpha(X,Y),0)'")),
+                    TransitionKind::DiagonalWipe => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(X/W+Y/H,2*min(T/{d},1)),alpha(X,Y),0)'")),
+                    TransitionKind::DiamondIris => filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(abs(X-W/2)/max(W/2,1)+abs(Y-H/2)/max(H/2,1),2*min(T/{d},1)),alpha(X,Y),0)'")),
                 }
             }
             let extend = ordered_video.iter().filter(|n| n.lane == clip.lane && n.start >= clip.end() - 0.03 && n.start <= clip.end() + 0.03)
@@ -344,6 +428,20 @@ pub fn build_args(project: &Project, output: &Path, settings: &ExportSettings, s
         let label = format!("aud{}", clip.id);
         let gain_expr = audio_gain_expr(clip).replace('T', "t");
         let mut f = vec![format!("atrim=start={}:duration={}", num(clip.src_off), num(clip.dur)), "asetpts=PTS-STARTPTS".to_string(), format!("volume=volume='(({gain_expr})/100)':eval=frame")];
+        match clip.audio_preset {
+            AudioPreset::Neutral => {},
+            AudioPreset::Voice => f.extend(["highpass=f=85".to_string(), "equalizer=f=2800:t=q:w=1:g=2".to_string(), "acompressor=threshold=0.16:ratio=2.5:attack=10:release=120".to_string()]),
+            AudioPreset::MusicBed => f.extend(["equalizer=f=120:t=q:w=1:g=1.2".to_string(), "acompressor=threshold=0.28:ratio=1.6:attack=20:release=220".to_string()]),
+            AudioPreset::Cinematic => f.extend(["highpass=f=35".to_string(), "equalizer=f=70:t=q:w=1:g=2.5".to_string(), "acompressor=threshold=0.22:ratio=2.2:attack=8:release=180".to_string()]),
+            AudioPreset::Telephone => f.extend(["highpass=f=280".to_string(), "lowpass=f=3400".to_string(), "acompressor=threshold=0.20:ratio=3:attack=5:release=100".to_string()]),
+            AudioPreset::LoFi => f.extend(["highpass=f=150".to_string(), "lowpass=f=5000".to_string(), "acrusher=bits=10:mix=0.15".to_string()]),
+            AudioPreset::Underwater => f.extend(["lowpass=f=900".to_string(), "aecho=0.8:0.9:120:0.25".to_string()]),
+            AudioPreset::Podcast => f.extend(["highpass=f=75".to_string(), "lowpass=f=13500".to_string(), "equalizer=f=3200:t=q:w=1:g=2.5".to_string(), "acompressor=threshold=0.13:ratio=3:attack=8:release=130".to_string()]),
+            AudioPreset::BassBoost => f.extend(["equalizer=f=95:t=q:w=1:g=5".to_string(), "acompressor=threshold=0.25:ratio=1.8:attack=25:release=220".to_string()]),
+            AudioPreset::BrightVoice => f.extend(["highpass=f=100".to_string(), "equalizer=f=4800:t=q:w=1:g=3".to_string(), "acompressor=threshold=0.18:ratio=2.4:attack=6:release=100".to_string()]),
+            AudioPreset::Reverb => f.extend(["aecho=0.85:0.82:55|110|165:0.22|0.14|0.08".to_string()]),
+            AudioPreset::Muffled => f.extend(["lowpass=f=1900".to_string(), "highpass=f=120".to_string(), "aecho=0.8:0.85:90:0.12".to_string()]),
+        }
         if clip.fade_in > 0.0 { f.push(format!("afade=t=in:st=0:d={}", num(clip.fade_in.min(clip.dur)))); }
         if clip.fade_out > 0.0 { f.push(format!("afade=t=out:st={}:d={}", num((clip.dur - clip.fade_out).max(0.0)), num(clip.fade_out.min(clip.dur)))); }
         f.push(format!("adelay=delays={}:all=1", (clip.start.max(0.0) * 1000.0).round() as u64));
