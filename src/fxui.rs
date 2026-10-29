@@ -3,7 +3,7 @@
 //! clip's `Fx`; a slider/graph drag becomes a single undo step.
 
 use super::*;
-use crate::project::{AudioPreset, Ease, EffectKind, Fx, Gfx, GfxKind, Key, NPARAM, PARAMS, TransitionKind};
+use crate::project::{AudioPreset, Ease, EffectKind, Fx, Gfx, GfxKind, Key, NPARAM, PARAMS};
 
 pub struct Inspector {
     pub tab: usize,
@@ -16,11 +16,12 @@ pub struct Inspector {
     session: Option<Vec<Clip>>,
     /// Timeline time the app should jump to (keyframe navigation).
     pub goto: Option<f64>,
+    pub focus_text_on_next_frame: bool,
 }
 
 impl Inspector {
     pub fn new() -> Self {
-        Self { tab: 0, sel_param: 0, sel_key: None, graph_key: None, sel_effect: None, sel_effect_clip: None, session: None, goto: None }
+        Self { tab: 0, sel_param: 0, sel_key: None, graph_key: None, sel_effect: None, sel_effect_clip: None, session: None, goto: None, focus_text_on_next_frame: false }
     }
 }
 
@@ -30,9 +31,9 @@ const KEY_BLUE: Color32 = Color32::from_rgb(120, 170, 255);
 pub fn inspector_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
     let mut changed = false;
     glass(14.0, 8.0, 14.0, 12.0).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
+        paint_panel_gradient(ui, 14.0, 8.0, 14.0, 12.0);
         ui.spacing_mut().item_spacing.y = 4.0;
-        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Text", "Essential Graphics", "Audio"]);
+        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Text Animation", "Essential Graphics", "Audio"]);
         ui.add_space(6.0);
         match ins.tab {
             0 => changed = effect_controls(ui, ins, proj, sel, t),
@@ -125,40 +126,8 @@ fn effect_stack(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, clip_id: u
         ins.sel_effect = if effects.is_empty() { None } else { Some(effects.len() - 1) };
     }
     if !effects.is_empty() && ins.sel_effect.is_none() { ins.sel_effect = Some(effects.len() - 1); }
-    // Inbound transition controls are kept with the selected clip's actual effect stack.
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("TRANSITION IN").color(MUTED).strong());
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if clip.transition_in.is_some() && ui.small_button("Remove").clicked() {
-                if let Some(c) = proj.clip_mut(clip_id) { c.transition_in = None; }
-                proj.push_undo(pre.clone());
-                modified = true;
-            }
-        });
-    });
-    let mut transition_kind = clip.transition_in.map(|tr| tr.kind).unwrap_or(TransitionKind::Dissolve);
-    let mut transition_duration = clip.transition_in.map(|tr| tr.duration).unwrap_or(0.8);
-    let mut transition_enabled = clip.transition_in.map(|tr| tr.enabled).unwrap_or(true);
-    let mut apply_transition = false;
-    ui.horizontal(|ui| {
-        ComboBox::from_id_salt(("transition_kind", clip_id))
-            .selected_text(transition_kind.label())
-            .show_ui(ui, |ui| for kind in TransitionKind::ALL { ui.selectable_value(&mut transition_kind, kind, kind.label()); });
-        if ui.small_button(if clip.transition_in.is_some() { "Update" } else { "+ Apply" }).clicked() { apply_transition = true; }
-    });
-    if clip.transition_in.is_some() {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut transition_enabled, "Enabled");
-            ui.add(Slider::new(&mut transition_duration, 0.05..=clip.dur.min(5.0) as f32).text("Duration"));
-        });
-    }
-    if apply_transition || clip.transition_in.map_or(false, |tr| tr.duration != transition_duration || tr.enabled != transition_enabled || tr.kind != transition_kind) {
-        if ins.session.is_none() { ins.session = Some(pre.clone()); }
-        if let Some(c) = proj.clip_mut(clip_id) {
-            c.transition_in = Some(crate::project::Transition { kind: transition_kind, duration: transition_duration.clamp(0.05, clip.dur.min(5.0) as f32), enabled: transition_enabled });
-        }
-        modified = true;
-    }
+    // Clip transitions live in the dedicated Transitions browser; keep this panel focused on
+    // the selected clip's effect stack and keyframe parameters.
     ui.add_space(5.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("APPLIED EFFECTS").color(MUTED).strong());
@@ -280,19 +249,19 @@ fn apply_text_animation(clip: &mut Clip, preset: &str) {
     match preset {
         "Fade In" => set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]),
         "Rise Up" => {
-            set_text_track(&mut clip.fx, 1, &[(start, (y + 90.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 1, &[(start, (y + 90.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
         }
         "Slide Left" => {
-            set_text_track(&mut clip.fx, 0, &[(start, (x - 180.0).clamp(0.0,1920.0), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 0, &[(start, (x - 180.0).clamp(PARAMS[0].lo, PARAMS[0].hi), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
         }
         "Slide Right" => {
-            set_text_track(&mut clip.fx, 0, &[(start, (x + 180.0).clamp(0.0,1920.0), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 0, &[(start, (x + 180.0).clamp(PARAMS[0].lo, PARAMS[0].hi), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
         }
         "Drop In" => {
-            set_text_track(&mut clip.fx, 1, &[(start, (y - 130.0).clamp(0.0,1080.0), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 1, &[(start, (y - 130.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
         }
         "Pop In" => {
@@ -301,7 +270,7 @@ fn apply_text_animation(clip: &mut Clip, preset: &str) {
         }
         "Fade Out" => set_text_track(&mut clip.fx, 4, &[(end - d, opacity, Ease::Linear), (end, 0.0, Ease::EaseIn)]),
         "Float In" => {
-            set_text_track(&mut clip.fx, 1, &[(start, (y + 28.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 1, &[(start, (y + 28.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
         }
         "Zoom In" => {
@@ -318,20 +287,20 @@ fn apply_text_animation(clip: &mut Clip, preset: &str) {
         }
         "Slam In" => {
             set_text_track(&mut clip.fx, 2, &[(start, (scale * 1.38).clamp(0.0,400.0), Ease::EaseIn), (start + d, scale, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(0.0,1080.0), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d * 0.55, opacity, Ease::EaseOut)]);
         }
         "Rotate In" => {
             let r = base[3];
-            set_text_track(&mut clip.fx, 3, &[(start, (r - 35.0).clamp(-180.0,180.0), Ease::EaseOut), (start + d, r, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 3, &[(start, (r - 35.0).clamp(PARAMS[3].lo, PARAMS[3].hi), Ease::EaseOut), (start + d, r, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
         }
-        "Drift Up" => set_text_track(&mut clip.fx, 1, &[(start, (y + 45.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
-        "Drift Down" => set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(0.0,1080.0), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
+        "Drift Up" => set_text_track(&mut clip.fx, 1, &[(start, (y + 45.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
+        "Drift Down" => set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
         "Scale Pulse" => set_text_track(&mut clip.fx, 2, &[(start, scale, Ease::EaseOut), (start + d * 0.5, (scale * 1.10).clamp(0.0,400.0), Ease::EaseInOut), (start + d, scale, Ease::EaseOut)]),
         "Soft Reveal" => {
             // A gentle left-to-right entrance built from transform/opacity keys, not per-character typing.
-            set_text_track(&mut clip.fx, 0, &[(start, (x - 30.0).clamp(0.0,1920.0), Ease::Linear), (start + d, x, Ease::EaseOut)]);
+            set_text_track(&mut clip.fx, 0, &[(start, (x - 30.0).clamp(PARAMS[0].lo, PARAMS[0].hi), Ease::Linear), (start + d, x, Ease::EaseOut)]);
             set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::Linear)]);
         }
         _ => {}
@@ -339,36 +308,15 @@ fn apply_text_animation(clip: &mut Clip, preset: &str) {
 }
 
 fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, _t: f64) -> bool {
-    let Some((id, mut gfx)) = selected_graphic(proj, sel) else {
-        placeholder(ui, "Select a text graphic, or create one in Essential Graphics.");
+    let Some((id, gfx)) = selected_graphic(proj, sel) else {
+        placeholder(ui, "Select a title or press T to create one.");
         return false;
     };
     if gfx.kind != GfxKind::Text {
-        ui.label(RichText::new("The selected item is a shape. Use Essential Graphics for its appearance.").color(MUTED));
+        ui.label(RichText::new("Select a text layer to apply title animations.").color(MUTED));
         return false;
     }
-    ui.label(RichText::new("TEXT").color(MUTED).strong());
     let pre = proj.clips.clone();
-    let mut changed = false;
-    ui.label("Content");
-    changed |= ui.add(egui::TextEdit::multiline(&mut gfx.text).desired_rows(3).desired_width(f32::INFINITY)).changed();
-    ui.horizontal(|ui| {
-        ui.label("Font size");
-        changed |= ui.add(egui::Slider::new(&mut gfx.size, 8.0..=240.0)).changed();
-    });
-    ui.horizontal(|ui| {
-        ui.label("Font");
-        changed |= ui.selectable_value(&mut gfx.mono, false, "Sans").changed();
-        changed |= ui.selectable_value(&mut gfx.mono, true, "Mono").changed();
-    });
-    ui.horizontal(|ui| {
-        ui.label("Alignment");
-        changed |= ui.selectable_value(&mut gfx.align, 0, "Left").changed();
-        changed |= ui.selectable_value(&mut gfx.align, 1, "Center").changed();
-        changed |= ui.selectable_value(&mut gfx.align, 2, "Right").changed();
-    });
-    changed |= ui.checkbox(&mut gfx.shadow, "Drop shadow").changed();
-    ui.separator();
     ui.label(RichText::new("TEXT ANIMATION PRESETS").color(MUTED).strong());
     ui.label(RichText::new("Presets create editable transform keyframes on this title clip.").size(9.0).color(MUTED));
     let mut apply_anim: Option<&'static str> = None;
@@ -377,26 +325,34 @@ fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Ve
             if ui.small_button(name).clicked() { apply_anim = Some(name); }
         }
     });
-    if changed {
-        if ins.session.is_none() { ins.session = Some(pre.clone()); }
-        if let Some(c) = proj.clip_mut(id) { c.gfx = Some(gfx); }
-    }
     if let Some(preset) = apply_anim {
-        if ins.session.is_none() { ins.session = Some(pre.clone()); }
+        if ins.session.is_none() { ins.session = Some(pre); }
         if let Some(c) = proj.clip_mut(id) { apply_text_animation(c, preset); }
-        changed = true;
+        return true;
     }
-    changed
+    false
 }
 
 fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
     let mut created = false;
-    ui.label(RichText::new("CREATE GRAPHIC").color(MUTED).strong());
     ui.horizontal(|ui| {
-        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Text);
-        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
-        created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
+        ui.label(RichText::new("TITLES").color(MUTED).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let add_text = add_graphic_button(ui, proj, sel, t, GfxKind::Text);
+            if add_text {
+                created = true;
+                ins.focus_text_on_next_frame = true;
+            }
+        });
     });
+    CollapsingHeader::new("Add shapes")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
+                created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
+            });
+        });
     ui.separator();
     ui.label(RichText::new("GRAPHIC LAYERS").color(MUTED).strong());
     let graphics: Vec<(u32, String, bool)> = proj.clips.iter().filter(|c| c.gfx.is_some())
@@ -415,7 +371,35 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     };
     let pre = proj.clips.clone();
     let mut changed = false;
-    ui.label(RichText::new(match gfx.kind { GfxKind::Text => "TEXT APPEARANCE", GfxKind::Rect => "RECTANGLE", GfxKind::Ellipse => "ELLIPSE" }).color(MUTED).strong());
+    let mut fx = proj.clip(id).map(|c| c.fx.clone()).unwrap_or_default();
+    let fx_time = proj.clip(id).map(|c| c.fx_time(t)).unwrap_or(0.0);
+    let mut transform_changed = false;
+    ui.label(RichText::new(match gfx.kind { GfxKind::Text => "TEXT LAYER", GfxKind::Rect => "RECTANGLE", GfxKind::Ellipse => "ELLIPSE" }).color(MUTED).strong());
+    if gfx.kind == GfxKind::Text {
+        ui.label("Text content");
+        let text_resp = ui.add(egui::TextEdit::multiline(&mut gfx.text).hint_text("Type your title...").desired_rows(3).desired_width(f32::INFINITY));
+        changed |= text_resp.changed();
+        if ins.focus_text_on_next_frame {
+            ui.memory_mut(|memory| memory.request_focus(text_resp.id));
+            ins.focus_text_on_next_frame = false;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Font size");
+            changed |= ui.add(egui::Slider::new(&mut gfx.size, 8.0..=240.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Font");
+            changed |= ui.selectable_value(&mut gfx.mono, false, "Sans").changed();
+            changed |= ui.selectable_value(&mut gfx.mono, true, "Mono").changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Alignment");
+            changed |= ui.selectable_value(&mut gfx.align, 0, "Left").changed();
+            changed |= ui.selectable_value(&mut gfx.align, 1, "Center").changed();
+            changed |= ui.selectable_value(&mut gfx.align, 2, "Right").changed();
+        });
+        changed |= ui.checkbox(&mut gfx.shadow, "Drop shadow").changed();
+    }
     // Width and height affect the geometry of a shape. Text is laid out from its content and
     // font size, so showing canvas dimensions for text would be misleading (and do nothing).
     if gfx.kind != GfxKind::Text {
@@ -443,18 +427,44 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
         ui.horizontal(|ui| { ui.label("Text background"); changed |= ui.color_edit_button_srgba(&mut bg).changed(); });
         gfx.bg = bg.to_array();
         ui.horizontal(|ui| { ui.label("Padding"); changed |= ui.add(egui::Slider::new(&mut gfx.pad, 0.0..=80.0)).changed(); });
-        changed |= ui.checkbox(&mut gfx.shadow, "Drop shadow").changed();
     }
-    if changed {
+    CollapsingHeader::new("Transform")
+        .default_open(true)
+        .show(ui, |ui| {
+            for (index, label) in [(0usize, "Position X"), (1, "Position Y"), (2, "Scale"), (3, "Rotation"), (4, "Opacity")] {
+                ui.horizontal(|ui| {
+                    ui.add_sized([82.0, 18.0], Label::new(RichText::new(label).size(10.0).color(MUTED)));
+                    let mut value = fx.value(index, fx_time);
+                    let def = &PARAMS[index];
+                    let speed = if index <= 1 { 1.0 } else if index == 3 { 1.0 } else { 0.5 };
+                    let response = ui.add_sized(
+                        [ui.available_width(), 20.0],
+                        egui::DragValue::new(&mut value)
+                            .clamp_range(def.lo..=def.hi)
+                            .speed(speed)
+                            .fixed_decimals(0)
+                            .suffix(def.suffix),
+                    );
+                    if response.changed() {
+                        fx.set_value(index, fx_time, value);
+                        transform_changed = true;
+                    }
+                });
+            }
+        });
+    if changed || transform_changed {
         if ins.session.is_none() { ins.session = Some(pre); }
-        if let Some(c) = proj.clip_mut(id) { c.gfx = Some(gfx); }
+        if let Some(c) = proj.clip_mut(id) {
+            if changed { c.gfx = Some(gfx); }
+            if transform_changed { c.fx = fx; }
+        }
     }
-    created || changed
+    created || changed || transform_changed
 }
 
 fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32], timeline_t: f64) -> bool {
     let Some(clip) = sel.iter().find_map(|id| proj.clip(*id).filter(|c| !c.lane.is_video()).cloned()) else {
-        placeholder(ui, "Select an audio clip on A1, A2 or A3.");
+        placeholder(ui, "Select an audio clip on A1, A2 or another audio track.");
         return false;
     };
     let pre = proj.clips.clone();
@@ -554,7 +564,12 @@ fn param_row(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, i: usize, ts: f64, c
         let mut v = fx.value(i, ts);
         let before = v;
         let w = (ui.available_width() - 138.0).max(36.0);
-        slider(ui, &mut v, def.lo, def.hi, w);
+        let (slider_lo, slider_hi) = match i {
+            0 => (-1920.0, 3840.0),
+            1 => (-1080.0, 2160.0),
+            _ => (def.lo, def.hi),
+        };
+        slider(ui, &mut v, slider_lo, slider_hi, w);
 
         let drag_speed = match i {
             0 | 1 => 0.5, // position: pixel-ish units per pointer point
@@ -624,18 +639,30 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
     let i = ins.sel_param.min(NPARAM - 1);
     let def = &PARAMS[i];
     ui.label(RichText::new(format!("Value graph  -  {}", def.name)).size(10.0).color(MUTED));
-    let h = (ui.available_height() - 58.0).clamp(110.0, 360.0);
+    // Keep the graph compact enough to avoid forcing the inspector/panel to resize. Position and
+    // rotation use a data-fit vertical range so wide off-screen values remain easy to keyframe.
+    let h = (ui.available_height() - 58.0).clamp(100.0, 240.0);
+    let (graph_lo, graph_hi) = if matches!(i, 0 | 1 | 3) {
+        let mut values = vec![fx.base[i]];
+        values.extend(fx.keys[i].iter().map(|k| k.v));
+        let minv = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let maxv = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let minimum_span = if i == 3 { 360.0 } else if i == 0 { 600.0 } else { 400.0 };
+        let span = (maxv - minv).max(minimum_span);
+        let pad = (span * 0.18).max(minimum_span * 0.25);
+        ((minv - pad).max(def.lo), (maxv + pad).min(def.hi))
+    } else { (def.lo, def.hi) };
+    let graph_span = (graph_hi - graph_lo).max(1e-3);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click_and_drag());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 6.0, rgba(8, 14, 36, 170));
 
     let plot = rect.shrink(10.0);
     let (t0, t1) = (clip.src_off, clip.src_off + clip.dur.max(0.1));
-    let span = (def.hi - def.lo).max(1e-3);
     let x_of = |t: f64| plot.left() + ((t - t0) / (t1 - t0)) as f32 * plot.width();
-    let y_of = |v: f32| plot.bottom() - (v - def.lo) / span * plot.height();
+    let y_of = |v: f32| plot.bottom() - (v - graph_lo) / graph_span * plot.height();
     let t_of = |x: f32| (t0 + ((x - plot.left()) / plot.width().max(1.0)) as f64 * (t1 - t0)).clamp(t0, t1);
-    let v_of = |y: f32| (def.lo + (plot.bottom() - y) / plot.height().max(1.0) * span).clamp(def.lo, def.hi);
+    let v_of = |y: f32| (graph_lo + (plot.bottom() - y) / plot.height().max(1.0) * graph_span).clamp(graph_lo, graph_hi);
 
     for k in 0..=4 {
         let y = plot.top() + plot.height() * k as f32 / 4.0;

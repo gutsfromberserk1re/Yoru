@@ -27,7 +27,7 @@ mod project;
 mod timeline;
 
 use assets::Assets;
-use project::{Clip, EffectKind, EffectInstance, Lane, Project, NPARAM, PARAMS};
+use project::{Clip, EffectKind, EffectInstance, Gfx, Lane, Project, TransitionKind, NPARAM, PARAMS};
 use timeline::{timeline_panel, Ghost, Timeline, Tool};
 
 // ------------------------------------------------------------------ settings
@@ -74,7 +74,7 @@ const TEXT: Color32 = POWDER;
 const MUTED: Color32 = GLAUCOUS;
 const DEEP: Color32 = Color32::from_rgb(0x22, 0x25, 0x30);
 /// Panel glass: very dark navy, ~84% opaque (premultiplied RGBA; lower the last number for more see-through).
-const PANEL_BG: Color32 = Color32::from_rgba_premultiplied(6, 13, 39, 215);
+const PANEL_BG: Color32 = Color32::TRANSPARENT;
 const DOT_COLORS: [Color32; 3] = [
     Color32::from_rgb(0x48, 0x52, 0x66),
     Color32::from_rgb(0x5E, 0x6B, 0x82),
@@ -255,11 +255,54 @@ fn paint_icon_btn(ui: &Ui, r: &Response, k: Ico, checked: bool, isz: f32) {
 
 // ------------------------------------------------------------------ small widgets
 fn glass(l: f32, t: f32, r: f32, b: f32) -> Frame {
+    // The panel fill is painted as a mesh gradient immediately inside its contents.
+    // Keeping the egui frame transparent avoids covering that gradient with a solid fill.
     Frame::none()
         .fill(PANEL_BG)
         .stroke(Stroke::new(1.0, panel_border()))
         .rounding(8.0)
         .inner_margin(Margin { left: l, right: r, top: t, bottom: b })
+}
+
+/// Warm graphite / amber / rose gradient sampled from Yoru's window backdrop.
+/// Paint this at the beginning of each panel's frame closure so controls remain on top.
+fn paint_panel_gradient(ui: &Ui, left: f32, top: f32, right: f32, bottom: f32) {
+    let content = ui.max_rect();
+    let rect = Rect::from_min_max(
+        pos2(content.left() - left + 1.0, content.top() - top + 1.0),
+        pos2(content.right() + right - 1.0, content.bottom() + bottom - 1.0),
+    );
+    if rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
+    let tl = rgba(126, 105, 104, 249);   // graphite mauve
+    let tr = rgba(198, 146, 91, 249);    // warm amber
+    let br = rgba(104, 111, 122, 249);   // brushed steel
+    let bl = rgba(166, 108, 123, 249);   // dusty rose
+    let mix = |a: Color32, b: Color32, t: f32| a.lerp_to_gamma(b, t.clamp(0.0, 1.0));
+    let mut mesh = Mesh::default();
+    let center_col = mix(mix(tl, tr, 0.5), mix(bl, br, 0.5), 0.5);
+    mesh.colored_vertex(rect.center(), center_col);
+    let corners = [
+        (rect.right() - 8.0, rect.top() + 8.0, -90.0f32),
+        (rect.right() - 8.0, rect.bottom() - 8.0, 0.0),
+        (rect.left() + 8.0, rect.bottom() - 8.0, 90.0),
+        (rect.left() + 8.0, rect.top() + 8.0, 180.0),
+    ];
+    const SEG: usize = 5;
+    for (cx, cy, start) in corners {
+        for i in 0..=SEG {
+            let a = (start + 90.0 * i as f32 / SEG as f32).to_radians();
+            let point = pos2(cx + 8.0 * a.cos(), cy + 8.0 * a.sin());
+            let u = ((point.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let v = ((point.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+            let top_col = mix(tl, tr, u);
+            let bot_col = mix(bl, br, u);
+            let col = mix(top_col, bot_col, v);
+            mesh.colored_vertex(point, col);
+        }
+    }
+    let n = mesh.vertices.len() as u32 - 1;
+    for i in 1..=n { mesh.add_triangle(0, i, if i == n { 1 } else { i + 1 }); }
+    ui.painter().add(Shape::mesh(mesh));
 }
 
 fn tab_strip(ui: &mut Ui, idx: &mut usize, names: &[&str]) {
@@ -292,7 +335,7 @@ fn slider(ui: &mut Ui, val: &mut f32, lo: f32, hi: f32, width: f32) {
             *val = (lo + (hi - lo) * f).round();
         }
     }
-    let f = (*val - lo) / (hi - lo);
+    let f = ((*val - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0);
     let x = rect.left() + 6.0 + (rect.width() - 12.0) * f;
     let cy = rect.center().y;
     let p = ui.painter();
@@ -383,7 +426,7 @@ fn monitor_panel(
     let mut play = false;
     let mut export = false;
     glass(14.0, 8.0, 14.0, 10.0).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
+        paint_panel_gradient(ui, 14.0, 8.0, 14.0, 10.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new(project).color(MUTED));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -460,7 +503,7 @@ const EFFECTS: [(&str, &[&str]); 7] = [
     ("Color Looks", &["Sepia Tone", "Black & White", "Invert Colors", "Posterize", "Color Temperature"]),
     ("Retro & Detail", &["VHS / Tape", "Edge Detect"]),
     ("Stylize", &["Pixelate", "Mirror"]),
-    ("Transitions", &["Flash", "Fade In", "Fade Out"]),
+    ("Flash & Fade", &["Flash", "Fade In", "Fade Out"]),
 ];
 
 struct Browser {
@@ -469,6 +512,8 @@ struct Browser {
     view: usize, // 0 = thumbnail grid, 1 = compact list
     search: String,
     fx_sel: Option<&'static str>,
+    transition_sel: Option<TransitionKind>,
+    transition_duration: f32,
 }
 
 /// Returns the media id the user asked to add to the timeline (double-click).
@@ -479,16 +524,17 @@ fn browser_panel(
     assets: &Assets,
     drag: &mut Option<u32>,
     effect_drag: &mut Option<EffectKind>,
+    transition_drag: &mut Option<TransitionKind>,
     import_requested: &mut bool,
     proxy_requested: &mut Option<u32>,
 ) -> Option<u32> {
     let mut add = None;
     glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
+        paint_panel_gradient(ui, 12.0, 8.0, 12.0, 12.0);
         ui.spacing_mut().item_spacing.y = 8.0;
         // The Project bin owns the imported media pool. Grid/list are two views of the same
         // assets, not separate panels; Effects remains its own tab.
-        tab_strip(ui, &mut b.tab, &["Project", "Effects"]);
+        tab_strip(ui, &mut b.tab, &["Project", "Effects", "Transitions"]);
         match b.tab {
             0 => {
                 ui.horizontal(|ui| {
@@ -516,7 +562,7 @@ fn browser_panel(
                     });
                 }
             }
-            _ => {
+            1 => {
                 ui.add(
                     TextEdit::singleline(&mut b.search)
                         .hint_text("Search effects")
@@ -554,6 +600,34 @@ fn browser_panel(
                                 }
                             }
                         });
+                    }
+                });
+            }
+            _ => {
+                ui.add(
+                    TextEdit::singleline(&mut b.search)
+                        .hint_text("Search video transitions")
+                        .desired_width(f32::INFINITY)
+                        .margin(vec2(10.0, 5.0)),
+                );
+                ui.label(RichText::new("Drag a transition onto the start of a video clip.").size(9.0).color(MUTED));
+                ui.add(Slider::new(&mut b.transition_duration, 0.05..=5.0).text("Duration").suffix(" s"));
+                let q = b.search.trim().to_lowercase();
+                ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    for kind in TransitionKind::ALL {
+                        let label = kind.label();
+                        if !q.is_empty() && !label.to_lowercase().contains(&q) { continue; }
+                        let selected = b.transition_sel == Some(kind);
+                        let fill = if selected { rgba(200, 140, 115, 70) } else { Color32::TRANSPARENT };
+                        let resp = ui.add_sized(
+                            [ui.available_width(), 28.0],
+                            Button::new(label).fill(fill).frame(false).sense(Sense::click_and_drag()),
+                        ).on_hover_text("Drag onto a video clip to set its inbound transition");
+                        if resp.clicked() { b.transition_sel = Some(kind); }
+                        if resp.drag_started() {
+                            *transition_drag = Some(kind);
+                            b.transition_sel = Some(kind);
+                        }
                     }
                 });
             }
@@ -858,6 +932,7 @@ struct App {
     applied_quality: usize,
     drag_media: Option<u32>,
     effect_drag: Option<EffectKind>,
+    transition_drag: Option<TransitionKind>,
     ghost: Option<Ghost>,
     last_params: Option<[f32; NPARAM]>,
     last_effects: Option<Vec<EffectInstance>>,
@@ -890,7 +965,7 @@ impl App {
             fit: 0,
             timeline: Timeline::new(),
             inspector: fxui::Inspector::new(),
-            browser: Browser { tab: 0, sel: 0, view: 0, search: String::new(), fx_sel: None },
+            browser: Browser { tab: 0, sel: 0, view: 0, search: String::new(), fx_sel: None, transition_sel: None, transition_duration: 0.8 },
             proj: Project::new(),
             engine: engine::Engine::new(),
             jumped: false,
@@ -902,6 +977,7 @@ impl App {
             applied_quality: 1,
             drag_media: None,
             effect_drag: None,
+            transition_drag: None,
             ghost: None,
             last_params: None,
             last_effects: None,
@@ -1291,6 +1367,16 @@ impl App {
             }
         }
 
+        // Create a title at the playhead (Premiere-style Type tool shortcut).
+        if k(Key::T, none) {
+            let id = self.proj.add_graphic(self.t, Gfx::title(""), "Title");
+            self.timeline.sel.clear();
+            self.timeline.sel.push(id);
+            self.inspector.tab = 2; // Essential Graphics
+            self.inspector.focus_text_on_next_frame = true;
+            self.after_edit();
+        }
+
         // ---- transport
         if k(Key::Space, none) {
             self.toggle_play();
@@ -1509,13 +1595,13 @@ impl eframe::App for App {
         let mut proxy_requested: Option<u32> = None;
         let mut fx_changed = false;
         {
-            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, effect_drag, ghost, .. } = self;
+            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, effect_drag, transition_drag, ghost, .. } = self;
             let playing = *rate > 0;
 
             TopBottomPanel::bottom("bottom")
                 .resizable(true)
-                .default_height(372.0)
-                .height_range(240.0..=720.0)
+                .default_height(285.0)
+                .height_range(210.0..=350.0)
                 .show_separator_line(false)
                 .frame(Frame::none().inner_margin(Margin { left: 12.0, right: 12.0, top: 6.0, bottom: 12.0 }))
                 .show(ctx, |ui| {
@@ -1526,10 +1612,10 @@ impl eframe::App for App {
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
                         .show_inside(ui, |ui| {
-                            add_media = browser_panel(ui, browser, proj, assets, drag_media, effect_drag, &mut import_requested, &mut proxy_requested);
+                            add_media = browser_panel(ui, browser, proj, assets, drag_media, effect_drag, transition_drag, &mut import_requested, &mut proxy_requested);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref(), effect_drag);
+                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref(), effect_drag, transition_drag, browser.transition_duration);
                         edited |= r.0;
                         seeked |= r.1;
                     });
@@ -1557,6 +1643,7 @@ impl eframe::App for App {
         // A dropped effect is either consumed by the timeline or cancelled if released elsewhere.
         if ctx.input(|i| i.pointer.primary_released()) {
             self.effect_drag = None;
+            self.transition_drag = None;
         }
 
         // Import goes into the Project bin only. Users can then drag or double-click media

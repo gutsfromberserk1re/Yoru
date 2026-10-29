@@ -49,7 +49,7 @@ keyframed transform controls as video clips.
 Select an audio clip and open the **Audio** tab to adjust gain (0–400%) and linear fade-in/fade-out
 durations. Playback gain is applied by the audio output callback without restarting playback.
 
-Graphics and audio settings are saved in the YORU project format. Newer versions remain readable by this build through YORU 1–7 compatibility.
+Graphics and audio settings are saved in the YORU project format. This build reads older YORU 1–8 projects; YORU 9 adds additional effect, transition, and audio-preset IDs.
 They are included in the existing clip-snapshot undo/redo history.
 
 ## Playback resolution and seeking
@@ -71,7 +71,9 @@ source file has moved or been deleted, that source still needs to be restored to
 ## Video effects
 
 Yoru's Effects browser includes non-destructive Wave Warp, Ripple, Twirl, Gaussian Blur, Lens Blur,
-Directional Motion Blur, Glow, Sharpen, RGB Split, Flash, Fade In, and Fade Out. Drag an effect onto
+Directional Motion Blur, Glow, Sharpen, RGB Split, Vignette, Pixelate, Sepia, Black & White,
+Invert, Posterize, Film Grain, Scanlines, Mirror, Edge Detect, Color Temperature, VHS/Tape, Flash,
+and fades. Drag an effect onto
 a video clip in the timeline to apply it. Select the clip and use **Effect Controls → Applied Effects**
 to enable/disable, reorder, reset, tune, or remove each effect. The timeline displays an `FX` badge and
 the number of enabled effects on a clip. Keyframe interpolation supports Linear, Ease In, Ease Out,
@@ -87,7 +89,7 @@ support also varies by filter. Always check a short render before a long export.
 - **Keyframe effects** from Effect Controls by clicking the diamond at the playhead. Parameter tracks are saved in `.yoru` projects; choose Linear, Ease In, Ease Out, Ease In/Out, or Hold for each keyframe segment.
 - **Transitions** can be applied on a selected video clip in Effect Controls → Transition In. Supported transitions are Cross Dissolve, Dip to Black, Wipe Left, and Flash. Their duration and enabled state are stored in the project and marked on the timeline.
 - **Audio gain automation** is available in the Audio inspector. Click the diamond next to Volume to add/remove a keyframe, change the gain at different positions, and select key easing. Export mixes all non-hidden audio clips from the timeline with per-clip gain, fades, automation, and a final limiter. Live monitor playback still follows the active video source's audio clock; a full low-latency real-time multitrack monitor mixer remains future work.
-- **Preview proxies** can be generated for the selected Project-bin item with Generate proxy. A 960px H.264/AAC copy is stored under `%LOCALAPPDATA%\Yoru\proxies` and used for interactive decoding when present. The source path remains unchanged and export always uses the original file. Proxy paths are stored in YORU 7 projects; YORU 1–6 projects still load.
+- **Preview proxies** can be generated for the selected Project-bin item with Generate proxy. A 960px H.264/AAC copy is stored under `%LOCALAPPDATA%\Yoru\proxies` and used for interactive decoding when present. The source path remains unchanged and export always uses the original file. Proxy paths are stored in YORU 7–9 projects; older YORU 1–6 projects still load.
 - Preview decoding uses a bounded frame queue and coalesces stale frames during seeking. A generated proxy can materially improve playback with high-resolution/long-GOP source footage, while quarter/half-resolution preview quality remains available.
 
 ## Export executable and GitHub Actions
@@ -95,3 +97,19 @@ support also varies by filter. Always check a short render before a long export.
 The Windows Actions workflow builds the Rust/FFmpeg bindings with vcpkg, then downloads and bundles a separate static FFmpeg CLI as `ffmpeg.exe`. Yoru uses that executable for MP4 export and proxy generation, so users do not have to install FFmpeg manually. The package includes an FFmpeg build notice and license documents from the selected build archive. The CLI package is large (roughly 185 MB before compression) and adds a download step to CI.
 
 Effect appearance in final output is implemented through FFmpeg filters; some filters are approximations of the monitor's custom CPU renderer, and not every filter parameter currently supports frame-by-frame animated interpolation in export. Always inspect a short export test before rendering a large project.
+
+## Expanded creative presets (YORU 9)
+
+- **Video effects:** Wave Warp, Ripple, Twirl, Gaussian/Lens/Motion Blur, Glow, Sharpen, RGB Split, Vignette, Pixelate, Sepia Tone, Black & White, Invert, Posterize, Film Grain, Scanlines, Mirror, Edge Detect, Color Temperature, VHS/Tape, Flash and fades. Effect instances and their keyframes are non-destructive and saved per clip.
+- **Transitions:** Cross Dissolve, Dip to Black, Flash, left/right/up/down wipes, Circle Iris, Diagonal Wipe, and Diamond Iris.
+- **Text animation presets:** Fade In, Rise Up, Slide Left/Right, Drop In, Pop In, Float In, Fade Out, Zoom In, Soft Zoom, Bounce In, Slam In, Rotate In, Drift Up/Down, Scale Pulse, and Soft Reveal (a slide/fade entrance, not per-character typing). Presets create regular editable transform/opacity keyframes.
+- **Audio presets:** Neutral, Voice Clear, Music Bed, Cinematic, Telephone/Radio, Lo-Fi, Underwater, Podcast/Spoken Word, Bass Boost, Bright Voice, Room Reverb, and Muffled/Distant. These non-destructive filters are applied in export; the preview audio path does not yet render the tonal processing.
+- Audio presets are saved with the project in YORU 9; existing YORU 1–8 files load with Neutral as the default. New IDs are append-only so saved effect and transition data keeps its meaning.
+
+
+## Build fix archive notice
+
+This archive supersedes the earlier full-render build. If updating an existing GitHub
+repository, replace the source files, especially `src/export.rs` and `src/engine.rs`; the
+previous text-position type error and mutable-player error have been addressed in this source.
+See `BUILD_FIXES.md` for details.

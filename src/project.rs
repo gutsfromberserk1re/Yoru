@@ -11,8 +11,8 @@ const EPS: f64 = 1e-6;
 pub const MIN_DUR: f64 = 0.1;
 const UNDO_LIMIT: usize = 200;
 
-pub const NV: usize = 3; // video tracks V1..V3
-pub const NA: usize = 3; // audio tracks A1..A3
+pub const NV: usize = 8; // video track capacity; only used tracks are shown
+pub const NA: usize = 8; // audio track capacity; tracks grow as clips are moved
 pub const NTRACKS: usize = NV + NA;
 
 // ---------------------------------------------------------------- tracks
@@ -29,7 +29,7 @@ impl Lane {
     pub fn is_video(self) -> bool {
         matches!(self, Lane::V(_))
     }
-    /// 0..NTRACKS: V1..V3, then A1..A3.
+    /// Stable slots: V1..V8, then A1..A8. Higher tracks are shown only when needed.
     pub fn slot(self) -> usize {
         match self {
             Lane::V(n) => (n as usize).min(NV - 1),
@@ -95,10 +95,10 @@ pub struct ParamDef {
 /// Index order is the storage order: 0 PosX, 1 PosY, 2 Scale, 3 Rotation, 4 Opacity,
 /// 5 Brightness, 6 Contrast, 7 Saturation.
 pub const PARAMS: [ParamDef; NPARAM] = [
-    ParamDef { name: "Position X", group: "Transform", lo: 0.0, hi: 1920.0, def: 960.0, suffix: "" },
-    ParamDef { name: "Position Y", group: "Transform", lo: 0.0, hi: 1080.0, def: 540.0, suffix: "" },
+    ParamDef { name: "Position X", group: "Transform", lo: -7680.0, hi: 9600.0, def: 960.0, suffix: "" },
+    ParamDef { name: "Position Y", group: "Transform", lo: -4320.0, hi: 5400.0, def: 540.0, suffix: "" },
     ParamDef { name: "Scale", group: "Transform", lo: 0.0, hi: 400.0, def: 100.0, suffix: "%" },
-    ParamDef { name: "Rotation", group: "Transform", lo: -180.0, hi: 180.0, def: 0.0, suffix: "\u{00B0}" },
+    ParamDef { name: "Rotation", group: "Transform", lo: -900.0, hi: 900.0, def: 0.0, suffix: "\u{00B0}" },
     ParamDef { name: "Opacity", group: "Compositing", lo: 0.0, hi: 100.0, def: 100.0, suffix: "%" },
     ParamDef { name: "Brightness", group: "Color", lo: -100.0, hi: 100.0, def: 0.0, suffix: "" },
     ParamDef { name: "Contrast", group: "Color", lo: 0.0, hi: 200.0, def: 100.0, suffix: "%" },
@@ -797,7 +797,7 @@ impl Project {
         let id = self.alloc();
         let dur = 5.0;
         self.clips.push(Clip {
-            id, link: 0, lane: Lane::V(2), start: t.max(0.0), dur, src_off: 0.0,
+            id, link: 0, lane: Lane::V(1), start: t.max(0.0), dur, src_off: 0.0,
             src_len: f64::INFINITY, name: name.to_string(), seed: id % 9 + 1,
             media: None, fx: Fx::default(), effects: Vec::new(), transition_in: None, gfx: Some(gfx),
             audio_gain: 100.0, audio_preset: AudioPreset::Neutral, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),

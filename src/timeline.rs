@@ -1,6 +1,6 @@
 //! Premiere-style multi-track timeline.
 //!
-//!   * six tracks (V3 V2 V1 / A1 A2 A3) with lock + visibility/mute buttons
+//!   * expandable video/audio tracks (V1 starts visible; V2+ and A2+ appear as clips are dragged)
 //!   * selection: click, Shift-click, marquee; linked clips (video + audio) select together
 //!   * Selection tool: drag to move (also between tracks, with overwrite), drag edges to trim
 //!   * Ripple (B), Rolling (N), Slip (Y), Razor (C), Zoom (Z), Hand (H)
@@ -8,7 +8,7 @@
 //!   * smooth animated zoom, edge auto-scroll while dragging, follow-playhead
 
 use super::*;
-use crate::project::{nearest, DragOp, EffectKind, Lane, NTRACKS, NV};
+use crate::project::{nearest, DragOp, EffectKind, Lane, TransitionKind, NTRACKS, NV, NA};
 
 const RULER: f32 = 28.0;
 const HEAD: f32 = 76.0; // track header column
@@ -17,8 +17,6 @@ const EDGE: f32 = 7.0; // trim handle width (px)
 const SNAP_PX: f64 = 9.0;
 const MIN_PPS: f64 = 0.4;
 const MAX_PPS: f64 = 600.0;
-/// Top-to-bottom display order.
-const ORDER: [Lane; NTRACKS] = [Lane::V(2), Lane::V(1), Lane::V(0), Lane::A(0), Lane::A(1), Lane::A(2)];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -101,6 +99,9 @@ pub struct Timeline {
     snap_line: Option<f64>,
     /// Rect of the last frame (the main loop uses it for drops coming from the browser).
     pub view: Rect,
+    /// Visible track counts start at one per media type and grow as clips are dragged.
+    visible_v: usize,
+    visible_a: usize,
 }
 
 impl Timeline {
@@ -120,6 +121,8 @@ impl Timeline {
             drag: None,
             snap_line: None,
             view: Rect::NOTHING,
+            visible_v: 1,
+            visible_a: 1,
         }
     }
 
@@ -131,22 +134,68 @@ impl Timeline {
         (x - r.left() - HEAD) as f64 / self.pps + self.scroll
     }
 
-    /// (y offset from the rect top, height) per track slot.
+    /// Display order keeps the highest video lane at the top and A1 at the bottom of the video group.
+    fn order(&self) -> Vec<Lane> {
+        let mut lanes = Vec::with_capacity(self.visible_v + self.visible_a);
+        for n in (0..self.visible_v.min(NV)).rev() { lanes.push(Lane::V(n as u8)); }
+        for n in 0..self.visible_a.min(NA) { lanes.push(Lane::A(n as u8)); }
+        lanes
+    }
+
+    /// (y offset from the rect top, height) per track slot. Track heights adapt to the current
+    /// visible count; adding tracks never changes the outer panel's requested size.
     fn rows(&self, h: f32) -> [(f32, f32); NTRACKS] {
         let avail = (h - RULER - 8.0).max(60.0);
-        let ah = ((avail - 6.0) / (NV as f32 * 1.45 + 3.0)).clamp(18.0, 36.0);
+        let video_n = self.visible_v.min(NV).max(1);
+        let audio_n = self.visible_a.min(NA).max(1);
+        let denom = video_n as f32 * 1.45 + audio_n as f32 + 0.8;
+        let ah = ((avail - 6.0) / denom).clamp(13.0, 36.0);
         let vh = ah * 1.45;
         let mut out = [(0.0, 0.0); NTRACKS];
         let mut y = RULER + 3.0;
-        for (i, lane) in ORDER.iter().enumerate() {
+        for (i, lane) in self.order().iter().enumerate() {
             let hh = if lane.is_video() { vh } else { ah };
             out[lane.slot()] = (y, hh);
             y += hh + 1.0;
-            if i == NV - 1 {
-                y += 4.0; // gap between the video and audio groups
-            }
+            if i + 1 == video_n { y += 4.0; }
         }
         out
+    }
+
+    /// Keep every lane that already contains a clip visible. Empty higher lanes are created
+    /// only while dragging, which gives a clean V1/A1 starting timeline without a hard ceiling
+    /// of three tracks.
+    fn reveal_used_tracks(&mut self, proj: &Project) {
+        let mut v = 1usize;
+        let mut a = 1usize;
+        for c in &proj.clips {
+            match c.lane {
+                Lane::V(n) => v = v.max(n as usize + 1),
+                Lane::A(n) => a = a.max(n as usize + 1),
+            }
+        }
+        self.visible_v = v.min(NV).max(1);
+        self.visible_a = a.min(NA).max(1);
+    }
+
+    /// Dragging a clip beyond the current top/bottom lane grows the appropriate track stack.
+    fn reveal_for_drag(&mut self, rect: Rect, d: &Drag, pos: Pos2) {
+        let Some(origin) = d.pre.iter().find(|c| c.id == d.id) else { return; };
+        let rows = self.rows(rect.height());
+        // Reveal the next lane as the pointer reaches roughly the row boundary, not after
+        // travelling a full row-height beyond it (which would force the cursor outside the panel).
+        let threshold = (rows[origin.lane.slot()].1 * 0.5).max(12.0);
+        match origin.lane {
+            Lane::V(n) if pos.y < d.grab_y => {
+                let steps = ((d.grab_y - pos.y) / threshold).floor() as usize;
+                self.visible_v = self.visible_v.max((n as usize + steps + 1).min(NV));
+            }
+            Lane::A(n) if pos.y > d.grab_y => {
+                let steps = ((pos.y - d.grab_y) / threshold).floor() as usize;
+                self.visible_a = self.visible_a.max((n as usize + steps + 1).min(NA));
+            }
+            _ => {}
+        }
     }
 
     fn lane_rect(&self, rect: Rect, lane: Lane) -> Rect {
@@ -159,7 +208,7 @@ impl Timeline {
         let rows = self.rows(rect.height());
         let yr = y - rect.top();
         let mut best: Option<(f32, Lane)> = None;
-        for lane in ORDER {
+        for lane in self.order() {
             let (ly, lh) = rows[lane.slot()];
             if yr >= ly && yr < ly + lh {
                 return Some(lane);
@@ -292,7 +341,7 @@ impl Timeline {
     /// Lock / eye / mute buttons. True if something changed.
     fn header_click(&self, rect: Rect, pos: Pos2, proj: &mut Project) -> bool {
         let rows = self.rows(rect.height());
-        for lane in ORDER {
+        for lane in self.order() {
             let (y, hh) = rows[lane.slot()];
             let r = Rect::from_min_size(pos2(rect.left(), rect.top() + y), vec2(HEAD, hh));
             if r.contains(pos) {
@@ -462,8 +511,11 @@ impl Timeline {
         assets: &Assets,
         ghost: Option<&Ghost>,
         effect_drag: &mut Option<EffectKind>,
+        transition_drag: &mut Option<TransitionKind>,
+        transition_duration: f32,
     ) -> (bool, bool) {
         self.view = rect;
+        self.reveal_used_tracks(proj);
         let (mut edited, mut seeked) = (false, false);
         let (hover, pressed, down, released, delta, scroll, zoom, mods, dt) = ui.input(|i| {
             (
@@ -521,6 +573,9 @@ impl Timeline {
                     let tt = self.t_of(rect, p.x);
                     if d.moved || (tt - d.grab_t).abs() * self.pps > 3.0 || (p.y - d.grab_y).abs() > 6.0 {
                         d.moved = true; // dead zone so a plain click never edits
+                        if d.zone == Zone::Body && d.tool == Tool::Select {
+                            self.reveal_for_drag(rect, &d, p);
+                        }
                         d.changed = self.drag_step(proj, &d, p, rect, *t);
                     }
                 }
@@ -558,6 +613,27 @@ impl Timeline {
                 }
             }
             *effect_drag = None;
+        }
+
+        // ---- transition browser drag: apply a real clip transition, not a pixel effect
+        if released && transition_drag.is_some() {
+            let kind = *transition_drag;
+            if let (Some(kind), Some(pos)) = (kind, hover.filter(|p| rect.contains(*p) && p.x >= content_left)) {
+                if pos.y - rect.top() >= RULER {
+                    if let Some((idx, _)) = self.hit(proj, rect, pos) {
+                        if let Some(c) = proj.clips.get(idx) {
+                            let id = c.id;
+                            let duration = c.dur.min(transition_duration as f64).max(0.05) as f32;
+                            if proj.apply_transition(id, kind, duration) {
+                                self.sel.clear();
+                                self.sel.push(id);
+                                edited = true;
+                            }
+                        }
+                    }
+                }
+            }
+            *transition_drag = None;
         }
 
         // ---- marquee
@@ -677,7 +753,7 @@ impl Timeline {
 
         // ---- track rows + headers
         let rows = self.rows(rect.height());
-        for lane in ORDER {
+        for lane in self.order() {
             let (y, hh) = rows[lane.slot()];
             let lr = Rect::from_min_size(pos2(content.left(), rect.top() + y), vec2(content.width(), hh));
             let locked = proj.locked[lane.slot()];
@@ -935,10 +1011,12 @@ pub fn timeline_panel(
     assets: &Assets,
     ghost: Option<&Ghost>,
     effect_drag: &mut Option<EffectKind>,
+    transition_drag: &mut Option<TransitionKind>,
+    transition_duration: f32,
 ) -> (bool, bool) {
     let mut out = (false, false);
     glass(12.0, 8.0, 12.0, 10.0).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
+        paint_panel_gradient(ui, 12.0, 8.0, 12.0, 10.0);
         ui.spacing_mut().item_spacing.y = 6.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -965,7 +1043,7 @@ pub fn timeline_panel(
         let meter = Rect::from_min_max(pos2(full.right() - 36.0, full.top()), full.max);
         let view = Rect::from_min_max(full.min, pos2(meter.left() - 6.0, full.bottom()));
         ui.allocate_rect(full, Sense::hover());
-        out = tl.show(ui, view, t, proj, assets, ghost, effect_drag);
+        out = tl.show(ui, view, t, proj, assets, ghost, effect_drag, transition_drag, transition_duration);
         level_meter(ui, meter, levels.0, levels.1);
     });
     out

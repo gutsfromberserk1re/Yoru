@@ -22,6 +22,10 @@ struct Params {
     contrast: f32,
     sat: f32,
     color: bool,
+    // A final Flash/Fade effect is fused into the compositor to avoid a redundant full-frame
+    // allocation and image pass on every preview frame.
+    fade_factor: f32,
+    flash_strength: f32,
 }
 
 /// Renders a source frame after a non-destructive effect stack and standard clip transform.
@@ -29,6 +33,42 @@ pub fn render_with_effects(
     src: &[u8], sw: usize, sh: usize, v: &[f32; NPARAM], effects: &[EffectInstance],
     local_time: f64, clip_duration: f64, dst: &mut [u8], dw: usize, dh: usize,
 ) {
+    let active: Vec<(usize, &EffectInstance)> = effects.iter().enumerate().filter(|(_, e)| e.enabled).collect();
+    if active.is_empty() {
+        render(src, sw, sh, v, dst, dw, dh);
+        return;
+    }
+    // Flash and fades are scalar blends. When one is the last active effect, apply all effects
+    // before it normally, then fuse its blend into the main compositor. This preserves stack
+    // order but avoids allocating and walking another full RGBA frame for the flash/fade itself.
+    if let Some(&(last_index, effect)) = active.last() {
+        if matches!(effect.kind, EffectKind::Flash | EffectKind::FadeIn | EffectKind::FadeOut) {
+            let processed = apply_effects(src, sw, sh, &effects[..last_index], local_time, clip_duration);
+            let source = processed.as_deref().unwrap_or(src);
+            let p = effect.evaluated_params(local_time);
+            let (fade_factor, flash_strength) = match effect.kind {
+                EffectKind::FadeIn => (
+                    (local_time / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32,
+                    0.0,
+                ),
+                EffectKind::FadeOut => (
+                    ((clip_duration - local_time) / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32,
+                    0.0,
+                ),
+                EffectKind::Flash => {
+                    let duration = p[1].max(0.02) as f64;
+                    let u = (local_time - p[2] as f64) / duration;
+                    let strength = if (0.0..1.0).contains(&u) {
+                        (1.0 - u as f32).powi(2) * (p[0] / 100.0).clamp(0.0, 1.0)
+                    } else { 0.0 };
+                    (1.0, strength)
+                }
+                _ => unreachable!(),
+            };
+            render_adjusted(source, sw, sh, v, dst, dw, dh, fade_factor, flash_strength);
+            return;
+        }
+    }
     let processed = apply_effects(src, sw, sh, effects, local_time, clip_duration);
     let source = processed.as_deref().unwrap_or(src);
     render(source, sw, sh, v, dst, dw, dh);
@@ -36,6 +76,10 @@ pub fn render_with_effects(
 
 /// Renders `src` (RGBA, `sw`x`sh`) into `dst` (RGBA, `dw`x`dh`).
 pub fn render(src: &[u8], sw: usize, sh: usize, v: &[f32; NPARAM], dst: &mut [u8], dw: usize, dh: usize) {
+    render_adjusted(src, sw, sh, v, dst, dw, dh, 1.0, 0.0);
+}
+
+fn render_adjusted(src: &[u8], sw: usize, sh: usize, v: &[f32; NPARAM], dst: &mut [u8], dw: usize, dh: usize, fade_factor: f32, flash_strength: f32) {
     let n = dw * dh * 4;
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 || src.len() < sw * sh * 4 || dst.len() < n {
         if dst.len() >= n {
@@ -59,6 +103,8 @@ pub fn render(src: &[u8], sw: usize, sh: usize, v: &[f32; NPARAM], dst: &mut [u8
         contrast: v[6] / 100.0,
         sat: v[7] / 100.0,
         color: v[5] != 0.0 || v[6] != 100.0 || v[7] != 100.0,
+        fade_factor: fade_factor.clamp(0.0, 1.0),
+        flash_strength: flash_strength.clamp(0.0, 1.0),
     };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
     let rows_per = ((dh + threads - 1) / threads).max(1);
@@ -98,6 +144,7 @@ fn render_rows(src: &[u8], p: &Params, chunk: &mut [u8], y0: usize) {
                 let top = src[i00 + c] as f32 * (1.0 - tx) + src[i10 + c] as f32 * tx;
                 let bot = src[i01 + c] as f32 * (1.0 - tx) + src[i11 + c] as f32 * tx;
                 *vc = top * (1.0 - ty) + bot * ty;
+                *vc = (*vc * p.fade_factor + (255.0 - *vc) * p.flash_strength).clamp(0.0, 255.0);
             }
             if p.color {
                 for c in v.iter_mut() {
@@ -156,15 +203,23 @@ fn apply_effects(src: &[u8], sw: usize, sh: usize, effects: &[EffectInstance], t
             EffectKind::Flash => {
                 let dur = p[1].max(0.02) as f64; let start = p[2] as f64;
                 let u = (time - start) / dur;
-                if !(0.0..=1.0).contains(&u) { input.to_vec() } else {
+                if !(0.0..1.0).contains(&u) { continue; } else {
                     let strength = (1.0 - u as f32).powf(2.0) * (p[0] / 100.0).clamp(0.0, 1.0);
                     let mut out = input.to_vec();
                     for px in out.chunks_exact_mut(4) { for c in 0..3 { px[c] = (px[c] as f32 + (255.0 - px[c] as f32) * strength).clamp(0.0, 255.0) as u8; } }
                     out
                 }
             },
-            EffectKind::FadeIn => scale_luma(input, (time / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32),
-            EffectKind::FadeOut => scale_luma(input, ((duration - time) / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32),
+            EffectKind::FadeIn => {
+                let factor = (time / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32;
+                if factor >= 0.9999 { continue; }
+                scale_luma(input, factor)
+            }
+            EffectKind::FadeOut => {
+                let factor = ((duration - time) / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32;
+                if factor >= 0.9999 { continue; }
+                scale_luma(input, factor)
+            }
             EffectKind::Vignette => vignette(input, sw, sh, p[0], p[1]),
             EffectKind::Pixelate => pixelate(input, sw, sh, p[0].round().max(2.0) as usize),
             EffectKind::Sepia => tone_mix(input, 0, p[0], 6.0),
@@ -244,7 +299,7 @@ fn tone_mix(src: &[u8], mode: u8, amount: f32, levels: f32) -> Vec<u8> {
             0 => [r*0.393 + g*0.769 + b*0.189, r*0.349 + g*0.686 + b*0.168, r*0.272 + g*0.534 + b*0.131],
             1 => { let l = 0.2126*r + 0.7152*g + 0.0722*b; [l, l, l] },
             2 => [255.0-r, 255.0-g, 255.0-b],
-            _ => [r, g, b].map(|v| ((v/255.0*(levels-1.0)).round()/(levels-1.0)*255.0)),
+            _ => [r, g, b].map(|v| (v/255.0*(levels-1.0)).round()/(levels-1.0)*255.0),
         };
         for c in 0..3 { px[c] = (if mode == 3 { target[c] } else { [r,g,b][c]*(1.0-a)+target[c]*a }).round().clamp(0.0,255.0) as u8; }
     }
@@ -310,7 +365,7 @@ fn color_temperature(src: &[u8], temperature: f32, tint: f32) -> Vec<u8> {
 
 fn vhs(src: &[u8], sw: usize, sh: usize, amount: f32, tracking: f32, time: f64) -> Vec<u8> {
     if sw == 0 || sh == 0 { return src.to_vec(); }
-    let a = (amount.clamp(0.0,100.0) / 100.0);
+    let a = amount.clamp(0.0,100.0) / 100.0;
     let jitter = a * (tracking.clamp(0.0,100.0) * 0.09 + 2.0);
     let chroma = a * 2.0;
     let mut out = src.to_vec();
