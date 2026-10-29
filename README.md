@@ -49,7 +49,7 @@ keyframed transform controls as video clips.
 Select an audio clip and open the **Audio** tab to adjust gain (0–400%) and linear fade-in/fade-out
 durations. Playback gain is applied by the audio output callback without restarting playback.
 
-Graphics and audio settings are saved in the YORU 4 project format; YORU 1–3 projects remain readable.
+Graphics and audio settings are saved in the YORU project format. Newer versions remain readable by this build through YORU 1–7 compatibility.
 They are included in the existing clip-snapshot undo/redo history.
 
 ## Playback resolution and seeking
@@ -66,3 +66,32 @@ source file has moved or been deleted, that source still needs to be restored to
 ## Build
 `cargo build --release` needs the FFmpeg development libraries (CI installs them with vcpkg, see
 `.github/workflows/build.yml`). Unit tests: `cargo test`.
+
+
+## Video effects
+
+Yoru's Effects browser includes non-destructive Wave Warp, Ripple, Twirl, Gaussian Blur, Lens Blur,
+Directional Motion Blur, Glow, Sharpen, RGB Split, Flash, Fade In, and Fade Out. Drag an effect onto
+a video clip in the timeline to apply it. Select the clip and use **Effect Controls → Applied Effects**
+to enable/disable, reorder, reset, tune, or remove each effect. The timeline displays an `FX` badge and
+the number of enabled effects on a clip. Keyframe interpolation supports Linear, Ease In, Ease Out,
+Ease In/Out, and Hold; new keys start Linear and can be changed from the value graph.
+
+Effects are evaluated in the monitor preview and the export filter graph. Because the preview uses
+custom CPU kernels while export uses FFmpeg filters, some visual details can differ; animated keyframe
+support also varies by filter. Always check a short render before a long export.
+
+## Export, transitions, audio automation, and proxies
+
+- **Export MP4** from the monitor's Export button. Choose 480p/720p/1080p/4K, frame rate, and video bitrate. The renderer composites visible video tracks in track order, title/shape clips, supported effects, and inbound transitions, then mixes the visible audio clips with gain, keyframed gain, fades, and a limiter. Exports are rendered to a staging file and finalized only after FFmpeg succeeds.
+- **Keyframe effects** from Effect Controls by clicking the diamond at the playhead. Parameter tracks are saved in `.yoru` projects; choose Linear, Ease In, Ease Out, Ease In/Out, or Hold for each keyframe segment.
+- **Transitions** can be applied on a selected video clip in Effect Controls → Transition In. Supported transitions are Cross Dissolve, Dip to Black, Wipe Left, and Flash. Their duration and enabled state are stored in the project and marked on the timeline.
+- **Audio gain automation** is available in the Audio inspector. Click the diamond next to Volume to add/remove a keyframe, change the gain at different positions, and select key easing. Export mixes all non-hidden audio clips from the timeline with per-clip gain, fades, automation, and a final limiter. Live monitor playback still follows the active video source's audio clock; a full low-latency real-time multitrack monitor mixer remains future work.
+- **Preview proxies** can be generated for the selected Project-bin item with Generate proxy. A 960px H.264/AAC copy is stored under `%LOCALAPPDATA%\Yoru\proxies` and used for interactive decoding when present. The source path remains unchanged and export always uses the original file. Proxy paths are stored in YORU 7 projects; YORU 1–6 projects still load.
+- Preview decoding uses a bounded frame queue and coalesces stale frames during seeking. A generated proxy can materially improve playback with high-resolution/long-GOP source footage, while quarter/half-resolution preview quality remains available.
+
+## Export executable and GitHub Actions
+
+The Windows Actions workflow builds the Rust/FFmpeg bindings with vcpkg, then downloads and bundles a separate static FFmpeg CLI as `ffmpeg.exe`. Yoru uses that executable for MP4 export and proxy generation, so users do not have to install FFmpeg manually. The package includes an FFmpeg build notice and license documents from the selected build archive. The CLI package is large (roughly 185 MB before compression) and adds a download step to CI.
+
+Effect appearance in final output is implemented through FFmpeg filters; some filters are approximations of the monitor's custom CPU renderer, and not every filter parameter currently supports frame-by-frame animated interpolation in export. Always inspect a short export test before rendering a large project.

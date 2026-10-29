@@ -72,6 +72,16 @@ impl Engine {
         self.players.insert(media, Slot { player, used: self.tick });
     }
 
+    /// Drop a decoder so the next update reopens it from the current preview path (proxy or source).
+    pub fn invalidate_media(&mut self, media: u32) {
+        if let Some(slot) = self.players.remove(&media) {
+            slot.player.set_playing(false, None);
+        }
+        self.failed.remove(&media);
+        if self.active.map_or(false, |m| m.media == media) { self.active = None; }
+        if self.prepared.map_or(false, |m| m.media == media) { self.prepared = None; }
+    }
+
     /// Preview resolution divisor for every open decoder (1 = full, 2 = 1/2, 4 = 1/4).
     pub fn set_quality(&mut self, div: u32) {
         self.quality = div.max(1);
@@ -92,7 +102,8 @@ impl Engine {
             return false;
         }
         let Some(m) = proj.media(media) else { return false };
-        match Player::open(&m.path, ctx.clone()) {
+        let preview_path = m.proxy_path.as_ref().filter(|path| path.is_file()).unwrap_or(&m.path);
+        match Player::open(preview_path, ctx.clone()) {
             Ok(p) => {
                 self.insert(media, p);
                 true

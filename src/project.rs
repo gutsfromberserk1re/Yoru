@@ -121,7 +121,7 @@ impl Ease {
             Ease::Linear => "Linear",
             Ease::EaseIn => "Ease in",
             Ease::EaseOut => "Ease out",
-            Ease::EaseInOut => "Smooth",
+            Ease::EaseInOut => "Ease in/out",
             Ease::Hold => "Hold",
         }
     }
@@ -223,7 +223,7 @@ impl Fx {
         match self.key_near(i, t) {
             Some(k) => self.keys[i][k].v = v,
             None => {
-                self.insert_key(i, Key { t, v, ease: Ease::EaseInOut });
+                self.insert_key(i, Key { t, v, ease: Ease::Linear });
             }
         }
     }
@@ -232,7 +232,7 @@ impl Fx {
     pub fn toggle_anim(&mut self, i: usize, t: f64) {
         if self.keys[i].is_empty() {
             let v = self.base[i];
-            self.keys[i].push(Key { t, v, ease: Ease::EaseInOut });
+            self.keys[i].push(Key { t, v, ease: Ease::Linear });
         } else {
             self.base[i] = self.value(i, t);
             self.keys[i].clear();
@@ -256,7 +256,7 @@ impl Fx {
             }
             None => {
                 let v = self.value(i, t);
-                self.insert_key(i, Key { t, v, ease: Ease::EaseInOut });
+                self.insert_key(i, Key { t, v, ease: Ease::Linear });
             }
         }
     }
@@ -267,6 +267,202 @@ impl Fx {
         self.keys[i].remove(k);
         self.insert_key(i, Key { t: t.max(0.0), v: v.clamp(PARAMS[i].lo, PARAMS[i].hi), ease })
     }
+}
+
+// ---------------------------------------------------------------- non-destructive clip effects
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EffectKind {
+    Wave, Ripple, Twirl, GaussianBlur, LensBlur, MotionBlur, Glow, Sharpen, RgbSplit,
+    Flash, FadeIn, FadeOut,
+}
+
+impl EffectKind {
+    pub const ALL: [EffectKind; 12] = [
+        EffectKind::Wave, EffectKind::Ripple, EffectKind::Twirl,
+        EffectKind::GaussianBlur, EffectKind::LensBlur, EffectKind::MotionBlur,
+        EffectKind::Glow, EffectKind::Sharpen, EffectKind::RgbSplit,
+        EffectKind::Flash, EffectKind::FadeIn, EffectKind::FadeOut,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wave => "Wave Warp", Self::Ripple => "Ripple", Self::Twirl => "Twirl",
+            Self::GaussianBlur => "Gaussian Blur", Self::LensBlur => "Lens Blur",
+            Self::MotionBlur => "Directional Motion Blur", Self::Glow => "Glow",
+            Self::Sharpen => "Sharpen", Self::RgbSplit => "RGB Split",
+            Self::Flash => "Flash", Self::FadeIn => "Fade In", Self::FadeOut => "Fade Out",
+        }
+    }
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::Wave | Self::Ripple | Self::Twirl | Self::RgbSplit => "Distortion",
+            Self::GaussianBlur | Self::LensBlur | Self::MotionBlur | Self::Sharpen => "Blur & Sharpen",
+            Self::Glow => "Light & Stylize",
+            Self::Flash | Self::FadeIn | Self::FadeOut => "Transitions",
+        }
+    }
+    pub fn id(self) -> u8 { Self::ALL.iter().position(|e| *e == self).unwrap_or(0) as u8 }
+    pub fn from_id(id: u8) -> Option<Self> { Self::ALL.get(id as usize).copied() }
+    pub fn from_label(label: &str) -> Option<Self> { Self::ALL.into_iter().find(|e| e.label() == label) }
+    pub fn params(self) -> &'static [EffectParamDef] {
+        match self {
+            Self::Wave => &WAVE_PARAMS,
+            Self::Ripple => &RIPPLE_PARAMS,
+            Self::Twirl => &TWIRL_PARAMS,
+            Self::GaussianBlur => &BLUR_PARAMS,
+            Self::LensBlur => &LENS_PARAMS,
+            Self::MotionBlur => &MOTION_PARAMS,
+            Self::Glow => &GLOW_PARAMS,
+            Self::Sharpen => &SHARPEN_PARAMS,
+            Self::RgbSplit => &RGB_PARAMS,
+            Self::Flash => &FLASH_PARAMS,
+            Self::FadeIn | Self::FadeOut => &FADE_PARAMS,
+        }
+    }
+    pub fn defaults(self) -> [f32; 4] {
+        let mut p = [0.0; 4];
+        for (i, def) in self.params().iter().enumerate() { p[i] = def.default; }
+        p
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EffectParamDef {
+    pub name: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub suffix: &'static str,
+}
+static WAVE_PARAMS: [EffectParamDef; 3] = [
+    EffectParamDef { name: "Height", min: 0.0, max: 120.0, default: 18.0, suffix: " px" },
+    EffectParamDef { name: "Frequency", min: 0.5, max: 30.0, default: 8.0, suffix: "" },
+    EffectParamDef { name: "Speed", min: -10.0, max: 10.0, default: 1.0, suffix: " Hz" },
+];
+static RIPPLE_PARAMS: [EffectParamDef; 3] = [
+    EffectParamDef { name: "Strength", min: 0.0, max: 100.0, default: 24.0, suffix: " px" },
+    EffectParamDef { name: "Rings", min: 0.5, max: 20.0, default: 5.0, suffix: "" },
+    EffectParamDef { name: "Speed", min: -10.0, max: 10.0, default: 1.0, suffix: " Hz" },
+];
+static TWIRL_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Angle", min: -720.0, max: 720.0, default: 180.0, suffix: "°" },
+    EffectParamDef { name: "Radius", min: 5.0, max: 100.0, default: 55.0, suffix: "%" },
+];
+static BLUR_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Radius", min: 0.0, max: 48.0, default: 8.0, suffix: " px" }];
+static LENS_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Radius", min: 0.0, max: 40.0, default: 12.0, suffix: " px" },
+    EffectParamDef { name: "Iris", min: 3.0, max: 12.0, default: 7.0, suffix: " blades" },
+];
+static MOTION_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Length", min: 0.0, max: 80.0, default: 18.0, suffix: " px" },
+    EffectParamDef { name: "Angle", min: -180.0, max: 180.0, default: 0.0, suffix: "°" },
+];
+static GLOW_PARAMS: [EffectParamDef; 3] = [
+    EffectParamDef { name: "Intensity", min: 0.0, max: 3.0, default: 1.0, suffix: "×" },
+    EffectParamDef { name: "Radius", min: 0.0, max: 48.0, default: 12.0, suffix: " px" },
+    EffectParamDef { name: "Threshold", min: 0.0, max: 255.0, default: 180.0, suffix: "" },
+];
+static SHARPEN_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Amount", min: 0.0, max: 3.0, default: 1.0, suffix: "×" },
+    EffectParamDef { name: "Radius", min: 1.0, max: 12.0, default: 1.0, suffix: " px" },
+];
+static RGB_PARAMS: [EffectParamDef; 2] = [
+    EffectParamDef { name: "Offset", min: 0.0, max: 40.0, default: 8.0, suffix: " px" },
+    EffectParamDef { name: "Angle", min: -180.0, max: 180.0, default: 0.0, suffix: "°" },
+];
+static FLASH_PARAMS: [EffectParamDef; 3] = [
+    EffectParamDef { name: "Intensity", min: 0.0, max: 100.0, default: 100.0, suffix: "%" },
+    EffectParamDef { name: "Duration", min: 0.02, max: 2.0, default: 0.25, suffix: " s" },
+    EffectParamDef { name: "Start", min: 0.0, max: 3600.0, default: 0.0, suffix: " s" },
+];
+static FADE_PARAMS: [EffectParamDef; 1] = [EffectParamDef { name: "Duration", min: 0.02, max: 10.0, default: 1.0, suffix: " s" }];
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct EffectKey {
+    pub t: f64,
+    pub v: f32,
+    pub ease: Ease,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct EffectInstance {
+    pub kind: EffectKind,
+    pub enabled: bool,
+    pub params: [f32; 4],
+    /// Per-parameter animation in clip-local seconds. Empty tracks use the static parameter.
+    pub keys: [Vec<EffectKey>; 4],
+}
+impl EffectInstance {
+    pub fn new(kind: EffectKind, local_time: f64) -> Self {
+        let mut params = kind.defaults();
+        if kind == EffectKind::Flash { params[2] = local_time.max(0.0) as f32; }
+        Self { kind, enabled: true, params, keys: Default::default() }
+    }
+
+    pub fn param_at(&self, index: usize, t: f64) -> f32 {
+        if index >= 4 { return 0.0; }
+        let keys = &self.keys[index];
+        let (Some(first), Some(last)) = (keys.first(), keys.last()) else { return self.params[index] };
+        if t <= first.t { return first.v; }
+        if t >= last.t { return last.v; }
+        let k = keys.partition_point(|key| key.t <= t).saturating_sub(1);
+        let (a, b) = (&keys[k], &keys[(k + 1).min(keys.len() - 1)]);
+        let u = ((t - a.t) / (b.t - a.t).max(1e-9)) as f32;
+        a.v + (b.v - a.v) * a.ease.apply(u.clamp(0.0, 1.0))
+    }
+
+    pub fn evaluated_params(&self, t: f64) -> [f32; 4] {
+        std::array::from_fn(|i| self.param_at(i, t))
+    }
+
+    pub fn key_near(&self, index: usize, t: f64) -> Option<usize> {
+        self.keys.get(index)?.iter().position(|k| (k.t - t).abs() <= 1.0 / 60.0)
+    }
+
+    pub fn toggle_key(&mut self, index: usize, t: f64) {
+        if index >= 4 { return; }
+        if let Some(k) = self.key_near(index, t) {
+            self.keys[index].remove(k);
+        } else {
+            let key = EffectKey { t: t.max(0.0), v: self.param_at(index, t), ease: Ease::Linear };
+            let at = self.keys[index].partition_point(|k| k.t < key.t);
+            self.keys[index].insert(at, key);
+        }
+    }
+
+    pub fn set_param_at(&mut self, index: usize, t: f64, value: f32) {
+        if index >= 4 { return; }
+        let def = self.kind.params().get(index);
+        let v = def.map_or(value, |d| value.clamp(d.min, d.max));
+        if self.keys[index].is_empty() {
+            self.params[index] = v;
+        } else if let Some(k) = self.key_near(index, t) {
+            self.keys[index][k].v = v;
+        } else {
+            let at = self.keys[index].partition_point(|k| k.t < t);
+            self.keys[index].insert(at, EffectKey { t: t.max(0.0), v, ease: Ease::Linear });
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransitionKind { Dissolve, DipToBlack, WipeLeft, Flash }
+impl TransitionKind {
+    pub const ALL: [TransitionKind; 4] = [Self::Dissolve, Self::DipToBlack, Self::WipeLeft, Self::Flash];
+    pub fn label(self) -> &'static str {
+        match self { Self::Dissolve => "Cross Dissolve", Self::DipToBlack => "Dip to Black", Self::WipeLeft => "Wipe Left", Self::Flash => "Flash Transition" }
+    }
+    pub fn id(self) -> u8 { Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as u8 }
+    pub fn from_id(id: u8) -> Option<Self> { Self::ALL.get(id as usize).copied() }
+    pub fn from_label(s: &str) -> Option<Self> { Self::ALL.into_iter().find(|v| v.label() == s) }
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    pub duration: f32,
+    pub enabled: bool,
+}
+impl Transition {
+    pub fn new(kind: TransitionKind) -> Self { Self { kind, duration: 0.8, enabled: true } }
 }
 
 // ---------------------------------------------------------------- title / shape graphics
@@ -340,15 +536,60 @@ pub struct Clip {
     pub seed: u32,
     pub media: Option<u32>,
     pub fx: Fx,
+    /// Ordered, non-destructive video effects applied before the clip transform.
+    pub effects: Vec<EffectInstance>,
+    /// Optional inbound transition applied over the start of this clip.
+    pub transition_in: Option<Transition>,
     /// Optional title/shape overlay rendered over the clip.
     pub gfx: Option<Gfx>,
     /// Audio controls stored as percent gain and seconds of linear fades.
     pub audio_gain: f32,
     pub fade_in: f64,
     pub fade_out: f64,
+    /// Clip-local gain automation (seconds from the start of this timeline clip).
+    pub audio_keys: Vec<EffectKey>,
 }
 
 impl Clip {
+    pub fn audio_gain_at(&self, local_t: f64) -> f32 {
+        let keys = &self.audio_keys;
+        let (Some(first), Some(last)) = (keys.first(), keys.last()) else { return self.audio_gain };
+        if local_t <= first.t { return first.v; }
+        if local_t >= last.t { return last.v; }
+        let k = keys.partition_point(|key| key.t <= local_t).saturating_sub(1);
+        let a = keys[k];
+        let b = keys[(k + 1).min(keys.len() - 1)];
+        let u = ((local_t - a.t) / (b.t - a.t).max(1e-9)) as f32;
+        a.v + (b.v - a.v) * a.ease.apply(u.clamp(0.0, 1.0))
+    }
+
+    pub fn audio_key_near(&self, local_t: f64) -> Option<usize> {
+        self.audio_keys.iter().position(|k| (k.t - local_t).abs() <= 1.0 / 60.0)
+    }
+
+    pub fn toggle_audio_key(&mut self, local_t: f64) {
+        if let Some(k) = self.audio_key_near(local_t) {
+            self.audio_keys.remove(k);
+        } else {
+            let key = EffectKey { t: local_t.max(0.0), v: self.audio_gain_at(local_t), ease: Ease::Linear };
+            let at = self.audio_keys.partition_point(|k| k.t < key.t);
+            self.audio_keys.insert(at, key);
+        }
+    }
+
+    pub fn set_audio_gain_at(&mut self, local_t: f64, value: f32) {
+        let value = value.clamp(0.0, 400.0);
+        if self.audio_keys.is_empty() {
+            self.audio_gain = value;
+        } else if let Some(k) = self.audio_key_near(local_t) {
+            self.audio_keys[k].v = value;
+        } else {
+            let key = EffectKey { t: local_t.max(0.0), v: value, ease: Ease::Linear };
+            let at = self.audio_keys.partition_point(|k| k.t < key.t);
+            self.audio_keys.insert(at, key);
+        }
+    }
+
     pub fn end(&self) -> f64 {
         self.start + self.dur
     }
@@ -366,6 +607,8 @@ pub struct Media {
     pub duration: f64,
     pub has_audio: bool,
     pub seed: u32,
+    /// Optional low-resolution proxy used for interactive preview only. Export uses `path`.
+    pub proxy_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -466,7 +709,9 @@ impl Project {
             seed,
             media: None,
             fx: Fx::default(),
-            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
+            effects: Vec::new(),
+            transition_in: None,
+            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
         });
     }
 
@@ -478,18 +723,58 @@ impl Project {
         self.clips.push(Clip {
             id, link: 0, lane: Lane::V(2), start: t.max(0.0), dur, src_off: 0.0,
             src_len: f64::INFINITY, name: name.to_string(), seed: id % 9 + 1,
-            media: None, fx: Fx::default(), gfx: Some(gfx),
-            audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
+            media: None, fx: Fx::default(), effects: Vec::new(), transition_in: None, gfx: Some(gfx),
+            audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
         });
         self.push_undo(pre);
         id
+    }
+
+    /// Applies a non-destructive effect to a video clip and records one undo step.
+    pub fn apply_effect(&mut self, clip_id: u32, kind: EffectKind, local_time: f64) -> bool {
+        let Some(c) = self.clip(clip_id) else { return false };
+        if !c.lane.is_video() || c.gfx.is_some() || c.media.is_none() { return false; }
+        let pre = self.clips.clone();
+        if let Some(c) = self.clip_mut(clip_id) {
+            c.effects.push(EffectInstance::new(kind, local_time));
+        }
+        self.push_undo(pre);
+        true
+    }
+
+    pub fn remove_effect(&mut self, clip_id: u32, index: usize) -> bool {
+        let Some(c) = self.clip(clip_id) else { return false };
+        if index >= c.effects.len() { return false; }
+        let pre = self.clips.clone();
+        if let Some(c) = self.clip_mut(clip_id) { c.effects.remove(index); }
+        self.push_undo(pre);
+        true
+    }
+
+    pub fn apply_transition(&mut self, clip_id: u32, kind: TransitionKind, duration: f32) -> bool {
+        let Some(c) = self.clip(clip_id) else { return false };
+        if !c.lane.is_video() || c.gfx.is_some() || c.media.is_none() { return false; }
+        let pre = self.clips.clone();
+        if let Some(c) = self.clip_mut(clip_id) {
+            c.transition_in = Some(Transition { kind, duration: duration.clamp(0.05, 5.0).min(c.dur as f32), enabled: true });
+        }
+        self.push_undo(pre);
+        true
+    }
+
+    pub fn remove_transition(&mut self, clip_id: u32) -> bool {
+        if !self.clip(clip_id).map_or(false, |c| c.transition_in.is_some()) { return false; }
+        let pre = self.clips.clone();
+        if let Some(c) = self.clip_mut(clip_id) { c.transition_in = None; }
+        self.push_undo(pre);
+        true
     }
 
     pub fn audio_gain_at(&self, t: f64) -> f32 {
         let Some(v) = self.video_clip_at(t) else { return 1.0 };
         let Some(a) = self.clips.iter().find(|a| a.link != 0 && a.link == v.link && !a.lane.is_video()) else { return 1.0 };
         if self.hidden[a.lane.slot()] { return 0.0; }
-        let mut g = (a.audio_gain / 100.0).clamp(0.0, 4.0);
+        let mut g = (a.audio_gain_at(t - a.start) / 100.0).clamp(0.0, 4.0);
         if a.fade_in > 0.0 { g *= ((t - a.start) / a.fade_in).clamp(0.0, 1.0) as f32; }
         if a.fade_out > 0.0 { g *= ((a.end() - t) / a.fade_out).clamp(0.0, 1.0) as f32; }
         g
@@ -605,8 +890,15 @@ impl Project {
             return m.id;
         }
         let id = self.alloc();
-        self.media.push(Media { id, path, name, duration, has_audio, seed: id % 9 + 1 });
+        self.media.push(Media { id, path, name, duration, has_audio, seed: id % 9 + 1, proxy_path: None });
         id
+    }
+
+    /// Store a preview proxy for this source. Final export always uses the original media path.
+    pub fn set_proxy_path(&mut self, media_id: u32, path: Option<PathBuf>) -> bool {
+        let Some(m) = self.media.iter_mut().find(|m| m.id == media_id) else { return false };
+        m.proxy_path = path;
+        true
     }
 
     /// Appends the media after the last clip on V1.
@@ -655,7 +947,9 @@ impl Project {
             seed,
             media: Some(media_id),
             fx: Fx::default(),
-            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
+            effects: Vec::new(),
+            transition_in: None,
+            gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
         });
         let mut movers = vec![vid];
         if with_audio {
@@ -672,7 +966,9 @@ impl Project {
                 seed: 0,
                 media: Some(media_id),
                 fx: Fx::default(),
-                gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
+                effects: Vec::new(),
+                transition_in: None,
+                gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
             });
             movers.push(aid);
         }
@@ -964,18 +1260,16 @@ impl Project {
     // ---------------------------------------------------------------- save / load
     /// Plain-text project format (tab separated; names/paths are the last field of a line).
     pub fn to_text(&self) -> String {
-        let mut s = String::from("YORU 4\n");
+        let mut s = String::from("YORU 7\n");
         s += &format!("N\t{}\n", self.next_id);
         for m in &self.media {
             s += &format!(
                 "M\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                m.id,
-                m.duration,
-                m.has_audio as u8,
-                m.seed,
-                m.name,
-                m.path.to_string_lossy()
+                m.id, m.duration, m.has_audio as u8, m.seed, m.name, m.path.to_string_lossy()
             );
+            if let Some(proxy) = &m.proxy_path {
+                s += &format!("P\t{}\t{}\n", m.id, proxy.to_string_lossy());
+            }
         }
         for c in &self.clips {
             s += &format!(
@@ -1005,6 +1299,21 @@ impl Project {
                     g.mono as u8, g.size, g.pad, g.bg[0], g.bg[1], g.bg[2], g.bg[3], g.align, g.shadow as u8, esc);
             }
             s += &format!("A\t{}\t{}\t{}\t{}\n", c.id, c.audio_gain, c.fade_in, c.fade_out);
+            for key in &c.audio_keys {
+                s += &format!("AK\t{}\t{}\t{}\t{}\n", c.id, key.t, key.v, key.ease.id());
+            }
+            if let Some(tr) = c.transition_in {
+                s += &format!("TR\t{}\t{}\t{}\t{}\n", c.id, tr.kind.id(), tr.enabled as u8, tr.duration);
+            }
+            for (order, effect) in c.effects.iter().enumerate() {
+                s += &format!("E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", c.id, order,
+                    effect.kind.id(), effect.enabled as u8, effect.params[0], effect.params[1], effect.params[2], effect.params[3]);
+                for (pi, keys) in effect.keys.iter().enumerate() {
+                    for key in keys {
+                        s += &format!("Q\t{}\t{}\t{}\t{}\t{}\t{}\n", c.id, order, pi, key.t, key.v, key.ease.id());
+                    }
+                }
+            }
         }
         for c in &self.clips {
             for (pi, keys) in c.fx.keys.iter().enumerate() {
@@ -1023,6 +1332,9 @@ impl Project {
             Some("YORU 2") => 2,
             Some("YORU 3") => 3,
             Some("YORU 4") => 4,
+            Some("YORU 5") => 5,
+            Some("YORU 6") => 6,
+            Some("YORU 7") => 7,
             _ => return Err("not a Yoru project file".into()),
         };
         let mut p = Project::empty();
@@ -1031,7 +1343,7 @@ impl Project {
                 continue;
             }
             let bad = || format!("line {}: damaged record", n + 2);
-            let f: Vec<&str> = if line.starts_with("C\t") { line.splitn(19, '\t').collect() } else { line.splitn(32, '\t').collect() };
+            let f: Vec<&str> = if line.starts_with("C\t") { line.splitn(19, '\t').collect() } else if line.starts_with("P\t") { line.splitn(3, '\t').collect() } else { line.splitn(32, '\t').collect() };
             match f[0] {
                 "N" => p.next_id = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
                 "M" if f.len() >= 7 => p.media.push(Media {
@@ -1041,6 +1353,7 @@ impl Project {
                     seed: f[4].parse().map_err(|_| bad())?,
                     name: f[5].to_string(),
                     path: PathBuf::from(f[6..].join("\t")),
+                    proxy_path: None,
                 }),
                 "C" if (ver == 1 && f.len() == 11) || (ver >= 2 && f.len() == 19) => {
                     let media: u32 = f[9].parse().map_err(|_| bad())?;
@@ -1061,9 +1374,15 @@ impl Project {
                         seed: f[8].parse().map_err(|_| bad())?,
                         media: if media == 0 { None } else { Some(media) },
                         fx,
-                        gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0,
+                        effects: Vec::new(),
+                        transition_in: None,
+                        gfx: None, audio_gain: 100.0, fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
                         name: f[f.len() - 1].to_string(),
                     });
+                }
+                "P" if ver >= 7 && f.len() == 3 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    if let Some(m) = p.media.iter_mut().find(|m| m.id == id) { m.proxy_path = Some(PathBuf::from(f[2])); }
                 }
                 "A" if f.len() == 5 => {
                     let id: u32 = f[1].parse().map_err(|_| bad())?;
@@ -1072,6 +1391,53 @@ impl Project {
                         c.fade_in = f[3].parse().map_err(|_| bad())?;
                         c.fade_out = f[4].parse().map_err(|_| bad())?;
                     }
+                }
+                "E" if ver >= 5 && f.len() == 9 => {
+                    let cid: u32 = f[1].parse().map_err(|_| bad())?;
+                    let order: usize = f[2].parse().map_err(|_| bad())?;
+                    let kind = EffectKind::from_id(f[3].parse().map_err(|_| bad())?).ok_or_else(bad)?;
+                    let mut params = [0.0f32; 4];
+                    for i in 0..4 { params[i] = f[5 + i].parse().map_err(|_| bad())?; }
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == cid) {
+                        let effect = EffectInstance { kind, enabled: f[4] == "1", params, keys: Default::default() };
+                        let at = order.min(c.effects.len());
+                        c.effects.insert(at, effect);
+                    }
+                }
+                "Q" if ver >= 6 && f.len() == 7 => {
+                    let cid: u32 = f[1].parse().map_err(|_| bad())?;
+                    let order: usize = f[2].parse().map_err(|_| bad())?;
+                    let pi: usize = f[3].parse().map_err(|_| bad())?;
+                    let key = EffectKey {
+                        t: f[4].parse().map_err(|_| bad())?,
+                        v: f[5].parse().map_err(|_| bad())?,
+                        ease: Ease::from_id(f[6].parse().map_err(|_| bad())?),
+                    };
+                    if pi >= 4 { return Err(bad()); }
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == cid) {
+                        if let Some(effect) = c.effects.get_mut(order) {
+                            effect.keys[pi].push(key);
+                        }
+                    }
+                }
+                "AK" if ver >= 7 && f.len() == 5 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    let key = EffectKey {
+                        t: f[2].parse().map_err(|_| bad())?,
+                        v: f[3].parse().map_err(|_| bad())?,
+                        ease: Ease::from_id(f[4].parse().map_err(|_| bad())?),
+                    };
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == id) { c.audio_keys.push(key); }
+                }
+                "TR" if ver >= 6 && f.len() == 5 => {
+                    let cid: u32 = f[1].parse().map_err(|_| bad())?;
+                    let kind = TransitionKind::from_id(f[2].parse().map_err(|_| bad())?).ok_or_else(bad)?;
+                    let transition = Transition {
+                        kind,
+                        enabled: f[3] == "1",
+                        duration: f[4].parse::<f32>().map_err(|_| bad())?.clamp(0.05, 5.0),
+                    };
+                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == cid) { c.transition_in = Some(transition); }
                 }
                 "G" if f.len() >= 24 => {
                     let id: u32 = f[1].parse().map_err(|_| bad())?;
@@ -1110,6 +1476,11 @@ impl Project {
             for k in c.fx.keys.iter_mut() {
                 k.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
             }
+            for effect in c.effects.iter_mut() {
+                for keys in effect.keys.iter_mut() {
+                    keys.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
         }
         let max_id = p.media.iter().map(|m| m.id).chain(p.clips.iter().flat_map(|c| [c.id, c.link])).max().unwrap_or(0);
         p.next_id = p.next_id.max(max_id);
@@ -1120,6 +1491,7 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn new_project_starts_empty() {
@@ -1273,6 +1645,47 @@ mod tests {
         assert!(p.clip(id).is_none());
         assert!(p.redo());
         assert_eq!(p.clip(id).unwrap().gfx.as_ref(), Some(&g));
+    }
+
+
+    #[test]
+    fn yoru7_proxy_transition_effect_and_audio_keys_round_trip() {
+        let (mut p, media_id) = media_project();
+        p.set_proxy_path(media_id, Some(PathBuf::from("proxies/a.mp4")));
+        let video_id = p.clips.iter().find(|c| c.lane.is_video()).unwrap().id;
+        let audio_id = p.clips.iter().find(|c| !c.lane.is_video()).unwrap().id;
+        {
+            let video = p.clip_mut(video_id).unwrap();
+            video.transition_in = Some(Transition { kind: TransitionKind::Dissolve, duration: 0.6, enabled: true });
+            let mut effect = EffectInstance::new(EffectKind::Wave, 0.0);
+            effect.keys[0].push(EffectKey { t: 0.0, v: 5.0, ease: Ease::Linear });
+            effect.keys[0].push(EffectKey { t: 1.0, v: 32.0, ease: Ease::EaseOut });
+            video.effects.push(effect);
+        }
+        p.clip_mut(audio_id).unwrap().audio_keys.push(EffectKey { t: 0.5, v: 82.0, ease: Ease::EaseInOut });
+
+        let saved = p.to_text();
+        assert!(saved.starts_with("YORU 7\n"));
+        let q = Project::from_text(&saved).expect("YORU 7 project parses");
+        assert_eq!(q.media(media_id).unwrap().proxy_path.as_deref(), Some(Path::new("proxies/a.mp4")));
+        assert_eq!(q.clip(video_id).unwrap().transition_in.unwrap().kind, TransitionKind::Dissolve);
+        assert_eq!(q.clip(video_id).unwrap().effects[0].keys[0].len(), 2);
+        assert_eq!(q.clip(audio_id).unwrap().audio_keys[0].v, 82.0);
+    }
+
+    #[test]
+    fn applied_effect_stack_survives_save_load_and_undo() {
+        let (mut p, _) = media_project();
+        let id = p.clips[0].id;
+        let before = p.clips.clone();
+        p.clip_mut(id).unwrap().effects.push(EffectInstance::new(EffectKind::Wave, 0.75));
+        p.clip_mut(id).unwrap().effects.push(EffectInstance::new(EffectKind::GaussianBlur, 0.75));
+        let saved = p.to_text();
+        let q = Project::from_text(&saved).expect("effect project parses");
+        assert_eq!(q.clip(id).unwrap().effects, p.clip(id).unwrap().effects);
+        p.push_undo(before);
+        assert!(p.undo());
+        assert!(p.clip(id).unwrap().effects.is_empty());
     }
 
 }

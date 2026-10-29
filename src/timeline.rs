@@ -8,7 +8,7 @@
 //!   * smooth animated zoom, edge auto-scroll while dragging, follow-playhead
 
 use super::*;
-use crate::project::{nearest, DragOp, Lane, NTRACKS, NV};
+use crate::project::{nearest, DragOp, EffectKind, Lane, NTRACKS, NV};
 
 const RULER: f32 = 28.0;
 const HEAD: f32 = 76.0; // track header column
@@ -461,14 +461,16 @@ impl Timeline {
         proj: &mut Project,
         assets: &Assets,
         ghost: Option<&Ghost>,
+        effect_drag: &mut Option<EffectKind>,
     ) -> (bool, bool) {
         self.view = rect;
         let (mut edited, mut seeked) = (false, false);
-        let (hover, pressed, down, delta, scroll, zoom, mods, dt) = ui.input(|i| {
+        let (hover, pressed, down, released, delta, scroll, zoom, mods, dt) = ui.input(|i| {
             (
                 i.pointer.hover_pos(),
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
+                i.pointer.primary_released(),
                 i.pointer.delta(),
                 i.smooth_scroll_delta,
                 i.zoom_delta(),
@@ -534,6 +536,28 @@ impl Timeline {
                     edited = true;
                 }
             }
+        }
+
+        // ---- drag an effect from the browser onto a real video clip
+        if released && effect_drag.is_some() {
+            let kind = *effect_drag;
+            if let (Some(kind), Some(pos)) = (kind, hover.filter(|p| rect.contains(*p) && p.x >= content_left)) {
+                if pos.y - rect.top() >= RULER {
+                    if let Some((idx, _)) = self.hit(proj, rect, pos) {
+                        if let Some(c) = proj.clips.get(idx) {
+                            let id = c.id;
+                            let is_target = c.lane.is_video() && c.media.is_some() && !proj.is_locked(c.lane);
+                            let local_time = (self.t_of(rect, pos.x) - c.start).clamp(0.0, c.dur);
+                            if is_target && proj.apply_effect(id, kind, local_time) {
+                                self.sel.clear();
+                                self.sel.push(id);
+                                edited = true;
+                            }
+                        }
+                    }
+                }
+            }
+            *effect_drag = None;
         }
 
         // ---- marquee
@@ -844,13 +868,30 @@ impl Timeline {
         // label strip
         p.rect_filled(Rect::from_min_size(pos2(x0, y), vec2(x1 - x0, LABEL)), 0.0, rgba(40, 48, 70, 230));
         let mut room = x1 - x0 - 12.0;
-        if !c.fx.is_identity() && c.lane.is_video() && x1 - x0 > 60.0 {
-            p.text(pos2(x1 - 6.0, y + LABEL * 0.5), Align2::RIGHT_CENTER, "fx", font.clone(), POWDER);
-            room -= 16.0;
+        let effect_count = c.effects.len();
+        let enabled_count = c.effects.iter().filter(|e| e.enabled).count();
+        let has_fx = (!c.fx.is_identity() || effect_count > 0) && c.lane.is_video();
+        if has_fx && x1 - x0 > 60.0 {
+            let badge = if effect_count > 0 { format!("FX {effect_count}") } else { "FX".to_string() };
+            let bw = if effect_count > 0 { 30.0 } else { 20.0 };
+            let br = Rect::from_min_size(pos2(x1 - bw - 4.0, y + 2.0), vec2(bw, LABEL - 4.0));
+            p.rect_filled(br, 3.0, if effect_count > 0 && enabled_count == 0 { rgba(139, 148, 158, 48) } else { rgba(120, 160, 240, 75) });
+            p.text(br.center(), Align2::CENTER_CENTER, badge, FontId::monospace(7.0), if effect_count > 0 && enabled_count == 0 { MUTED } else { POWDER });
+            room -= bw + 8.0;
+        }
+        let mut label_x = x0 + 6.0;
+        if let Some(_tr) = c.transition_in.filter(|tr| tr.enabled) {
+            if x1 - x0 > 52.0 {
+                let br = Rect::from_min_size(pos2(x0 + 3.0, y + 2.0), vec2(20.0, LABEL - 4.0));
+                p.rect_filled(br, 3.0, rgba(250, 190, 100, 75));
+                p.text(br.center(), Align2::CENTER_CENTER, "TR", FontId::monospace(7.0), rgba(255, 220, 160, 255));
+                room -= 24.0;
+                label_x += 24.0;
+            }
         }
         if x1 - x0 > 40.0 {
             let g = elided(ui, &c.name, font.clone(), TEXT, room.max(10.0));
-            p.galley(pos2(x0 + 6.0, y + (LABEL - g.size().y) / 2.0), g, TEXT);
+            p.galley(pos2(label_x, y + (LABEL - g.size().y) / 2.0), g, TEXT);
         }
 
         // track state overlays
@@ -893,6 +934,7 @@ pub fn timeline_panel(
     proj: &mut Project,
     assets: &Assets,
     ghost: Option<&Ghost>,
+    effect_drag: &mut Option<EffectKind>,
 ) -> (bool, bool) {
     let mut out = (false, false);
     glass(12.0, 8.0, 12.0, 10.0).show(ui, |ui| {
@@ -923,7 +965,7 @@ pub fn timeline_panel(
         let meter = Rect::from_min_max(pos2(full.right() - 36.0, full.top()), full.max);
         let view = Rect::from_min_max(full.min, pos2(meter.left() - 6.0, full.bottom()));
         ui.allocate_rect(full, Sense::hover());
-        out = tl.show(ui, view, t, proj, assets, ghost);
+        out = tl.show(ui, view, t, proj, assets, ghost, effect_drag);
         level_meter(ui, meter, levels.0, levels.1);
     });
     out

@@ -3,13 +3,15 @@
 //! clip's `Fx`; a slider/graph drag becomes a single undo step.
 
 use super::*;
-use crate::project::{Ease, Fx, Gfx, GfxKind, NPARAM, PARAMS};
+use crate::project::{Ease, EffectKind, Fx, Gfx, GfxKind, NPARAM, PARAMS, TransitionKind};
 
 pub struct Inspector {
     pub tab: usize,
     sel_param: usize,
     sel_key: Option<usize>,
     graph_key: Option<usize>,
+    sel_effect: Option<usize>,
+    sel_effect_clip: Option<u32>,
     /// Clip list from before the current edit; pushed as one undo step when the mouse is released.
     session: Option<Vec<Clip>>,
     /// Timeline time the app should jump to (keyframe navigation).
@@ -18,7 +20,7 @@ pub struct Inspector {
 
 impl Inspector {
     pub fn new() -> Self {
-        Self { tab: 0, sel_param: 0, sel_key: None, graph_key: None, session: None, goto: None }
+        Self { tab: 0, sel_param: 0, sel_key: None, graph_key: None, sel_effect: None, sel_effect_clip: None, session: None, goto: None }
     }
 }
 
@@ -52,6 +54,11 @@ fn effect_controls(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[
     let Some(clip) = clip else {
         placeholder(ui, "Select a video clip on the timeline to edit its effects.");
         return false;
+    };
+    let stack_changed = if clip.media.is_some() && clip.gfx.is_none() {
+        effect_stack(ui, ins, proj, clip.id, t)
+    } else {
+        false
     };
     let ts = clip.fx_time(t); // keyframe time = source seconds
     let snapshot = proj.clips.clone();
@@ -104,7 +111,134 @@ fn effect_controls(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[
             c.fx = fx;
         }
     }
-    changed
+    changed || stack_changed
+}
+
+fn effect_stack(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, clip_id: u32, timeline_t: f64) -> bool {
+    let Some(clip) = proj.clip(clip_id).cloned() else { return false; };
+    let pre = proj.clips.clone();
+    let mut effects = clip.effects.clone();
+    let mut modified = false;
+    let mut remove_at = None;
+    if ins.sel_effect_clip != Some(clip_id) {
+        ins.sel_effect_clip = Some(clip_id);
+        ins.sel_effect = if effects.is_empty() { None } else { Some(effects.len() - 1) };
+    }
+    if !effects.is_empty() && ins.sel_effect.is_none() { ins.sel_effect = Some(effects.len() - 1); }
+    // Inbound transition controls are kept with the selected clip's actual effect stack.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("TRANSITION IN").color(MUTED).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if clip.transition_in.is_some() && ui.small_button("Remove").clicked() {
+                if let Some(c) = proj.clip_mut(clip_id) { c.transition_in = None; }
+                proj.push_undo(pre.clone());
+                modified = true;
+            }
+        });
+    });
+    let mut transition_kind = clip.transition_in.map(|tr| tr.kind).unwrap_or(TransitionKind::Dissolve);
+    let mut transition_duration = clip.transition_in.map(|tr| tr.duration).unwrap_or(0.8);
+    let mut transition_enabled = clip.transition_in.map(|tr| tr.enabled).unwrap_or(true);
+    let mut apply_transition = false;
+    ui.horizontal(|ui| {
+        ComboBox::from_id_salt(("transition_kind", clip_id))
+            .selected_text(transition_kind.label())
+            .show_ui(ui, |ui| for kind in TransitionKind::ALL { ui.selectable_value(&mut transition_kind, kind, kind.label()); });
+        if ui.small_button(if clip.transition_in.is_some() { "Update" } else { "+ Apply" }).clicked() { apply_transition = true; }
+    });
+    if clip.transition_in.is_some() {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut transition_enabled, "Enabled");
+            ui.add(Slider::new(&mut transition_duration, 0.05..=clip.dur.min(5.0) as f32).text("Duration"));
+        });
+    }
+    if apply_transition || clip.transition_in.map_or(false, |tr| tr.duration != transition_duration || tr.enabled != transition_enabled || tr.kind != transition_kind) {
+        if ins.session.is_none() { ins.session = Some(pre.clone()); }
+        if let Some(c) = proj.clip_mut(clip_id) {
+            c.transition_in = Some(crate::project::Transition { kind: transition_kind, duration: transition_duration.clamp(0.05, clip.dur.min(5.0) as f32), enabled: transition_enabled });
+        }
+        modified = true;
+    }
+    ui.add_space(5.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("APPLIED EFFECTS").color(MUTED).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(format!("{}", effects.len())).size(9.0).color(MUTED));
+        });
+    });
+    if effects.is_empty() {
+        ui.label(RichText::new("Drag an effect from the Effects browser onto this clip.").size(10.0).color(MUTED));
+    } else {
+        ScrollArea::vertical().max_height(116.0).auto_shrink([false, false]).show(ui, |ui| {
+            for i in 0..effects.len() {
+                ui.horizontal(|ui| {
+                    let mut enabled = effects[i].enabled;
+                    if ui.checkbox(&mut enabled, "").changed() { effects[i].enabled = enabled; modified = true; }
+                    let label = format!("{}  {}", if effects[i].enabled { "●" } else { "○" }, effects[i].kind.label());
+                    if ui.selectable_label(ins.sel_effect == Some(i), label).clicked() { ins.sel_effect = Some(i); }
+                    if ui.small_button("↑").on_hover_text("Move effect earlier in the stack").clicked() && i > 0 {
+                        effects.swap(i, i - 1); ins.sel_effect = Some(i - 1); modified = true;
+                    }
+                    if ui.small_button("↓").on_hover_text("Move effect later in the stack").clicked() && i + 1 < effects.len() {
+                        effects.swap(i, i + 1); ins.sel_effect = Some(i + 1); modified = true;
+                    }
+                    if ui.small_button("×").on_hover_text("Remove effect").clicked() {
+                        remove_at = Some(i); modified = true;
+                    }
+                });
+            }
+        });
+        if let Some(i) = remove_at {
+            if i < effects.len() { effects.remove(i); }
+            ins.sel_effect = if effects.is_empty() { None } else { Some(i.min(effects.len() - 1)) };
+        }
+        if let Some(idx) = ins.sel_effect.filter(|i| *i < effects.len()) {
+            let ef = &mut effects[idx];
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(ef.kind.label()).color(POWDER).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Reset").clicked() { ef.params = ef.kind.defaults(); ef.keys = Default::default(); modified = true; }
+                });
+            });
+            let local_time = (timeline_t - clip.start).max(0.0);
+            for (pi, def) in ef.kind.params().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 18.0], Label::new(RichText::new(def.name).size(10.0).color(MUTED)));
+                    let mut v = ef.param_at(pi, local_time);
+                    let before = v;
+                    let slider_w = (ui.available_width() - 98.0).max(45.0);
+                    ui.add_sized([slider_w, 18.0], Slider::new(&mut v, def.min..=def.max).show_value(false));
+                    ui.add_sized([58.0, 18.0], DragValue::new(&mut v).clamp_range(def.min..=def.max).speed(((def.max-def.min)/500.0).max(0.01)).suffix(def.suffix));
+                    if (v - before).abs() > 1e-4 { ef.set_param_at(pi, local_time, v); modified = true; }
+                    let keyed = ef.key_near(pi, local_time).is_some();
+                    if ui.small_button(if keyed { "◆" } else { "◇" }).on_hover_text(if keyed { "Remove keyframe at the playhead" } else { "Add keyframe at the playhead" }).clicked() {
+                        ef.toggle_key(pi, local_time);
+                        modified = true;
+                    }
+                });
+                if let Some(k) = ef.key_near(pi, local_time) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(78.0);
+                        ui.label(RichText::new("Key easing").size(9.0).color(MUTED));
+                        let mut ease = ef.keys[pi][k].ease;
+                        ComboBox::from_id_salt(("effect_key_ease", clip_id, idx, pi))
+                            .selected_text(ease.label())
+                            .show_ui(ui, |ui| for e in Ease::ALL { ui.selectable_value(&mut ease, e, e.label()); });
+                        if ease != ef.keys[pi][k].ease { ef.keys[pi][k].ease = ease; modified = true; }
+                    });
+                }
+            }
+            if ef.kind == EffectKind::Flash {
+                ui.label(RichText::new("Flash begins at the timeline position where you dropped it.").size(9.0).color(MUTED));
+            }
+        }
+    }
+    if modified && effects != clip.effects {
+        if ins.session.is_none() { ins.session = Some(pre); }
+        if let Some(c) = proj.clip_mut(clip_id) { c.effects = effects; }
+    }
+    modified
 }
 
 fn selected_graphic(proj: &Project, sel: &[u32]) -> Option<(u32, crate::project::Gfx)> {
@@ -226,22 +360,51 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     created || changed
 }
 
-fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32], _t: f64) -> bool {
+fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32], timeline_t: f64) -> bool {
     let Some(clip) = sel.iter().find_map(|id| proj.clip(*id).filter(|c| !c.lane.is_video()).cloned()) else {
         placeholder(ui, "Select an audio clip on A1, A2 or A3.");
         return false;
     };
     let pre = proj.clips.clone();
-    let (mut gain, mut fade_in, mut fade_out) = (clip.audio_gain, clip.fade_in, clip.fade_out);
+    let local_t = (timeline_t - clip.start).clamp(0.0, clip.dur.max(0.0));
+    let (mut gain, mut fade_in, mut fade_out) = (clip.audio_gain_at(local_t), clip.fade_in, clip.fade_out);
     let mut changed = false;
+    let mut gain_changed = false;
     ui.label(RichText::new(&clip.name).color(TEXT).strong());
-    ui.horizontal(|ui| { ui.label("Volume"); changed |= ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%")).changed(); });
+    ui.horizontal(|ui| {
+        ui.label("Volume");
+        let slider_changed = ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%")).changed();
+        gain_changed |= slider_changed;
+        changed |= slider_changed;
+        let keyed = clip.audio_key_near(local_t).is_some();
+        if ui.small_button(if keyed { "◆" } else { "◇" }).on_hover_text(if keyed { "Remove gain keyframe at playhead" } else { "Add gain keyframe at playhead" }).clicked() {
+            if let Some(c) = proj.clip_mut(clip.id) { c.toggle_audio_key(local_t); }
+            changed = true;
+        }
+    });
+    if let Some(k) = clip.audio_key_near(local_t) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Gain key easing").size(10.0).color(MUTED));
+            let mut ease = clip.audio_keys[k].ease;
+            ComboBox::from_id_salt(("audio_gain_ease", clip.id, k))
+                .selected_text(ease.label())
+                .show_ui(ui, |ui| for e in Ease::ALL { ui.selectable_value(&mut ease, e, e.label()); });
+            if ease != clip.audio_keys[k].ease {
+                if let Some(c) = proj.clip_mut(clip.id) { if let Some(key) = c.audio_keys.get_mut(k) { key.ease = ease; } }
+                changed = true;
+            }
+        });
+    }
     ui.horizontal(|ui| { ui.label("Fade in"); changed |= ui.add(egui::DragValue::new(&mut fade_in).clamp_range(0.0..=clip.dur).speed(0.05).suffix(" s")).changed(); });
     ui.horizontal(|ui| { ui.label("Fade out"); changed |= ui.add(egui::DragValue::new(&mut fade_out).clamp_range(0.0..=clip.dur).speed(0.05).suffix(" s")).changed(); });
-    ui.label(RichText::new("Gain and fades apply during playback; fades are linear.").size(10.0).color(MUTED));
+    ui.label(RichText::new("Gain can be keyframed. Fades are linear; final export mixes all visible audio clips.").size(10.0).color(MUTED));
     if changed {
         if ins.session.is_none() { ins.session = Some(pre); }
-        if let Some(c) = proj.clip_mut(clip.id) { c.audio_gain = gain; c.fade_in = fade_in; c.fade_out = fade_out; }
+        if let Some(c) = proj.clip_mut(clip.id) {
+            if gain_changed { c.set_audio_gain_at(local_t, gain); }
+            c.fade_in = fade_in;
+            c.fade_out = fade_out;
+        }
     }
     changed
 }
@@ -281,6 +444,7 @@ fn param_row(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, i: usize, ts: f64, c
             Label::new(RichText::new(def.name).size(11.0).color(if picked { TEXT } else { MUTED })).sense(Sense::click()),
         );
         if name.clicked() {
+            if ins.sel_param != i { ins.sel_key = None; }
             ins.sel_param = i;
         }
 
@@ -347,6 +511,7 @@ fn param_row(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, i: usize, ts: f64, c
         if dresp.on_hover_text("Add / remove a keyframe at the playhead").clicked() {
             fx.toggle_key(i, ts);
             ins.sel_param = i;
+            ins.sel_key = fx.key_near(i, ts);
             *changed = true;
         }
     });
@@ -454,10 +619,19 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
 
     // easing of the selected key (applies to the segment up to the next key)
     if let Some(k) = ins.sel_key.filter(|k| *k < fx.keys[i].len()) {
-        ui.horizontal(|ui| {
+        ui.label(RichText::new("SEGMENT INTERPOLATION").size(9.0).color(MUTED));
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for e in Ease::ALL {
-                if ui.selectable_label(fx.keys[i][k].ease == e, RichText::new(e.label()).size(10.0)).clicked() {
+                let short = match e {
+                    Ease::Linear => "Linear",
+                    Ease::EaseIn => "In",
+                    Ease::EaseOut => "Out",
+                    Ease::EaseInOut => "In/Out",
+                    Ease::Hold => "Hold",
+                };
+                if ui.selectable_label(fx.keys[i][k].ease == e, RichText::new(short).size(10.0))
+                    .on_hover_text(e.label()).clicked() {
                     fx.keys[i][k].ease = e;
                     *changed = true;
                 }

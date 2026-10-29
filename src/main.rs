@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 mod assets;
 mod engine;
 mod fxrender;
+mod export;
 mod gfxdraw;
 mod fxui;
 mod media;
@@ -26,7 +27,7 @@ mod project;
 mod timeline;
 
 use assets::Assets;
-use project::{Clip, Lane, Project, NPARAM, PARAMS};
+use project::{Clip, EffectKind, EffectInstance, Lane, Project, NPARAM, PARAMS};
 use timeline::{timeline_panel, Ghost, Timeline, Tool};
 
 // ------------------------------------------------------------------ settings
@@ -310,17 +311,24 @@ fn slider(ui: &mut Ui, val: &mut f32, lo: f32, hi: f32, width: f32) {
 
 /// Monitor picture for one frame: the raw video when no effect is active (and it is 16:9),
 /// otherwise the frame composited into a 16:9 canvas with the clip's effects applied.
-fn preview_image(f: &media::Frame, params: &[f32; NPARAM]) -> (ColorImage, f32) {
+fn preview_image(
+    f: &media::Frame,
+    params: &[f32; NPARAM],
+    effects: &[EffectInstance],
+    local_time: f64,
+    clip_duration: f64,
+) -> (ColorImage, f32) {
     let asp = f.w as f32 / f.h.max(1) as f32;
     let neutral = (0..NPARAM).all(|i| (params[i] - PARAMS[i].def).abs() < 1e-4);
-    if neutral && (asp - 16.0 / 9.0).abs() < 0.02 {
+    let no_effects = effects.iter().all(|e| !e.enabled);
+    if neutral && no_effects && (asp - 16.0 / 9.0).abs() < 0.02 {
         // alpha is always 255 after the RGBA conversion, so premultiplied == straight
         return (ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba), asp);
     }
     let cw = f.w.max(320) & !1;
     let ch = (cw * 9 / 16) & !1;
     let mut buf = vec![0u8; cw * ch * 4];
-    fxrender::render(&f.rgba, f.w, f.h, params, &mut buf, cw, ch);
+    fxrender::render_with_effects(&f.rgba, f.w, f.h, params, effects, local_time, clip_duration, &mut buf, cw, ch);
     (ColorImage::from_rgba_premultiplied([cw, ch], &buf), cw as f32 / ch as f32)
 }
 
@@ -371,8 +379,9 @@ fn monitor_panel(
     quality: &mut usize,
     video: Option<(TextureId, f32)>,
     overlays: &[gfxdraw::Overlay],
-) -> bool {
+) -> (bool, bool) {
     let mut play = false;
+    let mut export = false;
     glass(14.0, 8.0, 14.0, 10.0).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.horizontal(|ui| {
@@ -389,6 +398,7 @@ fn monitor_panel(
                     }
                 });
                 ui.label(RichText::new("Playback").size(10.0).color(MUTED));
+                if ui.button("Export").on_hover_text("Render the timeline to MP4").clicked() { export = true; }
             });
         });
 
@@ -430,7 +440,7 @@ fn monitor_panel(
         ui.painter()
             .galley(pos2(x0 + 44.0, bar.center().y - g.size().y / 2.0), g, TEXT);
     });
-    play
+    (play, export)
 }
 
 fn placeholder(ui: &mut Ui, text: &str) {
@@ -443,13 +453,11 @@ fn placeholder(ui: &mut Ui, text: &str) {
 const CLIP_NAMES: [&str; 10] = [
     "Cabana", "Mountain gold", "Jungle forest", "Hammock", "Waterfall", "Beach", "Pool", "Rocks", "Trail", "Canopy",
 ];
-const EFFECTS: [(&str, &[&str]); 6] = [
-    ("Presets", &["Blurs", "Distort", "Lens Flares"]),
-    ("Lumetri Presets", &["Cinematic", "Technicolor", "Monochrome"]),
-    ("Audio Effects", &["Reverb", "Parametric EQ", "Compressor"]),
-    ("Audio Transitions", &["Constant Power", "Cross Fade"]),
-    ("Video Effects", &["Color Correction", "Blur & Sharpen", "Transform", "Stylize"]),
-    ("Video Transitions", &["Cross Dissolve", "Dip to Black", "Wipe", "Push"]),
+const EFFECTS: [(&str, &[&str]); 4] = [
+    ("Distortion", &["Wave Warp", "Ripple", "Twirl", "RGB Split"]),
+    ("Blur & Sharpen", &["Gaussian Blur", "Lens Blur", "Directional Motion Blur", "Sharpen"]),
+    ("Light & Stylize", &["Glow"]),
+    ("Transitions", &["Flash", "Fade In", "Fade Out"]),
 ];
 
 struct Browser {
@@ -467,7 +475,9 @@ fn browser_panel(
     proj: &Project,
     assets: &Assets,
     drag: &mut Option<u32>,
+    effect_drag: &mut Option<EffectKind>,
     import_requested: &mut bool,
+    proxy_requested: &mut Option<u32>,
 ) -> Option<u32> {
     let mut add = None;
     glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
@@ -493,6 +503,15 @@ fn browser_panel(
                 } else {
                     media_list(ui, proj, &mut b.sel, drag)
                 };
+                if let Some(selected) = proj.media.get(b.sel) {
+                    let ready = selected.proxy_path.as_ref().map_or(false, |p| p.is_file());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if ready { "Proxy ready" } else { "Preview proxy: none" }).size(9.0).color(if ready { rgba(150, 225, 185, 255) } else { MUTED }));
+                        if ui.small_button(if ready { "Rebuild" } else { "Generate proxy" }).on_hover_text("Create a 960px proxy for smoother timeline playback; export uses the original source.").clicked() {
+                            *proxy_requested = Some(selected.id);
+                        }
+                    });
+                }
             }
             _ => {
                 ui.add(
@@ -501,6 +520,7 @@ fn browser_panel(
                         .desired_width(f32::INFINITY)
                         .margin(vec2(10.0, 5.0)),
                 );
+                ui.label(RichText::new("Drag an effect onto a video clip to apply it.").size(9.0).color(MUTED));
                 let q = b.search.trim().to_lowercase();
                 ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     for (folder, kids) in EFFECTS {
@@ -518,7 +538,15 @@ fn browser_panel(
                         }
                         h.show(ui, |ui| {
                             for k in vis {
-                                if ui.selectable_label(b.fx_sel == Some(k), k).clicked() {
+                                let selected = b.fx_sel == Some(k);
+                                let fill = if selected { rgba(120, 160, 240, 50) } else { Color32::TRANSPARENT };
+                                let resp = ui.add_sized(
+                                    [ui.available_width(), 26.0],
+                                    Button::new(k).fill(fill).frame(false).sense(Sense::click_and_drag()),
+                                ).on_hover_text("Drag onto a video clip to apply this effect");
+                                if resp.clicked() { b.fx_sel = Some(k); }
+                                if resp.drag_started() {
+                                    *effect_drag = EffectKind::from_label(k);
                                     b.fx_sel = Some(k);
                                 }
                             }
@@ -826,12 +854,21 @@ struct App {
     quality_idx: usize,
     applied_quality: usize,
     drag_media: Option<u32>,
+    effect_drag: Option<EffectKind>,
     ghost: Option<Ghost>,
     last_params: Option<[f32; NPARAM]>,
+    last_effects: Option<Vec<EffectInstance>>,
     autosave_path: PathBuf,
     last_change: Instant,
     last_autosave: Instant,
     recovery_offer: bool,
+    export_open: bool,
+    export_settings: export::ExportSettings,
+    export_job: Option<export::ExportJob>,
+    export_error: Option<String>,
+    proxy_job: Option<export::ExportJob>,
+    proxy_target: Option<(u32, PathBuf)>,
+    proxy_error: Option<String>,
 }
 
 impl App {
@@ -861,12 +898,21 @@ impl App {
             quality_idx: 1, // 1/2 resolution: snappy by default
             applied_quality: 1,
             drag_media: None,
+            effect_drag: None,
             ghost: None,
             last_params: None,
+            last_effects: None,
             autosave_path,
             last_change: now,
             last_autosave: now,
             recovery_offer,
+            export_open: false,
+            export_settings: export::ExportSettings::default(),
+            export_job: None,
+            export_error: None,
+            proxy_job: None,
+            proxy_target: None,
+            proxy_error: None,
         }
     }
 
@@ -913,9 +959,10 @@ impl App {
         self.assets = Assets::new();
         for m in &self.proj.media {
             self.assets.spawn(ctx, m.id, &m.path, m.duration, m.has_audio);
-            match media::Player::open(&m.path, ctx.clone()) {
+            let preview_path = m.proxy_path.as_ref().filter(|path| path.is_file()).unwrap_or(&m.path);
+            match media::Player::open(preview_path, ctx.clone()) {
                 Ok(player) => self.engine.insert(m.id, player),
-                Err(e) => eprintln!("cannot reopen media {}: {e}", m.path.display()),
+                Err(e) => eprintln!("cannot reopen media {}: {e}", preview_path.display()),
             }
         }
     }
@@ -949,6 +996,131 @@ impl App {
                 eprintln!("cannot recover Yoru autosave: {e}");
                 self.recovery_offer = false;
             }
+        }
+    }
+
+    fn export_windows(&mut self, ctx: &Context) {
+        if self.export_open {
+            let mut open = self.export_open;
+            let mut begin = false;
+            Window::new("Export Video")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("MP4 · H.264 video · AAC audio").color(MUTED));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Resolution");
+                        ComboBox::from_id_salt("export_resolution")
+                            .selected_text(format!("{} × {}", self.export_settings.width, self.export_settings.height))
+                            .show_ui(ui, |ui| {
+                                for (w, h, label) in [(1920, 1080, "1080p"), (1280, 720, "720p"), (854, 480, "480p"), (3840, 2160, "4K") ] {
+                                    ui.selectable_value(&mut self.export_settings.width, w, label);
+                                    // Keep height paired with the selected width.
+                                    if self.export_settings.width == w { self.export_settings.height = h; }
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Frame rate");
+                        ComboBox::from_id_salt("export_fps").selected_text(format!("{} fps", self.export_settings.fps)).show_ui(ui, |ui| {
+                            for fps in [24, 25, 30, 50, 60] { ui.selectable_value(&mut self.export_settings.fps, fps, format!("{fps} fps")); }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Video bitrate");
+                        ui.add(Slider::new(&mut self.export_settings.bitrate_mbps, 2..=50).suffix(" Mbps"));
+                    });
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("All timeline video layers are composited; audio clips are mixed with gain and fades.").size(10.0).color(MUTED));
+                    ui.add_space(4.0);
+                    if ui.button("Choose output and render MP4…").clicked() { begin = true; }
+                });
+            self.export_open = open;
+            if begin {
+                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.mp4", self.project)).add_filter("MP4 video", &["mp4"]).save_file() {
+                    match export::start(&self.proj, &path, &self.export_settings) {
+                        Ok(job) => { self.export_job = Some(job); self.export_error = None; self.export_open = false; }
+                        Err(e) => { self.export_error = Some(e); self.export_open = true; }
+                    }
+                }
+            }
+        }
+
+        if let Some(job) = self.export_job.as_ref() {
+            let snapshot = job.status.lock().map(|s| s.clone()).unwrap_or(export::ExportStatus { progress: 0.0, message: "Export status unavailable".into(), done: true, success: Some(false), error: None });
+            let mut cancel = false;
+            let mut dismiss = false;
+            Window::new("Rendering Timeline")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    ui.label(&snapshot.message);
+                    ui.add(ProgressBar::new(snapshot.progress.clamp(0.0, 1.0)).show_percentage());
+                    if let Some(error) = &snapshot.error {
+                        ScrollArea::vertical().max_height(130.0).show(ui, |ui| ui.label(RichText::new(error).color(rgba(255, 130, 130, 255))));
+                    }
+                    ui.horizontal(|ui| {
+                        if !snapshot.done && ui.button("Cancel export").clicked() { cancel = true; }
+                        if snapshot.done && ui.button("Close").clicked() { dismiss = true; }
+                    });
+                });
+            if cancel { if let Some(job) = self.export_job.as_ref() { job.cancel(); } }
+            if dismiss { self.export_job = None; }
+        }
+
+        if let Some(err) = self.export_error.clone() {
+            let mut open = true;
+            Window::new("Export Error").open(&mut open).collapsible(false).show(ctx, |ui| {
+                ui.label(RichText::new(err).color(rgba(255, 140, 140, 255)));
+                if ui.button("OK").clicked() { self.export_error = None; }
+            });
+            if !open { self.export_error = None; }
+        }
+    }
+
+    fn proxy_windows(&mut self, ctx: &Context) {
+        let snapshot = self.proxy_job.as_ref().map(|job| {
+            job.status.lock().map(|s| s.clone()).unwrap_or(export::ExportStatus {
+                progress: 0.0, message: "Proxy status unavailable".into(), done: true, success: Some(false), error: None,
+            })
+        });
+        if let Some(snapshot) = snapshot {
+            if snapshot.done {
+                if snapshot.success == Some(true) {
+                    if let Some((media_id, path)) = self.proxy_target.take() {
+                        self.proj.set_proxy_path(media_id, Some(path));
+                        self.engine.invalidate_media(media_id);
+                        self.after_edit();
+                    }
+                } else if let Some((_, path)) = self.proxy_target.take() {
+                    self.proxy_error = snapshot.error.clone().or_else(|| Some(format!("Proxy generation did not complete: {}", path.display())));
+                }
+            }
+            let mut cancel = false;
+            let mut dismiss = false;
+            Window::new("Generating Preview Proxy").collapsible(false).resizable(false).default_width(360.0).show(ctx, |ui| {
+                ui.label(&snapshot.message);
+                ui.add(ProgressBar::new(snapshot.progress.clamp(0.0, 1.0)).show_percentage());
+                if let Some(error) = &snapshot.error { ScrollArea::vertical().max_height(100.0).show(ui, |ui| ui.label(error)); }
+                ui.horizontal(|ui| {
+                    if !snapshot.done && ui.button("Cancel").clicked() { cancel = true; }
+                    if snapshot.done && ui.button("Close").clicked() { dismiss = true; }
+                });
+            });
+            if cancel { if let Some(job) = self.proxy_job.as_ref() { job.cancel(); } }
+            if dismiss { self.proxy_job = None; self.proxy_target = None; }
+        }
+        if let Some(error) = self.proxy_error.clone() {
+            let mut open = true;
+            Window::new("Proxy Error").open(&mut open).collapsible(false).show(ctx, |ui| {
+                ui.label(RichText::new(error).color(rgba(255, 130, 130, 255)));
+                if ui.button("OK").clicked() { self.proxy_error = None; }
+            });
+            if !open { self.proxy_error = None; }
         }
     }
 
@@ -1281,11 +1453,17 @@ impl eframe::App for App {
         self.engine.update(ctx, &self.proj, self.t, self.rate == 1, jumped, muted, self.proj.audio_gain_at(self.t));
         // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
         let new_frame = self.engine.poll(self.t).is_some();
-        let params = self.proj.video_clip_at(self.t).map(|c| c.fx.eval(c.fx_time(self.t)));
-        if new_frame || params != self.last_params {
+        let active = self.proj.video_clip_at(self.t).map(|c| {
+            (c.fx.eval(c.fx_time(self.t)), c.effects.clone(), (self.t - c.start).max(0.0), c.dur)
+        });
+        let params = active.as_ref().map(|a| a.0);
+        let effects = active.as_ref().map(|a| a.1.clone());
+        let effects_changed = effects != self.last_effects;
+        if new_frame || params != self.last_params || effects_changed {
             self.last_params = params;
-            if let (Some(f), Some(pr)) = (self.engine.current(), params) {
-                let (img, aspect) = preview_image(f, &pr);
+            self.last_effects = effects.clone();
+            if let (Some(f), Some(pr), Some((_, fx, local_time, dur))) = (self.engine.current(), params, active) {
+                let (img, aspect) = preview_image(f, &pr, &fx, local_time, dur);
                 self.tex_aspect = aspect;
                 match &mut self.tex {
                     Some(t) => t.set(img, TextureOptions::LINEAR),
@@ -1322,12 +1500,13 @@ impl eframe::App for App {
             .show_separator_line(false)
             .show(ctx, |ui| title_bar(ui, ctx, &title, maximized));
 
-        let (mut edited, mut seeked, mut play) = (false, false, false);
+        let (mut edited, mut seeked, mut play, mut export_clicked) = (false, false, false, false);
         let mut add_media: Option<u32> = None;
         let mut import_requested = false;
+        let mut proxy_requested: Option<u32> = None;
         let mut fx_changed = false;
         {
-            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, ghost, .. } = self;
+            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, effect_drag, ghost, .. } = self;
             let playing = *rate > 0;
 
             TopBottomPanel::bottom("bottom")
@@ -1344,10 +1523,10 @@ impl eframe::App for App {
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
                         .show_inside(ui, |ui| {
-                            add_media = browser_panel(ui, browser, proj, assets, drag_media, &mut import_requested);
+                            add_media = browser_panel(ui, browser, proj, assets, drag_media, effect_drag, &mut import_requested, &mut proxy_requested);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref());
+                        let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref(), effect_drag);
                         edited |= r.0;
                         seeked |= r.1;
                     });
@@ -1366,10 +1545,17 @@ impl eframe::App for App {
                             fx_changed |= fxui::inspector_panel(ui, inspector, proj, &mut timeline.sel, *t);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        play |= monitor_panel(ui, &label, *t, playing, fit, quality_idx, video, &overlays);
+                        let (p, e) = monitor_panel(ui, &label, *t, playing, fit, quality_idx, video, &overlays);
+                        play |= p;
+                        export_clicked |= e;
                     });
                 });
         }
+        // A dropped effect is either consumed by the timeline or cancelled if released elsewhere.
+        if ctx.input(|i| i.pointer.primary_released()) {
+            self.effect_drag = None;
+        }
+
         // Import goes into the Project bin only. Users can then drag or double-click media
         // when they actually want it on the timeline.
         if import_requested {
@@ -1398,6 +1584,20 @@ impl eframe::App for App {
                 if imported_any {
                     self.mark_dirty();
                 }
+            }
+        }
+
+        if let Some(media_id) = proxy_requested {
+            if self.proxy_job.as_ref().map_or(true, |job| job.is_done()) {
+                if let Some(media) = self.proj.media.iter().find(|m| m.id == media_id).cloned() {
+                    let proxy_path = yoru_data_dir().join("proxies").join(format!("media_{media_id}.mp4"));
+                    match export::start_proxy(&media.path, &proxy_path, media.duration) {
+                        Ok(job) => { self.proxy_job = Some(job); self.proxy_target = Some((media_id, proxy_path)); self.proxy_error = None; }
+                        Err(e) => { self.proxy_error = Some(e); }
+                    }
+                }
+            } else {
+                self.proxy_error = Some("A proxy is already being generated. Finish or cancel it first.".into());
             }
         }
 
@@ -1463,6 +1663,9 @@ impl eframe::App for App {
         if play {
             self.toggle_play();
         }
+        if export_clicked { self.export_open = true; }
+        self.export_windows(ctx);
+        self.proxy_windows(ctx);
     }
 }
 
