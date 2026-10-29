@@ -214,7 +214,7 @@ fn filters_for_effect(effect: &EffectInstance, clip_duration: f64) -> Vec<String
             let denom = levels - 1;
             vec![format!("lutrgb=r='round(val*{denom}/255)*255/{denom}':g='round(val*{denom}/255)*255/{denom}':b='round(val*{denom}/255)*255/{denom}'")]
         }
-        EffectKind::FilmGrain => vec![format!("noise=alls={}:allf=t+u", num((effect.params[0] * 0.8).clamp(0.0, 40.0)))],
+        EffectKind::FilmGrain => vec![format!("noise=alls={}:allf=t+u", fnum((effect.params[0] * 0.8).clamp(0.0, 40.0)))],
         EffectKind::Scanlines => {
             let amount = format!("({}/100)", fnum(effect.params[0].clamp(0.0, 100.0)));
             let spacing = effect.params[1].round().clamp(2.0, 12.0) as u32;
@@ -311,7 +311,6 @@ fn graphic_filter(clip: &Clip, duration: f64, settings: &ExportSettings, label: 
             }
             let cx_text = format!("(({px})/1920*w)");
             let cy_text = format!("(({py})/1080*h)");
-            let x_text = format!("({cx_text})-text_w/2");
             // `cx_text` is the graphic center; the text alignment is relative to the
             // graphic box. Keep these as FFmpeg expressions (Strings) instead of doing
             // mixed f32/f64 arithmetic in Rust during filter construction.
