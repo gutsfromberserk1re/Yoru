@@ -924,6 +924,7 @@ struct App {
     proj: Project,
     engine: engine::Engine,
     jumped: bool,
+    step_direction: Option<i8>,
     tex: Option<TextureHandle>,
     tex_aspect: f32,
     assets: Assets,
@@ -969,6 +970,7 @@ impl App {
             proj: Project::new(),
             engine: engine::Engine::new(),
             jumped: false,
+            step_direction: None,
             tex: None,
             tex_aspect: 16.0 / 9.0,
             assets: Assets::new(),
@@ -999,6 +1001,22 @@ impl App {
     fn seek(&mut self, t: f64) {
         self.set_time(t);
         self.jumped = true; // the engine repositions its decoders on the next frame
+        self.step_direction = None;
+    }
+
+    /// Frame navigation is handled separately from a normal seek so the decoder can continue
+    /// from its current position or use its nearby-frame cache instead of flushing on every key.
+    fn step_frame(&mut self, direction: i8) {
+        if self.rate != 0 {
+            self.set_rate(0);
+        }
+        let target = (self.t + self.engine.frame_step() * direction as f64).clamp(0.0, duration());
+        if (target - self.t).abs() < 1e-9 {
+            return;
+        }
+        self.set_time(target);
+        self.step_direction = Some(direction);
+        self.jumped = false;
     }
 
     fn project_file_dialog() -> rfd::FileDialog {
@@ -1391,16 +1409,10 @@ impl App {
             self.shuttle(-1);
         }
         if k(Key::ArrowRight, none) {
-            // Frame stepping is deterministic: stop transport first and move exactly one source
-            // frame, not one hard-coded 30 fps frame for every clip.
-            if self.rate != 0 { self.set_rate(0); }
-            let step = self.engine.frame_step();
-            self.seek(self.t + step);
+            self.step_frame(1);
         }
         if k(Key::ArrowLeft, none) {
-            if self.rate != 0 { self.set_rate(0); }
-            let step = self.engine.frame_step();
-            self.seek(self.t - step);
+            self.step_frame(-1);
         }
         if k(Key::ArrowUp, none) {
             let e = self.edit_point(-1);
@@ -1538,8 +1550,18 @@ impl eframe::App for App {
 
         // playback engine: follow the playhead, switch decoders at cuts, pre-roll the next clip
         let jumped = std::mem::take(&mut self.jumped);
+        let step_direction = self.step_direction.take();
         let muted = self.proj.audio_muted_at(self.t);
-        self.engine.update(ctx, &self.proj, self.t, self.rate == 1, jumped, muted, self.proj.audio_gain_at(self.t));
+        self.engine.update(
+            ctx,
+            &self.proj,
+            self.t,
+            self.rate == 1,
+            jumped,
+            step_direction,
+            muted,
+            self.proj.audio_gain_at(self.t),
+        );
         // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
         let new_frame = self.engine.poll(self.t).is_some();
         let active = self.proj.video_clip_at(self.t).map(|c| {

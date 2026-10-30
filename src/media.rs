@@ -41,6 +41,14 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// A preview frame plus a few frames decoded immediately before it during a step-seek.
+/// The history is moved into Player's small reverse-step cache; it is never uploaded to the GPU
+/// unless the user actually steps back to one of those frames.
+struct PreviewFrame {
+    frame: Frame,
+    history: VecDeque<Frame>,
+}
+
 /// One decoder step. `Skipped` means a frame was decoded but intentionally not converted/presented;
 /// the worker loop should check for newer seek commands before decoding again.
 pub enum VideoDecodeStep {
@@ -63,7 +71,12 @@ fn rational(r: ffmpeg::Rational) -> f64 {
 
 // ================================================================== VIDEO WORKER
 enum Cmd {
-    Seek(f64, u64),
+    /// Timestamp seek used by normal scrubbing and arbitrary jumps.
+    Seek(f64, u64, bool),
+    /// Continue decoding from the decoder's current position (frame stepping).
+    Step(f64, u64),
+    /// Update the generation while keeping the decoder cursor where it is.
+    SetGeneration(u64),
     Play(bool),
     /// Preview resolution divisor: 1 = full, 2 = half, 4 = quarter.
     Quality(u32),
@@ -80,6 +93,7 @@ pub struct VideoWorker {
     rgba: VFrame,
     flushed: bool,
     gen: u64,
+    seek_history: VecDeque<Frame>,
     w: u32,
     h: u32,
     src_w: u32,
@@ -121,6 +135,7 @@ impl VideoWorker {
             rgba: VFrame::new(format::Pixel::RGBA, w, h),
             flushed: false,
             gen: 0,
+            seek_history: VecDeque::new(),
             w,
             h,
             src_w: sw,
@@ -158,6 +173,7 @@ impl VideoWorker {
 
     pub fn seek(&mut self, t: f64, gen: u64) {
         let t = t.max(0.0);
+        self.seek_history.clear();
         let ts = (t * 1_000_000.0) as i64;
         if let Err(err) = self.ictx.seek(ts, ..ts) {
             // Some containers don't support timestamp seeking reliably. Reopen from the start as
@@ -177,15 +193,45 @@ impl VideoWorker {
         self.gen = gen;
     }
 
+    /// Change the output generation without seeking the demuxer. Used by sequential frame steps.
+    pub fn set_generation(&mut self, gen: u64) {
+        self.gen = gen;
+        self.seek_history.clear();
+    }
+
+    /// Return and clear the nearby frames captured while scanning to a step-seek target.
+    fn take_seek_history(&mut self) -> VecDeque<Frame> {
+        std::mem::take(&mut self.seek_history)
+    }
+
     /// Decode a single presentation step. While seeking, discard frames before the target *before*
     /// scaling them to RGBA and copying pixels. Return after each skipped decoded frame so the
     /// worker can coalesce a newer seek request instead of being stuck scanning an obsolete target.
     pub fn next_frame(&mut self, discard_before: Option<(f64, f64)>) -> VideoDecodeStep {
+        self.next_frame_with_history(discard_before, 0)
+    }
+
+    /// Like `next_frame`, but retain a bounded number of frames immediately before the target.
+    /// This is enabled only for explicit frame-step seeks, so ordinary timeline scrubbing keeps
+    /// its existing low-cost discard path.
+    fn next_frame_with_history(
+        &mut self,
+        discard_before: Option<(f64, f64)>,
+        history_limit: usize,
+    ) -> VideoDecodeStep {
         loop {
             if self.dec.receive_frame(&mut self.raw).is_ok() {
                 let pts = self.raw.timestamp().or(self.raw.pts()).unwrap_or(0) as f64 * self.tb;
                 if let Some((target, half_frame)) = discard_before {
                     if pts + half_frame < target {
+                        if history_limit > 0 {
+                            if let Some(frame) = self.convert(pts) {
+                                self.seek_history.push_back(frame);
+                                while self.seek_history.len() > history_limit {
+                                    self.seek_history.pop_front();
+                                }
+                            }
+                        }
                         return VideoDecodeStep::Skipped;
                     }
                 }
@@ -222,12 +268,13 @@ impl VideoWorker {
     }
 }
 
-fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: Context, fps: f64) {
+fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<PreviewFrame>, ctx: Context, fps: f64) {
     let half = 0.5 / fps.max(1.0);
     let frame_interval = Duration::from_secs_f64(1.0 / fps.max(1.0));
     let mut playing = false;
     let mut target: Option<f64> = Some(0.0); // decode-and-discard until this time
-    let mut out: Option<Frame> = None; // finished frame waiting for queue space
+    let mut out: Option<PreviewFrame> = None; // finished frame waiting for queue space
+    let mut history_limit = 0usize;
     let mut next_frame_at: Option<Instant> = None;
     let mut eof = false;
 
@@ -235,11 +282,20 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
         // 1. commands - block only when there is genuinely nothing to do
         let busy = playing || target.is_some() || out.is_some();
         let was_playing = playing;
-        let mut seek = None;
+        enum PositionCommand {
+            Seek(f64, u64, bool),
+            Step(f64, u64),
+            SetGeneration(u64),
+        }
+        let mut position: Option<PositionCommand> = None;
         let mut quality = None;
         let mut apply = |c: Cmd, playing: &mut bool| match c {
             Cmd::Play(p) => *playing = p,
-            Cmd::Seek(t, g) => seek = Some((t, g)), // coalesce: only the newest seek matters
+            Cmd::Seek(t, g, keep_history) => {
+                position = Some(PositionCommand::Seek(t, g, keep_history));
+            }
+            Cmd::Step(t, g) => position = Some(PositionCommand::Step(t, g)),
+            Cmd::SetGeneration(g) => position = Some(PositionCommand::SetGeneration(g)),
             Cmd::Quality(d) => quality = Some(d),
         };
         if busy {
@@ -263,12 +319,45 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
             // Resume immediately, then pace subsequent frames near the source frame rate.
             next_frame_at = None;
         }
-        if let Some((t, g)) = seek {
-            w.seek(t, g);
-            target = Some(t);
-            out = None;
-            next_frame_at = None;
-            eof = false;
+        if let Some(command) = position {
+            match command {
+                PositionCommand::Seek(t, g, keep_history) => {
+                    w.seek(t, g);
+                    target = Some(t);
+                    history_limit = if keep_history { 8 } else { 0 };
+                    out = None;
+                    next_frame_at = None;
+                    eof = false;
+                }
+                PositionCommand::Step(t, g) => {
+                    // The demuxer/decoder is already positioned immediately after the last
+                    // displayed frame. Continue from there instead of seeking back to a keyframe.
+                    w.set_generation(g);
+                    let already_decoded = out.as_mut().map_or(false, |packet| {
+                        if (packet.frame.pts - t).abs() <= half {
+                            packet.frame.gen = g;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if already_decoded {
+                        target = None;
+                    } else {
+                        target = Some(t);
+                        out = None;
+                    }
+                    history_limit = 0;
+                    next_frame_at = None;
+                    eof = false;
+                }
+                PositionCommand::SetGeneration(g) => {
+                    w.set_generation(g);
+                    if let Some(packet) = out.as_mut() {
+                        packet.frame.gen = g;
+                    }
+                }
+            }
         }
 
         // 2. hand a finished frame to the UI (back-pressure when the queue is full)
@@ -314,12 +403,13 @@ fn video_run(mut w: VideoWorker, rx: Receiver<Cmd>, tx: SyncSender<Frame>, ctx: 
             .unwrap_or_else(Instant::now);
         // While seeking, let the decoder discard pre-target frames before doing RGBA conversion.
         // The first returned frame is therefore the closest usable frame to the requested time.
-        match w.next_frame(target.map(|t| (t, half))) {
+        match w.next_frame_with_history(target.map(|t| (t, half)), history_limit) {
             VideoDecodeStep::Frame(f) => {
                 if target.is_some() {
                     target = None;
+                    history_limit = 0;
                 }
-                out = Some(f);
+                out = Some(PreviewFrame { frame: f, history: w.take_seek_history() });
                 if playing {
                     let due = decode_slot + frame_interval;
                     let now = Instant::now();
@@ -699,10 +789,16 @@ pub struct Player {
     pub info: Info,
     pub current: Option<Frame>,
     cmd: Sender<Cmd>,
-    frames: Receiver<Frame>,
-    pending: VecDeque<Frame>,
+    frames: Receiver<PreviewFrame>,
+    pending: VecDeque<PreviewFrame>,
+    past: VecDeque<Frame>,
+    future: VecDeque<Frame>,
     gen: u64,
     need_first: bool,
+    keep_current_on_first: bool,
+    requested_pts: Option<f64>,
+    cache_changed: bool,
+    decoder_out_of_sync: bool,
     audio: Option<Audio>,
 }
 
@@ -734,8 +830,14 @@ impl Player {
             cmd: cmd_tx,
             frames: fr_rx,
             pending: VecDeque::new(),
+            past: VecDeque::new(),
+            future: VecDeque::new(),
             gen: 0,
             need_first: true,
+            keep_current_on_first: false,
+            requested_pts: None,
+            cache_changed: false,
+            decoder_out_of_sync: false,
             audio: open_audio(path),
         })
     }
@@ -775,28 +877,165 @@ impl Player {
         }
     }
 
+    fn advance_generation(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        self.pending.clear();
+        // Drain frames already queued. A frame racing with this drain is still rejected by gen.
+        while self.frames.try_recv().is_ok() {}
+    }
+
     /// Jump (scrub / click). Stale in-flight frames and samples are discarded.
     pub fn seek(&mut self, t: f64) {
-        self.gen += 1;
-        self.pending.clear();
+        let t = t.max(0.0);
+        self.advance_generation();
         self.need_first = true;
-        // Old frames can already be waiting in the bounded channel when the user seeks or steps.
-        // Drain them now so the newly requested frame doesn't wait behind stale pictures. Any
-        // old frame that races with this drain is still rejected by the generation check in poll().
-        while self.frames.try_recv().is_ok() {}
-        let _ = self.cmd.send(Cmd::Seek(t.max(0.0), self.gen));
-        self.seek_audio(t.max(0.0));
+        self.keep_current_on_first = false;
+        self.requested_pts = None;
+        self.past.clear();
+        self.future.clear();
+        self.decoder_out_of_sync = false;
+        let _ = self.cmd.send(Cmd::Seek(t, self.gen, false));
+        self.seek_audio(t);
+    }
+
+    /// Take the next already-decoded frame from the UI/worker queues before asking the decoder
+    /// for another one. Playback can be a few frames ahead of the playhead when it is paused.
+    fn take_queued_step_frame(&mut self, target: f64, tolerance: f64) -> Option<PreviewFrame> {
+        let mut queued: Vec<PreviewFrame> = self.pending.drain(..).collect();
+        while let Ok(packet) = self.frames.try_recv() {
+            if packet.frame.gen == self.gen {
+                queued.push(packet);
+            }
+        }
+        queued.retain(|packet| packet.frame.gen == self.gen);
+        queued.sort_by(|a, b| a.frame.pts.total_cmp(&b.frame.pts));
+
+        let Some(index) = queued.iter().position(|packet| packet.frame.pts + tolerance >= target) else {
+            self.pending = queued.into_iter().collect();
+            return None;
+        };
+        let selected = queued.remove(index);
+        for packet in queued.into_iter().filter(|packet| packet.frame.pts > selected.frame.pts) {
+            self.future.push_back(packet.frame);
+            while self.future.len() > 8 {
+                self.future.pop_back();
+            }
+        }
+        Some(selected)
+    }
+
+    /// Step exactly one frame without forcing FFmpeg to seek to a keyframe for every key press.
+    /// Forward steps continue decoding from the current decoder cursor. Reverse steps use the
+    /// small cache populated by step-seeks; the first reverse step performs one seek and captures
+    /// nearby frames so subsequent reverse steps are immediate.
+    pub fn step(&mut self, t: f64, direction: i8) {
+        let t = t.max(0.0);
+        let frame = 1.0 / self.info.fps.max(1.0);
+        let tolerance = frame * 0.55;
+
+        if direction < 0 && self.past.back().map_or(false, |f| (f.pts - t).abs() <= tolerance) {
+            self.advance_generation();
+            self.need_first = false;
+            self.keep_current_on_first = false;
+            self.requested_pts = None;
+            if let Some(previous) = self.past.pop_back() {
+                if let Some(current) = self.current.replace(previous) {
+                    self.future.push_front(current);
+                    while self.future.len() > 8 { self.future.pop_back(); }
+                }
+            }
+            self.decoder_out_of_sync = !self.future.is_empty();
+            let _ = self.cmd.send(Cmd::SetGeneration(self.gen));
+            self.cache_changed = true;
+            self.seek_audio(t);
+            return;
+        }
+
+        if direction > 0 && self.future.front().map_or(false, |f| (f.pts - t).abs() <= tolerance) {
+            self.advance_generation();
+            self.need_first = false;
+            self.keep_current_on_first = false;
+            self.requested_pts = None;
+            if let Some(next) = self.future.pop_front() {
+                if let Some(current) = self.current.replace(next) {
+                    self.past.push_back(current);
+                    while self.past.len() > 8 { self.past.pop_front(); }
+                }
+            }
+            self.decoder_out_of_sync = !self.future.is_empty();
+            let _ = self.cmd.send(Cmd::SetGeneration(self.gen));
+            self.cache_changed = true;
+            self.seek_audio(t);
+            return;
+        }
+
+        // When pausing playback, decoded frames may already be waiting in `pending` or the
+        // worker channel. Use those before advancing the decoder cursor, or a step could skip
+        // ahead by the preview queue depth.
+        if direction > 0 && !self.decoder_out_of_sync {
+            if let Some(packet) = self.take_queued_step_frame(t, tolerance) {
+                self.advance_generation();
+                if !packet.history.is_empty() && self.past.is_empty() {
+                    self.past = packet.history;
+                }
+                if let Some(previous) = self.current.replace(packet.frame) {
+                    self.push_past(previous);
+                }
+                self.decoder_out_of_sync = !self.future.is_empty();
+                let _ = self.cmd.send(Cmd::SetGeneration(self.gen));
+                self.cache_changed = true;
+                self.seek_audio(t);
+                return;
+            }
+        }
+
+        // A queued step may not have reached the UI yet. Chain from its requested timestamp so
+        // holding an arrow key coalesces to the newest requested frame instead of restarting seek.
+        let base = self.requested_pts.or_else(|| {
+            if self.need_first { None } else { self.current.as_ref().map(|f| f.pts) }
+        });
+        if direction > 0
+            && !self.decoder_out_of_sync
+            && base.map_or(false, |b| t > b && t - b <= frame * 1.55)
+        {
+            self.advance_generation();
+            self.need_first = true;
+            self.keep_current_on_first = true;
+            self.requested_pts = Some(t);
+            self.decoder_out_of_sync = false;
+            let _ = self.cmd.send(Cmd::Step(t, self.gen));
+            self.seek_audio(t);
+            return;
+        }
+
+        // Backwards (or a discontinuous step) needs one indexed seek. Keep a few decoded frames
+        // before the target so repeated reverse stepping never repeats that expensive operation.
+        self.advance_generation();
+        self.need_first = true;
+        self.keep_current_on_first = false;
+        self.requested_pts = None;
+        self.past.clear();
+        self.future.clear();
+        self.decoder_out_of_sync = false;
+        let _ = self.cmd.send(Cmd::Seek(t, self.gen, true));
+        self.seek_audio(t);
     }
 
     /// Start/stop real-time playback. `resync` re-aligns audio to that source time (exact resume).
     pub fn set_playing(&mut self, on: bool, resync: Option<f64>) {
+        if on && self.decoder_out_of_sync {
+            if let Some(t) = resync {
+                // Reverse stepping can move the displayed frame behind the demuxer's cursor.
+                // Realign once when playback resumes; do not pay this cost during frame stepping.
+                self.seek(t);
+            }
+        } else if on {
+            if let Some(t) = resync {
+                self.seek_audio(t);
+            }
+        }
         let _ = self.cmd.send(Cmd::Play(on));
         if let Some(a) = &self.audio {
-            if on {
-                if let Some(t) = resync {
-                    self.seek_audio(t);
-                }
-            }
             a.sh.playing.store(on, Relaxed);
         }
     }
@@ -807,37 +1046,62 @@ impl Player {
     /// and can decode faster than real time; an unbounded UI-side queue therefore grows forever
     /// and makes the preview increasingly late. Keep only a small look-ahead window, replacing
     /// obsolete due frames with the newest due frame, just like a real-time preview monitor.
+    fn push_past(&mut self, frame: Frame) {
+        self.past.push_back(frame);
+        while self.past.len() > 8 {
+            self.past.pop_front();
+        }
+    }
+
+    fn accept_preview_frame(&mut self, packet: PreviewFrame) {
+        let PreviewFrame { frame, history } = packet;
+        if self.need_first {
+            if self.keep_current_on_first {
+                if let Some(previous) = self.current.replace(frame) {
+                    self.push_past(previous);
+                }
+            } else {
+                self.current = Some(frame);
+                self.past = history;
+                self.future.clear();
+            }
+            self.need_first = false;
+            self.keep_current_on_first = false;
+            self.requested_pts = None;
+            self.decoder_out_of_sync = false;
+        } else if let Some(previous) = self.current.replace(frame) {
+            self.push_past(previous);
+            self.future.clear();
+        }
+    }
+
+    /// Pull finished frames and display the newest frame that is due at `t`.
+    /// The decoder stays on its worker thread; UI polling only swaps already-decoded frame buffers.
     pub fn poll(&mut self, t: f64) -> bool {
         let eps = 0.5 / self.info.fps.max(1.0);
         let due = t + eps;
-        let mut changed = false;
+        let mut changed = std::mem::take(&mut self.cache_changed);
 
-        // Consume frames that have become due since the previous UI tick.
-        while self.pending.front().map_or(false, |f| f.pts <= due) {
-            self.current = self.pending.pop_front();
-            self.need_first = false;
-            changed = true;
+        while self.pending.front().map_or(false, |f| f.frame.pts <= due) {
+            if let Some(frame) = self.pending.pop_front() {
+                self.accept_preview_frame(frame);
+                changed = true;
+            }
         }
 
-        while let Ok(f) = self.frames.try_recv() {
-            if f.gen != self.gen {
-                continue; // stale frame from before the most recent seek
+        while let Ok(packet) = self.frames.try_recv() {
+            if packet.frame.gen != self.gen {
+                continue; // stale frame from before the most recent seek/step
             }
 
             if self.need_first {
-                // The seek worker has already discarded frames before the requested time.
-                self.current = Some(f);
-                self.need_first = false;
+                self.accept_preview_frame(packet);
                 changed = true;
-            } else if f.pts <= due {
-                // Several frames may have arrived since the previous UI tick. Keep the newest
-                // due frame rather than rendering each stale frame one by one.
-                self.current = Some(f);
+            } else if packet.frame.pts <= due {
+                self.accept_preview_frame(packet);
                 changed = true;
             } else if self.pending.len() < VIDEO_QUEUE {
-                // Preserve a short, bounded look-ahead for smooth motion. Once full, drop later
-                // future frames rather than letting decoder speed create an ever-growing delay.
-                self.pending.push_back(f);
+                self.pending.push_back(packet);
             }
         }
 

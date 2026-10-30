@@ -128,7 +128,17 @@ impl Engine {
 
     /// Call once per frame. `jumped` = the playhead was moved by the user (or an edit happened),
     /// so decoders must be repositioned instead of just following the clock.
-    pub fn update(&mut self, ctx: &Context, proj: &Project, t: f64, playing: bool, jumped: bool, muted: bool, gain: f32) {
+    pub fn update(
+        &mut self,
+        ctx: &Context,
+        proj: &Project,
+        t: f64,
+        playing: bool,
+        jumped: bool,
+        step_direction: Option<i8>,
+        muted: bool,
+        gain: f32,
+    ) {
         self.tick += 1;
         let play_changed = playing != self.playing;
         self.playing = playing;
@@ -147,6 +157,11 @@ impl Engine {
             Some(c) => {
                 let same = self.active.map_or(false, |a| a.matches(&c));
                 if same && !jumped {
+                    if let Some(direction) = step_direction {
+                        if let Some(s) = self.players.get_mut(&c.media) {
+                            s.player.step(t + c.map, direction);
+                        }
+                    }
                     if play_changed {
                         // resume exactly at the playhead (audio re-aligns), or pause
                         self.set_playing(c.media, playing, Some(t + c.map));
@@ -160,7 +175,11 @@ impl Engine {
                     let prepared = !jumped && self.prepared.map_or(false, |p| p.matches(&c));
                     if !prepared {
                         if let Some(s) = self.players.get_mut(&c.media) {
-                            s.player.seek(t + c.map);
+                            if let Some(direction) = step_direction {
+                                s.player.step(t + c.map, direction);
+                            } else {
+                                s.player.seek(t + c.map);
+                            }
                         }
                     }
                     self.set_playing(c.media, playing, None);
