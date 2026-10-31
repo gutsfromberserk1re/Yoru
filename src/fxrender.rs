@@ -55,14 +55,10 @@ pub fn render_with_effects(
                     ((clip_duration - local_time) / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32,
                     0.0,
                 ),
-                EffectKind::Flash => {
-                    let duration = p[1].max(0.02) as f64;
-                    let u = (local_time - p[2] as f64) / duration;
-                    let strength = if (0.0..1.0).contains(&u) {
-                        (1.0 - u as f32).powi(2) * (p[0] / 100.0).clamp(0.0, 1.0)
-                    } else { 0.0 };
-                    (1.0, strength)
-                }
+                EffectKind::Flash => (
+                    1.0,
+                    flash_strength(local_time, p[2], p[1], p[0]).unwrap_or(0.0),
+                ),
                 _ => unreachable!(),
             };
             render_adjusted(source, sw, sh, v, dst, dw, dh, fade_factor, flash_strength);
@@ -163,6 +159,20 @@ fn render_rows(src: &[u8], p: &Params, chunk: &mut [u8], y0: usize) {
     }
 }
 
+// Flash parameters are stored as f32 while the timeline clock is f64. At an exact start
+// time, converting the stored start back to f64 can put it a few nanoseconds after the clock.
+// Treat that representation-only difference as the start instant rather than skipping the flash.
+fn flash_strength(time: f64, start: f32, duration: f32, intensity: f32) -> Option<f32> {
+    const START_EPSILON_SECONDS: f64 = 1.0e-6;
+    let elapsed = time - start as f64;
+    let duration = duration.max(0.02) as f64;
+    if elapsed < -START_EPSILON_SECONDS || elapsed >= duration {
+        return None;
+    }
+    let u = (elapsed.max(0.0) / duration) as f32;
+    Some((1.0 - u).powi(2) * (intensity / 100.0).clamp(0.0, 1.0))
+}
+
 // Effects are evaluated on the decoded preview frame, in stack order, before the clip's
 // transform/compositing controls. The kernels are intentionally dependency-free so the Windows
 // build does not need a separate GPU or image-processing runtime.
@@ -201,14 +211,17 @@ fn apply_effects(src: &[u8], sw: usize, sh: usize, effects: &[EffectInstance], t
             EffectKind::Sharpen => sharpen(input, sw, sh, p[0], p[1]),
             EffectKind::RgbSplit => rgb_split(input, sw, sh, p[0], p[1]),
             EffectKind::Flash => {
-                let dur = p[1].max(0.02) as f64; let start = p[2] as f64;
-                let u = (time - start) / dur;
-                if !(0.0..1.0).contains(&u) { continue; } else {
-                    let strength = (1.0 - u as f32).powf(2.0) * (p[0] / 100.0).clamp(0.0, 1.0);
-                    let mut out = input.to_vec();
-                    for px in out.chunks_exact_mut(4) { for c in 0..3 { px[c] = (px[c] as f32 + (255.0 - px[c] as f32) * strength).clamp(0.0, 255.0) as u8; } }
-                    out
+                let Some(strength) = flash_strength(time, p[2], p[1], p[0]) else {
+                    continue;
+                };
+                let mut out = input.to_vec();
+                for px in out.chunks_exact_mut(4) {
+                    for c in 0..3 {
+                        px[c] = (px[c] as f32 + (255.0 - px[c] as f32) * strength)
+                            .clamp(0.0, 255.0) as u8;
+                    }
                 }
+                out
             },
             EffectKind::FadeIn => {
                 let factor = (time / p[0].max(0.02) as f64).clamp(0.0, 1.0) as f32;
@@ -564,9 +577,35 @@ mod tests {
         let src: Vec<u8> = (0..16 * 12 * 4).map(|i| (i * 17 % 256) as u8).collect();
         for kind in EffectKind::ALL {
             let effect = EffectInstance::new(kind, 0.2);
-            let out = apply_effects(&src, 16, 12, &[effect], 0.2, 1.0).expect("one enabled effect produces a frame");
+            let out = apply_effects(&src, 16, 12, &[effect], 0.2, 1.0)
+                .unwrap_or_else(|| panic!("enabled effect {:?} produced no frame", kind));
             assert_eq!(out.len(), src.len(), "effect {:?} returned a different frame size", kind);
         }
+    }
+
+    #[test]
+    fn flash_is_active_at_its_exact_start_time() {
+        let src = vec![0u8; 4 * 4 * 4];
+        let effect = EffectInstance::new(EffectKind::Flash, 0.2);
+        let out = apply_effects(&src, 4, 4, &[effect.clone()], 0.2, 1.0)
+            .expect("flash must render at its configured start time");
+        assert!(out.chunks_exact(4).all(|px| px[0] == 255 && px[1] == 255 && px[2] == 255));
+
+        // The optimized final-effect path must use the same boundary handling.
+        let mut dst = vec![0u8; src.len()];
+        render_with_effects(
+            &src,
+            4,
+            4,
+            &Fx::default().eval(0.2),
+            &[effect],
+            0.2,
+            1.0,
+            &mut dst,
+            4,
+            4,
+        );
+        assert!(dst.chunks_exact(4).all(|px| px[0] == 255 && px[1] == 255 && px[2] == 255));
     }
 
     #[test]
