@@ -99,6 +99,7 @@ pub struct VideoWorker {
     src_w: u32,
     src_h: u32,
     max_w: u32,
+    fps_hint: f64,
 }
 
 impl VideoWorker {
@@ -141,12 +142,17 @@ impl VideoWorker {
             src_w: sw,
             src_h: sh,
             max_w,
+            fps_hint: fps,
         };
         Ok((me, info))
     }
 
     /// Changes the output size on the fly (rebuilds the scaler). Frames already queued keep
     /// their old size; the caller re-seeks so new ones arrive at the new size.
+    fn info_fps_hint(&self) -> f64 {
+        self.fps_hint.max(1.0)
+    }
+
     pub fn rescale(&mut self, div: u32) {
         let div = div.clamp(1, 8);
         let full = self.src_w.min(self.max_w);
@@ -224,7 +230,12 @@ impl VideoWorker {
                 let pts = self.raw.timestamp().or(self.raw.pts()).unwrap_or(0) as f64 * self.tb;
                 if let Some((target, half_frame)) = discard_before {
                     if pts + half_frame < target {
-                        if history_limit > 0 {
+                        // Only convert the small window immediately before the requested frame.
+                        // A seek may have to decode from an earlier keyframe; converting every
+                        // discarded frame made the first reverse step needlessly expensive on
+                        // long-GOP footage even though only the final few frames are cached.
+                        let history_window = history_limit as f64 / self.info_fps_hint();
+                        if history_limit > 0 && pts >= target - history_window - half_frame {
                             if let Some(frame) = self.convert(pts) {
                                 self.seek_history.push_back(frame);
                                 while self.seek_history.len() > history_limit {

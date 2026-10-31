@@ -64,7 +64,7 @@ fn peak_to_meter(peak: f32) -> f32 {
 const WINDOW_RADIUS: f32 = 12.0;
 
 /// Acrylic tint (R, G, B, A). Lower alpha = more see-through glass.
-const GLASS_TINT: (u8, u8, u8, u8) = (0x35, 0x3A, 0x4C, 110);
+const GLASS_TINT: (u8, u8, u8, u8) = (0x30, 0x33, 0x38, 118);
 
 // ------------------------------------------------------------------ palette
 const POWDER: Color32 = Color32::from_rgb(0xF0, 0xF6, 0xFC);
@@ -72,20 +72,20 @@ const VISTA: Color32 = Color32::from_rgb(0xC9, 0xD1, 0xD9);
 const GLAUCOUS: Color32 = Color32::from_rgb(0x8B, 0x94, 0x9E);
 const TEXT: Color32 = POWDER;
 const MUTED: Color32 = GLAUCOUS;
-const DEEP: Color32 = Color32::from_rgb(0x22, 0x25, 0x30);
+const DEEP: Color32 = Color32::from_rgb(0x1C, 0x1E, 0x22);
 /// Panel glass: very dark navy, ~84% opaque (premultiplied RGBA; lower the last number for more see-through).
 const PANEL_BG: Color32 = Color32::TRANSPARENT;
 const DOT_COLORS: [Color32; 3] = [
-    Color32::from_rgb(0x48, 0x52, 0x66),
-    Color32::from_rgb(0x5E, 0x6B, 0x82),
-    Color32::from_rgb(0x8A, 0x99, 0xB3),
+    Color32::from_rgb(0x55, 0x59, 0x60),
+    Color32::from_rgb(0x78, 0x7E, 0x87),
+    Color32::from_rgb(0xB4, 0xBA, 0xC2),
 ];
 
 fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 fn panel_border() -> Color32 {
-    rgba(80, 100, 160, 170)
+    rgba(145, 151, 160, 125)
 }
 
 fn fmt_tc(t: f64) -> String {
@@ -1331,7 +1331,10 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let k = |key: Key, m: Modifiers| ctx.input_mut(|i| i.consume_key(m, key));
+        let k = |key: Key, m: Modifiers| ctx.input_mut(|i| {
+            let pressed = i.consume_key(m, key);
+            pressed && !i.key_repeated(key)
+        });
         let (none, cmd, shift) = (Modifiers::NONE, Modifiers::COMMAND, Modifiers::SHIFT);
 
         // ---- file / history

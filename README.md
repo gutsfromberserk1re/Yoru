@@ -55,8 +55,11 @@ They are included in the existing clip-snapshot undo/redo history.
 ## Playback resolution and seeking
 The **Playback** menu above the monitor (Full, 1/2, 1/4) lowers the preview conversion resolution
 for smoother playback on heavy footage. Default is 1/2. During a seek or paused frame step, Yoru
-now discards frames before the target before scaling/copying them to RGBA, and drains stale queued
-preview frames so an old frame does not sit ahead of the requested one. If a container rejects a
+discards frames before the target before scaling/copying them to RGBA, and drains stale queued
+preview frames so an old frame does not sit ahead of the requested one. Reverse-step history only
+converts the small frame window immediately before the target instead of converting every frame
+from the preceding keyframe. Keyboard auto-repeat is ignored for frame-step shortcuts so a held
+Left arrow cannot flood the decoder with overlapping reverse seeks. If a container rejects a
 timestamp seek, Yoru reopens the source and scans forward as a slower fallback rather than leaving
 the preview stuck at the previous position.
 
