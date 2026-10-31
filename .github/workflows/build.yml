@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     tags: ["v*"]
   pull_request:
-  workflow_dispatch: # run by hand from the Actions tab (also runs the unit tests)
+  workflow_dispatch: # run by hand from the Actions tab
 
 permissions:
   contents: write # only used by the tag -> GitHub Release step
@@ -43,23 +43,23 @@ jobs:
         with:
           path: .vcpkg-cache
           # bump the suffix to force a fresh FFmpeg build
-          key: vcpkg-ffmpeg-x64-windows-${{ runner.os }}-v1
+          key: vcpkg-ffmpeg-x64-windows-${{ runner.os }}-v2
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg (D3D11VA/DXVA2 + optional NVDEC)
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          # Windows vcpkg builds enable the native D3D11VA/DXVA2 paths when supported.
+          # nvcodec adds NVIDIA's headers so CUDA/NVDEC can be used on systems with a compatible GPU.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install "ffmpeg[nvcodec]:x64-windows"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg FFmpeg install failed" }
+
+      # ---- regression tests ----
+      - name: cargo test --release
+        run: cargo test --release
 
       # ---- build ----
       - name: cargo build --release
         run: cargo build --release
-
-      # ---- unit tests (only when started by hand: project model, effects, renderer) ----
-      - name: cargo test
-        if: github.event_name == 'workflow_dispatch'
-        continue-on-error: true
-        run: cargo test --release
 
       # ---- package: app, decoder DLLs, and the standalone FFmpeg export/proxy CLI ----
       - name: Package
