@@ -759,7 +759,7 @@ impl Timeline {
             let locked = proj.locked[lane.slot()];
             let hidden = proj.hidden[lane.slot()];
             p.rect_filled(lr, 0.0, if lane.is_video() { rgba(255, 255, 255, 8) } else { rgba(255, 255, 255, 5) });
-            p.line_segment([lr.left_bottom(), lr.right_bottom()], Stroke::new(1.0, rgba(110, 125, 170, 40)));
+            p.line_segment([lr.left_bottom(), lr.right_bottom()], Stroke::new(1.0, rgba(145, 151, 160, 40)));
 
             let hr = Rect::from_min_size(pos2(rect.left(), rect.top() + y), vec2(HEAD, hh));
             p_all.rect_filled(hr, 0.0, rgba(8, 14, 36, 150));
@@ -784,7 +784,7 @@ impl Timeline {
         }
         p_all.line_segment(
             [pos2(content.left(), rect.top() + RULER), pos2(content.left(), rect.bottom())],
-            Stroke::new(1.0, rgba(110, 125, 170, 70)),
+            Stroke::new(1.0, rgba(145, 151, 160, 70)),
         );
 
         // ---- ruler
@@ -792,7 +792,7 @@ impl Timeline {
         p.rect_filled(
             Rect::from_min_size(pos2(content.left(), rect.top() + RULER - 1.0), vec2(content.width(), 1.0)),
             0.0,
-            rgba(110, 125, 170, 100),
+            rgba(145, 151, 160, 100),
         );
         let step = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0]
             .into_iter()
@@ -813,7 +813,7 @@ impl Timeline {
                 font.clone(),
                 rgba(139, 148, 158, 200),
             );
-            let sub = Stroke::new(1.0, rgba(110, 125, 170, 100));
+            let sub = Stroke::new(1.0, rgba(145, 151, 160, 100));
             for k in 1..5 {
                 let tx = x + k as f32 * step as f32 * self.pps as f32 / 5.0;
                 p.line_segment([pos2(tx, ry - 5.0), pos2(tx, ry - 1.0)], sub);
@@ -951,7 +951,7 @@ impl Timeline {
             let badge = if effect_count > 0 { format!("FX {effect_count}") } else { "FX".to_string() };
             let bw = if effect_count > 0 { 30.0 } else { 20.0 };
             let br = Rect::from_min_size(pos2(x1 - bw - 4.0, y + 2.0), vec2(bw, LABEL - 4.0));
-            p.rect_filled(br, 3.0, if effect_count > 0 && enabled_count == 0 { rgba(139, 148, 158, 48) } else { rgba(120, 160, 240, 75) });
+            p.rect_filled(br, 3.0, if effect_count > 0 && enabled_count == 0 { rgba(139, 148, 158, 48) } else { rgba(185, 193, 202, 64) });
             p.text(br.center(), Align2::CENTER_CENTER, badge, FontId::monospace(7.0), if effect_count > 0 && enabled_count == 0 { MUTED } else { POWDER });
             room -= bw + 8.0;
         }

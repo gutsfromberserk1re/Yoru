@@ -687,6 +687,49 @@ pub struct Media {
     pub proxy_path: Option<PathBuf>,
 }
 
+/// One normalized point sample from a source-media frame (0..1 in each axis).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackSample {
+    pub t: f64,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A user-placed point tracker attached to one video clip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackingPoint {
+    pub id: u32,
+    pub clip_id: u32,
+    pub name: String,
+    pub samples: Vec<TrackSample>,
+}
+
+impl TrackingPoint {
+    /// Interpolate between recorded samples, clamping to the nearest recorded endpoint.
+    pub fn position_at(&self, t: f64) -> Option<(f32, f32)> {
+        let first = self.samples.first()?;
+        let last = self.samples.last()?;
+        if t <= first.t { return Some((first.x, first.y)); }
+        if t >= last.t { return Some((last.x, last.y)); }
+        let right = self.samples.partition_point(|sample| sample.t < t).min(self.samples.len() - 1);
+        let a = self.samples[right.saturating_sub(1)];
+        let b = self.samples[right];
+        let span = (b.t - a.t).max(1e-9);
+        let u = ((t - a.t) / span) as f32;
+        Some((a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u))
+    }
+
+    /// Insert or replace a sample while keeping the source timestamps sorted.
+    pub fn set_sample(&mut self, t: f64, x: f32, y: f32) {
+        let sample = TrackSample { t: t.max(0.0), x: x.clamp(0.0, 1.0), y: y.clamp(0.0, 1.0) };
+        let at = self.samples.partition_point(|old| old.t < sample.t - 1e-5);
+        if let Some(old) = self.samples.get_mut(at) {
+            if (old.t - sample.t).abs() <= 1e-5 { *old = sample; return; }
+        }
+        self.samples.insert(at, sample);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum DragOp {
     /// `new_lane` applies to the grabbed clip only (same kind: video<->video, audio<->audio).
@@ -701,6 +744,8 @@ pub enum DragOp {
 pub struct Project {
     pub media: Vec<Media>,
     pub clips: Vec<Clip>,
+    /// Point-tracking samples are clip-scoped and saved with the project.
+    pub tracking_points: Vec<TrackingPoint>,
     /// Per track slot (see `Lane::slot`): clips can't be edited / the track is skipped.
     pub locked: [bool; NTRACKS],
     pub hidden: [bool; NTRACKS],
@@ -738,6 +783,7 @@ impl Project {
         Project {
             media: vec![],
             clips: vec![],
+            tracking_points: vec![],
             locked: [false; NTRACKS],
             hidden: [false; NTRACKS],
             next_id: 0,
@@ -804,6 +850,34 @@ impl Project {
         });
         self.push_undo(pre);
         id
+    }
+
+    /// Add a point tracker to a real video clip. The initial sample is the clicked monitor point.
+    pub fn add_tracking_point(&mut self, clip_id: u32, source_t: f64, x: f32, y: f32) -> Option<u32> {
+        let clip = self.clip(clip_id)?;
+        if !clip.lane.is_video() || clip.gfx.is_some() || clip.media.is_none() { return None; }
+        let id = self.alloc();
+        let mut point = TrackingPoint { id, clip_id, name: format!("Point {}", self.tracking_points.len() + 1), samples: Vec::new() };
+        point.set_sample(source_t, x, y);
+        self.tracking_points.push(point);
+        Some(id)
+    }
+
+    /// Remove one point tracker and its saved samples.
+    pub fn remove_tracking_point(&mut self, id: u32) -> bool {
+        let before = self.tracking_points.len();
+        self.tracking_points.retain(|point| point.id != id);
+        before != self.tracking_points.len()
+    }
+
+    /// Record an automatically tracked point sample.
+    pub fn set_tracking_sample(&mut self, id: u32, source_t: f64, x: f32, y: f32) -> bool {
+        if let Some(point) = self.tracking_points.iter_mut().find(|point| point.id == id) {
+            point.set_sample(source_t, x, y);
+            true
+        } else {
+            false
+        }
     }
 
     /// Applies a non-destructive effect to a video clip and records one undo step.
@@ -1336,7 +1410,7 @@ impl Project {
     // ---------------------------------------------------------------- save / load
     /// Plain-text project format (tab separated; names/paths are the last field of a line).
     pub fn to_text(&self) -> String {
-        let mut s = String::from("YORU 9\n");
+        let mut s = String::from("YORU 10\n");
         s += &format!("N\t{}\n", self.next_id);
         for m in &self.media {
             s += &format!(
@@ -1345,6 +1419,13 @@ impl Project {
             );
             if let Some(proxy) = &m.proxy_path {
                 s += &format!("P\t{}\t{}\n", m.id, proxy.to_string_lossy());
+            }
+        }
+        for point in &self.tracking_points {
+            let name = point.name.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
+            s += &format!("TP\t{}\t{}\t{}\n", point.id, point.clip_id, name);
+            for sample in &point.samples {
+                s += &format!("TK\t{}\t{}\t{}\t{}\n", point.id, sample.t, sample.x, sample.y);
             }
         }
         for c in &self.clips {
@@ -1414,6 +1495,7 @@ impl Project {
             Some("YORU 7") => 7,
             Some("YORU 8") => 8,
             Some("YORU 9") => 9,
+            Some("YORU 10") => 10,
             _ => return Err("not a Yoru project file".into()),
         };
         let mut p = Project::empty();
@@ -1425,6 +1507,23 @@ impl Project {
             let f: Vec<&str> = if line.starts_with("C\t") { line.splitn(19, '\t').collect() } else if line.starts_with("P\t") { line.splitn(3, '\t').collect() } else { line.splitn(32, '\t').collect() };
             match f[0] {
                 "N" => p.next_id = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
+                "TP" if ver >= 10 && f.len() == 4 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    let clip_id: u32 = f[2].parse().map_err(|_| bad())?;
+                    let name = unescape_gfx(f[3]);
+                    p.tracking_points.push(TrackingPoint { id, clip_id, name, samples: Vec::new() });
+                }
+                "TK" if ver >= 10 && f.len() == 5 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    let sample = TrackSample {
+                        t: f[2].parse().map_err(|_| bad())?,
+                        x: f[3].parse::<f32>().map_err(|_| bad())?.clamp(0.0, 1.0),
+                        y: f[4].parse::<f32>().map_err(|_| bad())?.clamp(0.0, 1.0),
+                    };
+                    if let Some(point) = p.tracking_points.iter_mut().find(|point| point.id == id) {
+                        point.samples.push(sample);
+                    }
+                }
                 "M" if f.len() >= 7 => p.media.push(Media {
                     id: f[1].parse().map_err(|_| bad())?,
                     duration: f[2].parse().map_err(|_| bad())?,
@@ -1566,7 +1665,13 @@ impl Project {
                 }
             }
         }
-        let max_id = p.media.iter().map(|m| m.id).chain(p.clips.iter().flat_map(|c| [c.id, c.link])).max().unwrap_or(0);
+        for point in p.tracking_points.iter_mut() {
+            point.samples.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let max_id = p.media.iter().map(|m| m.id)
+            .chain(p.clips.iter().flat_map(|c| [c.id, c.link]))
+            .chain(p.tracking_points.iter().map(|point| point.id))
+            .max().unwrap_or(0);
         p.next_id = p.next_id.max(max_id);
         Ok(p)
     }
@@ -1700,6 +1805,21 @@ mod tests {
     }
 
     #[test]
+    fn point_tracking_survives_save_load() {
+        let (mut p, media_id) = media_project();
+        let clip_id = p.clips.iter().find(|clip| clip.media == Some(media_id) && clip.lane.is_video()).unwrap().id;
+        let id = p.add_tracking_point(clip_id, 0.25, 0.42, 0.61).unwrap();
+        assert!(p.set_tracking_sample(id, 0.50, 0.48, 0.65));
+        let saved = p.to_text();
+        assert!(saved.starts_with("YORU 10\n"));
+        let q = Project::from_text(&saved).expect("tracking project parses");
+        assert_eq!(q.tracking_points.len(), 1);
+        assert_eq!(q.tracking_points[0].name, "Point 1");
+        assert_eq!(q.tracking_points[0].samples.len(), 2);
+        assert_eq!(q.tracking_points[0].clip_id, clip_id);
+    }
+
+    #[test]
     fn save_load_round_trip() {
         let (p, _) = media_project();
         let q = Project::from_text(&p.to_text()).expect("parse");
@@ -1733,7 +1853,7 @@ mod tests {
 
 
     #[test]
-    fn yoru9_proxy_transition_effect_and_audio_keys_round_trip() {
+    fn yoru10_proxy_transition_effect_and_audio_keys_round_trip() {
         let (mut p, media_id) = media_project();
         p.set_proxy_path(media_id, Some(PathBuf::from("proxies/a.mp4")));
         let video_id = p.clips.iter().find(|c| c.lane.is_video()).unwrap().id;
@@ -1750,8 +1870,8 @@ mod tests {
         p.clip_mut(audio_id).unwrap().audio_preset = AudioPreset::Podcast;
 
         let saved = p.to_text();
-        assert!(saved.starts_with("YORU 9\n"));
-        let q = Project::from_text(&saved).expect("YORU 9 project parses");
+        assert!(saved.starts_with("YORU 10\n"));
+        let q = Project::from_text(&saved).expect("YORU 10 project parses");
         assert_eq!(q.media(media_id).unwrap().proxy_path.as_deref(), Some(Path::new("proxies/a.mp4")));
         assert_eq!(q.clip(video_id).unwrap().transition_in.unwrap().kind, TransitionKind::DiamondIris);
         assert_eq!(q.clip(video_id).unwrap().effects[0].keys[0].len(), 2);
@@ -1760,10 +1880,10 @@ mod tests {
     }
 
     #[test]
-    fn yoru8_projects_still_load_after_v9_expansion() {
+    fn yoru9_projects_still_load_after_v10_expansion() {
         let (p, _) = media_project();
-        let old_text = p.to_text().replacen("YORU 9\n", "YORU 8\n", 1);
-        let q = Project::from_text(&old_text).expect("YORU 8 project remains readable");
+        let old_text = p.to_text().replacen("YORU 10\n", "YORU 9\n", 1);
+        let q = Project::from_text(&old_text).expect("YORU 9 project remains readable");
         for c in &q.clips {
             assert_eq!(c.audio_preset, AudioPreset::Neutral);
         }

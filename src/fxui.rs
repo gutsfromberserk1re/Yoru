@@ -25,7 +25,7 @@ impl Inspector {
     }
 }
 
-const KEY_BLUE: Color32 = Color32::from_rgb(120, 170, 255);
+const KEY_STEEL: Color32 = Color32::from_rgb(174, 184, 196);
 
 /// Returns true if an effect value changed this frame.
 pub fn inspector_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
@@ -523,7 +523,7 @@ fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32]
 }
 
 fn draw_stopwatch(p: &Painter, r: Rect, on: bool, hot: bool) {
-    let col = if on { KEY_BLUE } else if hot { TEXT } else { MUTED };
+    let col = if on { KEY_STEEL } else if hot { TEXT } else { MUTED };
     let c = r.center() + vec2(0.0, 1.0);
     p.circle_stroke(c, 5.0, Stroke::new(1.4, col));
     p.line_segment([c, c + vec2(0.0, -3.0)], Stroke::new(1.3, col));
@@ -611,9 +611,9 @@ fn param_row(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, i: usize, ts: f64, c
         ui.painter().add(tri(nr.center(), 1.0, next.is_some()));
         let dc = dr.center();
         if on_key {
-            ui.painter().add(Shape::convex_polygon(diamond(dc, 5.0), KEY_BLUE, Stroke::NONE));
+            ui.painter().add(Shape::convex_polygon(diamond(dc, 5.0), KEY_STEEL, Stroke::NONE));
         } else {
-            let col = if animated { KEY_BLUE } else { rgba(139, 148, 158, 90) };
+            let col = if animated { KEY_STEEL } else { rgba(139, 148, 158, 90) };
             ui.painter().add(Shape::closed_line(diamond(dc, 5.0), Stroke::new(1.2, col)));
         }
         if presp.clicked() {
@@ -666,7 +666,7 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
 
     for k in 0..=4 {
         let y = plot.top() + plot.height() * k as f32 / 4.0;
-        p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, rgba(110, 125, 170, 50)));
+        p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, rgba(145, 151, 160, 50)));
     }
     // curve
     let n = 160;
@@ -695,7 +695,7 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
     for (idx, k) in fx.keys[i].iter().enumerate() {
         let c = pos2(x_of(k.t), y_of(k.v));
         let on = ins.sel_key == Some(idx);
-        p.add(Shape::convex_polygon(diamond(c, if on { 6.5 } else { 5.5 }), if on { POWDER } else { KEY_BLUE }, Stroke::new(1.0, rgba(8, 14, 36, 255))));
+        p.add(Shape::convex_polygon(diamond(c, if on { 6.5 } else { 5.5 }), if on { POWDER } else { KEY_STEEL }, Stroke::new(1.0, rgba(8, 14, 36, 255))));
     }
 
     let near = |fx: &Fx, pos: Pos2| fx.keys[i].iter().position(|k| (pos - pos2(x_of(k.t), y_of(k.v))).length() < 10.0);

@@ -22,8 +22,11 @@ use ffmpeg::{
     ChannelLayout, Packet,
 };
 use ffmpeg_next as ffmpeg;
+use ffmpeg::ffi;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,6 +42,37 @@ pub struct Frame {
     pub w: usize,
     pub h: usize,
     pub rgba: Vec<u8>,
+    /// Time spent receiving/decoding packets for this displayed frame (milliseconds).
+    pub decode_ms: f32,
+    /// Time spent transferring/converting the decoded frame to packed RGBA (milliseconds).
+    pub convert_ms: f32,
+    /// Actual pixel format used for this frame. Hardware frames are read back to system memory
+    /// because the current effects and egui preview path still run on the CPU.
+    pub decode_backend: DecodeBackend,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecodeBackend {
+    #[default]
+    Software,
+    Cuda,
+    D3d11va,
+    Dxva2,
+}
+
+impl DecodeBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Software => "SOFTWARE",
+            Self::Cuda => "CUDA",
+            Self::D3d11va => "D3D11VA",
+            Self::Dxva2 => "DXVA2",
+        }
+    }
+
+    pub fn is_hardware(self) -> bool {
+        !matches!(self, Self::Software)
+    }
 }
 
 /// A preview frame plus a few frames decoded immediately before it during a step-seek.
@@ -86,7 +120,15 @@ pub struct VideoWorker {
     path: PathBuf,
     ictx: format::context::Input,
     dec: ffmpeg::decoder::Video,
-    scaler: scaling::Context,
+    /// Kept alive for the lifetime of the decoder because AVCodecContext::opaque points here.
+    /// The callback uses it to fall back to software if FFmpeg retries get_format after HW init fails.
+    hw_callback_state: Option<Box<AtomicBool>>,
+    /// Created lazily from the actual software pixel format. Hardware decoders expose a GPU
+    /// surface format until the first frame is decoded, so eager scaler creation is unreliable.
+    scaler: Option<scaling::Context>,
+    scaler_key: Option<(format::Pixel, u32, u32, u32, u32)>,
+    /// Reusable system-memory target for av_hwframe_transfer_data().
+    hw_transfer: VFrame,
     idx: usize,
     tb: f64,
     raw: VFrame,
@@ -94,12 +136,147 @@ pub struct VideoWorker {
     flushed: bool,
     gen: u64,
     seek_history: VecDeque<Frame>,
+    /// Includes decoded/discarded frames during a long-GOP seek, reported on the first result.
+    decode_accum_ms: f32,
     w: u32,
     h: u32,
     src_w: u32,
     src_h: u32,
     max_w: u32,
     fps_hint: f64,
+}
+
+// FFmpeg hardware decode setup. The decoder still falls back to software if the device is
+// unavailable, the codec lacks a matching HW config, or the driver fails during initialization.
+#[cfg(windows)]
+fn configure_hardware_decoder(
+    context: &mut codec::context::Context,
+    callback_state: &mut Option<Box<AtomicBool>>,
+) -> bool {
+    use ffi::AVHWDeviceType;
+
+    let candidates = [
+        (AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, "CUDA"),
+        (AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, "D3D11VA"),
+        (AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2, "DXVA2"),
+    ];
+    unsafe {
+        let codec_ctx = context.as_mut_ptr();
+        let decoder = if !(*codec_ctx).codec.is_null() {
+            (*codec_ctx).codec
+        } else {
+            ffi::avcodec_find_decoder((*codec_ctx).codec_id)
+        };
+        if decoder.is_null() {
+            return false;
+        }
+
+        for (device_type, name) in candidates {
+            let mut index = 0;
+            let mut supported = false;
+            loop {
+                let config = ffi::avcodec_get_hw_config(decoder, index);
+                if config.is_null() {
+                    break;
+                }
+                if (*config).device_type == device_type && ((*config).methods & 1) != 0 {
+                    supported = true; // AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX
+                    break;
+                }
+                index += 1;
+            }
+            if !supported {
+                continue;
+            }
+
+            let mut device_ref = ptr::null_mut();
+            let result = ffi::av_hwdevice_ctx_create(
+                &mut device_ref,
+                device_type,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            );
+            if result < 0 || device_ref.is_null() {
+                continue;
+            }
+
+            // AVCodecContext owns this reference after assignment and releases it when dropped.
+            (*codec_ctx).hw_device_ctx = device_ref;
+            let mut state = Box::new(AtomicBool::new(false));
+            (*codec_ctx).opaque = (&mut *state as *mut AtomicBool).cast();
+            (*codec_ctx).get_format = Some(select_hardware_pixel_format);
+            (*codec_ctx).extra_hw_frames = 8;
+            *callback_state = Some(state);
+            eprintln!("Yoru: trying {name} hardware decoding");
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn configure_hardware_decoder(
+    _context: &mut codec::context::Context,
+    _callback_state: &mut Option<Box<AtomicBool>>,
+) -> bool {
+    false
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn select_hardware_pixel_format(
+    context: *mut ffi::AVCodecContext,
+    formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    use ffi::{AVHWDeviceType, AVPixelFormat};
+    if context.is_null() || formats.is_null() {
+        return AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+
+    let wanted = unsafe {
+        let device_ref = (*context).hw_device_ctx;
+        if device_ref.is_null() || (*device_ref).data.is_null() {
+            AVPixelFormat::AV_PIX_FMT_NONE
+        } else {
+            let device = &*((*device_ref).data.cast::<ffi::AVHWDeviceContext>());
+            match device.type_ {
+                AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA => AVPixelFormat::AV_PIX_FMT_CUDA,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA => AVPixelFormat::AV_PIX_FMT_D3D11,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2 => AVPixelFormat::AV_PIX_FMT_DXVA2_VLD,
+                _ => AVPixelFormat::AV_PIX_FMT_NONE,
+            }
+        }
+    };
+
+    let retrying_after_hw_failure = unsafe {
+        !(*context).opaque.is_null()
+            && (*((*context).opaque.cast::<AtomicBool>())).swap(true, Relaxed)
+    };
+    let mut current = formats;
+    let mut first_software = AVPixelFormat::AV_PIX_FMT_NONE;
+    unsafe {
+        while *current != AVPixelFormat::AV_PIX_FMT_NONE {
+            let value = *current;
+            if value == wanted && !retrying_after_hw_failure {
+                return value;
+            }
+            let is_hardware = matches!(value,
+                AVPixelFormat::AV_PIX_FMT_CUDA |
+                AVPixelFormat::AV_PIX_FMT_D3D11 |
+                AVPixelFormat::AV_PIX_FMT_DXVA2_VLD |
+                AVPixelFormat::AV_PIX_FMT_D3D11VA_VLD
+            );
+            if !is_hardware && first_software == AVPixelFormat::AV_PIX_FMT_NONE {
+                first_software = value;
+            }
+            current = current.add(1);
+        }
+        if first_software != AVPixelFormat::AV_PIX_FMT_NONE {
+            first_software
+        } else {
+            *formats
+        }
+    }
 }
 
 impl VideoWorker {
@@ -117,19 +294,37 @@ impl VideoWorker {
         };
         let mut cctx = codec::context::Context::from_parameters(params)?;
         cctx.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
-        let dec = cctx.decoder().video()?;
+        let mut hw_callback_state = None;
+        let hw_configured = configure_hardware_decoder(&mut cctx, &mut hw_callback_state);
+        let dec = match cctx.decoder().video() {
+            Ok(dec) => dec,
+            Err(hw_error) if hw_configured => {
+                // A driver may create a device but fail while the codec initializes it. Re-open
+                // from the original stream parameters without hardware rather than failing import.
+                eprintln!("hardware decoder initialization failed for {} ({hw_error}); retrying in software", path.display());
+                // The failed hardware context has been dropped with the consumed decoder context.
+                hw_callback_state = None;
+                let fallback_params = ictx.streams().best(Type::Video).ok_or(ffmpeg::Error::StreamNotFound)?.parameters();
+                let mut fallback = codec::context::Context::from_parameters(fallback_params)?;
+                fallback.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
+                fallback.decoder().video()?
+            }
+            Err(err) => return Err(err),
+        };
 
         let (sw, sh) = (dec.width().max(2), dec.height().max(2));
         let w = (sw.min(max_w) & !1).max(2);
         let h = ((((sh as u64 * w as u64) / sw as u64) as u32) & !1).max(2);
-        let scaler = scaling::Context::get(dec.format(), sw, sh, format::Pixel::RGBA, w, h, scaling::Flags::BILINEAR)?;
         let dur = ictx.duration();
         let info = Info { w, h, fps, duration: if dur > 0 { dur as f64 / 1_000_000.0 } else { 0.0 } };
         let me = Self {
             path: path.to_path_buf(),
             ictx,
             dec,
-            scaler,
+            hw_callback_state,
+            scaler: None,
+            scaler_key: None,
+            hw_transfer: VFrame::empty(),
             idx,
             tb,
             raw: VFrame::empty(),
@@ -137,6 +332,7 @@ impl VideoWorker {
             flushed: false,
             gen: 0,
             seek_history: VecDeque::new(),
+            decode_accum_ms: 0.0,
             w,
             h,
             src_w: sw,
@@ -161,20 +357,11 @@ impl VideoWorker {
         if (w, h) == (self.w, self.h) {
             return;
         }
-        if let Ok(sc) = scaling::Context::get(
-            self.dec.format(),
-            self.src_w,
-            self.src_h,
-            format::Pixel::RGBA,
-            w,
-            h,
-            scaling::Flags::BILINEAR,
-        ) {
-            self.scaler = sc;
-            self.rgba = VFrame::new(format::Pixel::RGBA, w, h);
-            self.w = w;
-            self.h = h;
-        }
+        self.scaler = None;
+        self.scaler_key = None;
+        self.rgba = VFrame::new(format::Pixel::RGBA, w, h);
+        self.w = w;
+        self.h = h;
     }
 
     pub fn seek(&mut self, t: f64, gen: u64) {
@@ -197,6 +384,7 @@ impl VideoWorker {
         self.dec.flush();
         self.flushed = false;
         self.gen = gen;
+        self.decode_accum_ms = 0.0;
     }
 
     /// Change the output generation without seeking the demuxer. Used by sequential frame steps.
@@ -225,8 +413,12 @@ impl VideoWorker {
         discard_before: Option<(f64, f64)>,
         history_limit: usize,
     ) -> VideoDecodeStep {
+        let decode_started = Instant::now();
         loop {
             if self.dec.receive_frame(&mut self.raw).is_ok() {
+                if let Some(state) = &self.hw_callback_state {
+                    state.store(false, Relaxed);
+                }
                 let pts = self.raw.timestamp().or(self.raw.pts()).unwrap_or(0) as f64 * self.tb;
                 if let Some((target, half_frame)) = discard_before {
                     if pts + half_frame < target {
@@ -235,18 +427,22 @@ impl VideoWorker {
                         // discarded frame made the first reverse step needlessly expensive on
                         // long-GOP footage even though only the final few frames are cached.
                         let history_window = history_limit as f64 / self.info_fps_hint();
+                        let decode_ms = decode_started.elapsed().as_secs_f32() * 1000.0;
                         if history_limit > 0 && pts >= target - history_window - half_frame {
-                            if let Some(frame) = self.convert(pts) {
+                            if let Some(frame) = self.convert(pts, 0.0) {
                                 self.seek_history.push_back(frame);
                                 while self.seek_history.len() > history_limit {
                                     self.seek_history.pop_front();
                                 }
                             }
                         }
+                        self.decode_accum_ms += decode_ms;
                         return VideoDecodeStep::Skipped;
                     }
                 }
-                return self.convert(pts).map(VideoDecodeStep::Frame).unwrap_or(VideoDecodeStep::Skipped);
+                let decode_ms = self.decode_accum_ms + decode_started.elapsed().as_secs_f32() * 1000.0;
+                self.decode_accum_ms = 0.0;
+                return self.convert(pts, decode_ms).map(VideoDecodeStep::Frame).unwrap_or(VideoDecodeStep::Skipped);
             }
             if self.flushed {
                 return VideoDecodeStep::End;
@@ -266,8 +462,79 @@ impl VideoWorker {
         }
     }
 
-    fn convert(&mut self, pts: f64) -> Option<Frame> {
-        self.scaler.run(&self.raw, &mut self.rgba).ok()?;
+    fn convert(&mut self, pts: f64, decode_ms: f32) -> Option<Frame> {
+        let convert_started = Instant::now();
+        let decoded_format = self.raw.format();
+        let decode_backend = match decoded_format {
+            format::Pixel::CUDA => DecodeBackend::Cuda,
+            format::Pixel::D3D11 => DecodeBackend::D3d11va,
+            format::Pixel::DXVA2_VLD => DecodeBackend::Dxva2,
+            _ => DecodeBackend::Software,
+        };
+
+        // Hardware frames are opaque device surfaces. Transfer to a reusable software frame before
+        // swscale; this keeps the established CPU effect path correct until the GPU render graph lands.
+        if decode_backend.is_hardware() {
+            unsafe {
+                let src = self.raw.as_ptr();
+                let frames_ref = (*src).hw_frames_ctx;
+                if frames_ref.is_null() || (*frames_ref).data.is_null() {
+                    return None;
+                }
+                let frames = &*((*frames_ref).data.cast::<ffi::AVHWFramesContext>());
+                let sw_format = frames.sw_format;
+                if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                    return None;
+                }
+                let dst = self.hw_transfer.as_mut_ptr();
+                let needs_reallocation = (*dst).buf[0].is_null()
+                    || (*dst).format != sw_format as i32
+                    || (*dst).width != (*src).width
+                    || (*dst).height != (*src).height;
+                if needs_reallocation {
+                    ffi::av_frame_unref(dst);
+                    (*dst).format = sw_format as i32;
+                }
+                if ffi::av_hwframe_transfer_data(dst, src, 0) < 0 {
+                    // A driver may change its allocation requirements after a format change.
+                    // Retry once with a clean frame rather than dropping the preview frame.
+                    ffi::av_frame_unref(dst);
+                    (*dst).format = sw_format as i32;
+                    if ffi::av_hwframe_transfer_data(dst, src, 0) < 0 {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let (source_format, source_w, source_h) = if decode_backend.is_hardware() {
+            (self.hw_transfer.format(), self.hw_transfer.width(), self.hw_transfer.height())
+        } else {
+            (self.raw.format(), self.raw.width(), self.raw.height())
+        };
+        if source_format == format::Pixel::None || source_w < 2 || source_h < 2 {
+            return None;
+        }
+        let scaler_key = (source_format, source_w, source_h, self.w, self.h);
+        if self.scaler_key != Some(scaler_key) {
+            self.scaler = Some(scaling::Context::get(
+                source_format,
+                source_w,
+                source_h,
+                format::Pixel::RGBA,
+                self.w,
+                self.h,
+                scaling::Flags::BILINEAR,
+            ).ok()?);
+            self.scaler_key = Some(scaler_key);
+        }
+        let scaler = self.scaler.as_mut()?;
+        if decode_backend.is_hardware() {
+            scaler.run(&self.hw_transfer, &mut self.rgba).ok()?;
+        } else {
+            scaler.run(&self.raw, &mut self.rgba).ok()?;
+        }
+
         let (w, h) = (self.w as usize, self.h as usize);
         let stride = self.rgba.stride(0);
         let data = self.rgba.data(0);
@@ -275,7 +542,16 @@ impl VideoWorker {
         for y in 0..h {
             out.extend_from_slice(&data[y * stride..y * stride + w * 4]); // strip row padding
         }
-        Some(Frame { pts, gen: self.gen, w, h, rgba: out })
+        Some(Frame {
+            pts,
+            gen: self.gen,
+            w,
+            h,
+            rgba: out,
+            decode_ms,
+            convert_ms: convert_started.elapsed().as_secs_f32() * 1000.0,
+            decode_backend,
+        })
     }
 }
 

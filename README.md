@@ -49,7 +49,7 @@ keyframed transform controls as video clips.
 Select an audio clip and open the **Audio** tab to adjust gain (0–400%) and linear fade-in/fade-out
 durations. Playback gain is applied by the audio output callback without restarting playback.
 
-Graphics and audio settings are saved in the YORU project format. This build reads older YORU 1–8 projects; YORU 9 adds additional effect, transition, and audio-preset IDs.
+Graphics and audio settings are saved in the YORU project format. This build reads YORU 1–10 projects. YORU 10 adds saved point-tracking data while retaining compatibility with earlier projects.
 They are included in the existing clip-snapshot undo/redo history.
 
 ## Playback resolution and seeking
@@ -65,6 +65,21 @@ the preview stuck at the previous position.
 
 Projects now reopen their media decoders and thumbnail workers from the stored source paths. If a
 source file has moved or been deleted, that source still needs to be restored to its recorded path.
+
+Press **F3** or click **Perf** in the monitor toolbar to show per-frame decode backend, decode,
+RGBA conversion, effects, image construction, and texture-update submission timings. On Windows,
+Yoru attempts CUDA/NVDEC, D3D11VA, then DXVA2 when the codec and device support them, and falls back
+to software decoding when hardware initialization is unavailable. Hardware frames are copied back
+to system memory for the current CPU effects and egui preview path, so this is not yet a zero-copy
+GPU renderer. See [PERFORMANCE.md](PERFORMANCE.md) for measurement notes and a script that generates
+repeatable 4K H.264, 4K HEVC 10-bit, and ProRes benchmark footage.
+
+## Point tracking (YORU 10)
+
+- Enable **Track point** in the preview toolbar, then click a visible feature in the monitor to seed a point.
+- Yoru follows the feature with a bounded grayscale template matcher as new preview frames arrive. Tracking markers are drawn over the monitor and samples are stored against the source-media timestamp.
+- Point tracks are saved in YORU 10 project files. The runtime image template is recreated from the current preview frame after reopening a project.
+- Tracking works best on distinct, high-contrast details with modest movement. It can lose a point during occlusion, motion blur, large jumps, or major appearance changes; it is not face detection or a substitute for manual correction.
 
 ## Build
 `cargo build --release` needs the FFmpeg development libraries (CI installs them with vcpkg, see
@@ -92,7 +107,7 @@ support also varies by filter. Always check a short render before a long export.
 - **Keyframe effects** from Effect Controls by clicking the diamond at the playhead. Parameter tracks are saved in `.yoru` projects; choose Linear, Ease In, Ease Out, Ease In/Out, or Hold for each keyframe segment.
 - **Transitions** can be applied on a selected video clip in Effect Controls → Transition In. Supported transitions are Cross Dissolve, Dip to Black, Wipe Left, and Flash. Their duration and enabled state are stored in the project and marked on the timeline.
 - **Audio gain automation** is available in the Audio inspector. Click the diamond next to Volume to add/remove a keyframe, change the gain at different positions, and select key easing. Export mixes all non-hidden audio clips from the timeline with per-clip gain, fades, automation, and a final limiter. Live monitor playback still follows the active video source's audio clock; a full low-latency real-time multitrack monitor mixer remains future work.
-- **Preview proxies** can be generated for the selected Project-bin item with Generate proxy. A 960px H.264/AAC copy is stored under `%LOCALAPPDATA%\Yoru\proxies` and used for interactive decoding when present. The source path remains unchanged and export always uses the original file. Proxy paths are stored in YORU 7–9 projects; older YORU 1–6 projects still load.
+- **Preview proxies** can be generated for the selected Project-bin item with Generate proxy. A 960px H.264/AAC copy is stored under `%LOCALAPPDATA%\Yoru\proxies` and used for interactive decoding when present. The source path remains unchanged and export always uses the original file. Proxy paths are stored in YORU 7–10 projects; older YORU 1–6 projects still load.
 - Preview decoding uses a bounded frame queue and coalesces stale frames during seeking. A generated proxy can materially improve playback with high-resolution/long-GOP source footage, while quarter/half-resolution preview quality remains available.
 
 ## Export executable and GitHub Actions
@@ -107,7 +122,7 @@ Effect appearance in final output is implemented through FFmpeg filters; some fi
 - **Transitions:** Cross Dissolve, Dip to Black, Flash, left/right/up/down wipes, Circle Iris, Diagonal Wipe, and Diamond Iris.
 - **Text animation presets:** Fade In, Rise Up, Slide Left/Right, Drop In, Pop In, Float In, Fade Out, Zoom In, Soft Zoom, Bounce In, Slam In, Rotate In, Drift Up/Down, Scale Pulse, and Soft Reveal (a slide/fade entrance, not per-character typing). Presets create regular editable transform/opacity keyframes.
 - **Audio presets:** Neutral, Voice Clear, Music Bed, Cinematic, Telephone/Radio, Lo-Fi, Underwater, Podcast/Spoken Word, Bass Boost, Bright Voice, Room Reverb, and Muffled/Distant. These non-destructive filters are applied in export; the preview audio path does not yet render the tonal processing.
-- Audio presets are saved with the project in YORU 9; existing YORU 1–8 files load with Neutral as the default. New IDs are append-only so saved effect and transition data keeps its meaning.
+- Audio presets were introduced in YORU 9 and remain part of the YORU 10 format; existing YORU 1–8 files load with Neutral as the default. New IDs are append-only so saved effect and transition data keeps its meaning.
 
 
 ## Build fix archive notice

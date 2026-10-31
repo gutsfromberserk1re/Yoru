@@ -1,6 +1,6 @@
 //! Yoru - video editor (Rust / egui)
 //!
-//! * Panels: solid French Blue (#394988), rounded, 1px border.
+//! * Panels: graphite glass with restrained steel-silver accents, rounded, 1px border.
 //! * Everything else (title bar, gaps between panels, window background):
 //!   transparent frosted-glass (Windows acrylic blur, Windows 11 rounded corners).
 //!
@@ -25,6 +25,7 @@ mod fxui;
 mod media;
 mod project;
 mod timeline;
+mod tracking;
 
 use assets::Assets;
 use project::{Clip, EffectKind, EffectInstance, Gfx, Lane, Project, TransitionKind, NPARAM, PARAMS};
@@ -264,7 +265,7 @@ fn glass(l: f32, t: f32, r: f32, b: f32) -> Frame {
         .inner_margin(Margin { left: l, right: r, top: t, bottom: b })
 }
 
-/// Warm graphite / amber / rose gradient sampled from Yoru's window backdrop.
+/// Restrained graphite-to-steel gradient for Yoru's frosted-glass panels.
 /// Paint this at the beginning of each panel's frame closure so controls remain on top.
 fn paint_panel_gradient(ui: &Ui, left: f32, top: f32, right: f32, bottom: f32) {
     let content = ui.max_rect();
@@ -273,10 +274,10 @@ fn paint_panel_gradient(ui: &Ui, left: f32, top: f32, right: f32, bottom: f32) {
         pos2(content.right() + right - 1.0, content.bottom() + bottom - 1.0),
     );
     if rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
-    let tl = rgba(126, 105, 104, 249);   // graphite mauve
-    let tr = rgba(198, 146, 91, 249);    // warm amber
-    let br = rgba(104, 111, 122, 249);   // brushed steel
-    let bl = rgba(166, 108, 123, 249);   // dusty rose
+    let tl = rgba(43, 47, 53, 248);      // graphite
+    let tr = rgba(66, 72, 79, 248);      // cool brushed steel
+    let br = rgba(30, 33, 38, 249);      // deep chrome
+    let bl = rgba(53, 58, 65, 248);      // soft gunmetal
     let mix = |a: Color32, b: Color32, t: f32| a.lerp_to_gamma(b, t.clamp(0.0, 1.0));
     let mut mesh = Mesh::default();
     let center_col = mix(mix(tl, tr, 0.5), mix(bl, br, 0.5), 0.5);
@@ -360,19 +361,75 @@ fn preview_image(
     effects: &[EffectInstance],
     local_time: f64,
     clip_duration: f64,
-) -> (ColorImage, f32) {
+) -> (ColorImage, f32, PreviewTimings) {
     let asp = f.w as f32 / f.h.max(1) as f32;
     let neutral = (0..NPARAM).all(|i| (params[i] - PARAMS[i].def).abs() < 1e-4);
     let no_effects = effects.iter().all(|e| !e.enabled);
     if neutral && no_effects && (asp - 16.0 / 9.0).abs() < 0.02 {
         // alpha is always 255 after the RGBA conversion, so premultiplied == straight
-        return (ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba), asp);
+        let image_started = Instant::now();
+        let image = ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba);
+        return (
+            image,
+            asp,
+            PreviewTimings {
+                effects_ms: 0.0,
+                image_ms: image_started.elapsed().as_secs_f32() * 1000.0,
+            },
+        );
     }
     let cw = f.w.max(320) & !1;
     let ch = (cw * 9 / 16) & !1;
+    let effects_started = Instant::now();
     let mut buf = vec![0u8; cw * ch * 4];
     fxrender::render_with_effects(&f.rgba, f.w, f.h, params, effects, local_time, clip_duration, &mut buf, cw, ch);
-    (ColorImage::from_rgba_premultiplied([cw, ch], &buf), cw as f32 / ch as f32)
+    let effects_ms = effects_started.elapsed().as_secs_f32() * 1000.0;
+    let image_started = Instant::now();
+    let image = ColorImage::from_rgba_premultiplied([cw, ch], &buf);
+    (
+        image,
+        cw as f32 / ch as f32,
+        PreviewTimings {
+            effects_ms,
+            image_ms: image_started.elapsed().as_secs_f32() * 1000.0,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct PreviewTimings {
+    effects_ms: f32,
+    image_ms: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProfileStats {
+    decode_ms: f32,
+    convert_ms: f32,
+    effects_ms: f32,
+    image_ms: f32,
+    upload_ms: f32,
+    fps: f32,
+    decode_backend: &'static str,
+    last_presented: Option<Instant>,
+}
+
+impl ProfileStats {
+    fn record_frame(&mut self, frame: &media::Frame) {
+        let now = Instant::now();
+        if let Some(last) = self.last_presented {
+            let delta = now.duration_since(last).as_secs_f32();
+            self.fps = if (0.001..0.5).contains(&delta) { 1.0 / delta } else { 0.0 };
+        }
+        self.last_presented = Some(now);
+        self.decode_ms = frame.decode_ms;
+        self.convert_ms = frame.convert_ms;
+        self.decode_backend = frame.decode_backend.label();
+    }
+
+    fn pipeline_ms(self) -> f32 {
+        self.decode_ms + self.convert_ms + self.effects_ms + self.image_ms + self.upload_ms
+    }
 }
 
 fn level_meter(ui: &Ui, rect: Rect, l: f32, r: f32) {
@@ -422,9 +479,14 @@ fn monitor_panel(
     quality: &mut usize,
     video: Option<(TextureId, f32)>,
     overlays: &[gfxdraw::Overlay],
-) -> (bool, bool) {
+    tracked_points: &[(u32, String, f32, f32)],
+    track_mode: &mut bool,
+    profile_hud: &mut bool,
+    profile: ProfileStats,
+) -> (bool, bool, Option<(f32, f32)>) {
     let mut play = false;
     let mut export = false;
+    let mut track_click = None;
     glass(14.0, 8.0, 14.0, 10.0).show(ui, |ui| {
         paint_panel_gradient(ui, 14.0, 8.0, 14.0, 10.0);
         ui.horizontal(|ui| {
@@ -440,6 +502,12 @@ fn monitor_panel(
                         ui.selectable_value(quality, i, *name);
                     }
                 });
+                if ui.selectable_label(*track_mode, RichText::new("＋ Track point").size(10.0).color(if *track_mode { TEXT } else { MUTED }))
+                    .on_hover_text("Enable point placement, then click a visible feature in the preview")
+                    .clicked() { *track_mode = !*track_mode; }
+                if ui.selectable_label(*profile_hud, RichText::new("Perf").size(10.0).color(if *profile_hud { TEXT } else { MUTED }))
+                    .on_hover_text("Show per-frame decode, conversion, effects and texture upload timings · F3")
+                    .clicked() { *profile_hud = !*profile_hud; }
                 ui.label(RichText::new("Playback").size(10.0).color(MUTED));
                 if ui.button("Export").on_hover_text("Render the timeline to MP4").clicked() { export = true; }
             });
@@ -454,7 +522,7 @@ fn monitor_panel(
         if let Some((id, _)) = video {
             Image::new(load::SizedTexture::new(id, r.size())).rounding(6.0).paint_at(ui, r);
         } else {
-            rounded_gradient(ui.painter(), r, 6.0, rgba(0x22, 0x28, 0x38, 255), rgba(0x17, 0x1A, 0x24, 255));
+            rounded_gradient(ui.painter(), r, 6.0, rgba(0x2B, 0x2F, 0x35, 255), rgba(0x18, 0x1B, 0x20, 255));
             ui.painter().text(
                 r.center(),
                 Align2::CENTER_CENTER,
@@ -463,8 +531,65 @@ fn monitor_panel(
                 rgba(139, 148, 158, 150),
             );
         }
-        ui.painter().rect_stroke(r, 6.0, Stroke::new(1.0, rgba(110, 125, 170, 120)));
+        ui.painter().rect_stroke(r, 6.0, Stroke::new(1.0, rgba(145, 151, 160, 135)));
         gfxdraw::draw_overlays(ui.painter(), r, overlays);
+        if *profile_hud {
+            let hud_w = 190.0;
+            let hud_h = 126.0;
+            let hud = Rect::from_min_size(r.right_top() + vec2(-hud_w - 8.0, 8.0), vec2(hud_w, hud_h));
+            let p = ui.painter();
+            p.rect_filled(hud, 5.0, rgba(12, 14, 17, 218));
+            p.rect_stroke(hud, 5.0, Stroke::new(1.0, rgba(158, 166, 176, 125)));
+            p.text(hud.left_top() + vec2(8.0, 7.0), Align2::LEFT_TOP,
+                "FRAME PIPELINE  ·  ms", FontId::monospace(8.0), rgba(211, 218, 226, 235));
+            p.text(pos2(hud.left() + 8.0, hud.top() + 22.0), Align2::LEFT_TOP,
+                "BACKEND", FontId::monospace(8.0), rgba(139, 148, 158, 240));
+            p.text(pos2(hud.right() - 8.0, hud.top() + 22.0), Align2::RIGHT_TOP,
+                if profile.decode_backend.is_empty() { "--" } else { profile.decode_backend },
+                FontId::monospace(8.0), rgba(192, 203, 216, 245));
+            let rows = [
+                ("DECODE", profile.decode_ms),
+                ("CONVERT", profile.convert_ms),
+                ("EFFECTS", profile.effects_ms),
+                ("IMAGE", profile.image_ms),
+                ("UPLOAD", profile.upload_ms),
+            ];
+            for (i, (label, value)) in rows.iter().enumerate() {
+                let y = hud.top() + 36.0 + i as f32 * 13.0;
+                p.text(pos2(hud.left() + 8.0, y), Align2::LEFT_TOP,
+                    *label, FontId::monospace(8.0), rgba(139, 148, 158, 240));
+                p.text(pos2(hud.right() - 8.0, y), Align2::RIGHT_TOP,
+                    format!("{:6.2}", value), FontId::monospace(8.0), rgba(226, 232, 239, 245));
+            }
+            let fps_text = if profile.fps > 0.0 { format!("{:4.1} FPS", profile.fps) } else { "  -- FPS".to_owned() };
+            p.text(pos2(hud.left() + 8.0, hud.bottom() - 7.0), Align2::LEFT_BOTTOM,
+                format!("TOTAL {:6.2} ms", profile.pipeline_ms()), FontId::monospace(8.0), rgba(207, 215, 224, 245));
+            p.text(pos2(hud.right() - 8.0, hud.bottom() - 7.0), Align2::RIGHT_BOTTOM,
+                fps_text, FontId::monospace(8.0), rgba(207, 215, 224, 245));
+        }
+        if *track_mode {
+            ui.painter().text(r.left_top() + vec2(9.0, 8.0), Align2::LEFT_TOP,
+                "CLICK A FEATURE TO PLACE A TRACK POINT", FontId::monospace(8.5), rgba(225, 230, 236, 225));
+        }
+        for (id, name, nx, ny) in tracked_points {
+            let point = pos2(r.left() + nx.clamp(0.0, 1.0) * r.width(), r.top() + ny.clamp(0.0, 1.0) * r.height());
+            let p = ui.painter();
+            p.circle_stroke(point, 8.0, Stroke::new(1.4, rgba(17, 19, 22, 235)));
+            p.circle_stroke(point, 6.0, Stroke::new(1.5, rgba(220, 226, 233, 245)));
+            p.line_segment([point - vec2(11.0, 0.0), point + vec2(11.0, 0.0)], Stroke::new(1.0, rgba(220, 226, 233, 220)));
+            p.line_segment([point - vec2(0.0, 11.0), point + vec2(0.0, 11.0)], Stroke::new(1.0, rgba(220, 226, 233, 220)));
+            p.text(point + vec2(11.0, -10.0), Align2::LEFT_BOTTOM, format!("{} · {}", name, id), FontId::monospace(9.0), rgba(235, 239, 244, 245));
+        }
+        let image_response = ui.interact(r, ui.id().with("monitor_image_surface"), Sense::click())
+            .on_hover_cursor(if *track_mode { CursorIcon::Crosshair } else { CursorIcon::Default });
+        if *track_mode && image_response.clicked() {
+            if let Some(pointer) = image_response.interact_pointer_pos() {
+                track_click = Some((
+                    ((pointer.x - r.left()) / r.width().max(1.0)).clamp(0.0, 1.0),
+                    ((pointer.y - r.top()) / r.height().max(1.0)).clamp(0.0, 1.0),
+                ));
+            }
+        }
 
         let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), bar_h), Sense::hover());
         let s = fmt_tc(t);
@@ -483,7 +608,7 @@ fn monitor_panel(
         ui.painter()
             .galley(pos2(x0 + 44.0, bar.center().y - g.size().y / 2.0), g, TEXT);
     });
-    (play, export)
+    (play, export, track_click)
 }
 
 fn placeholder(ui: &mut Ui, text: &str) {
@@ -588,7 +713,7 @@ fn browser_panel(
                         h.show(ui, |ui| {
                             for k in vis {
                                 let selected = b.fx_sel == Some(k);
-                                let fill = if selected { rgba(120, 160, 240, 50) } else { Color32::TRANSPARENT };
+                                let fill = if selected { rgba(185, 193, 202, 42) } else { Color32::TRANSPARENT };
                                 let resp = ui.add_sized(
                                     [ui.available_width(), 26.0],
                                     Button::new(k).fill(fill).frame(false).sense(Sense::click_and_drag()),
@@ -618,7 +743,7 @@ fn browser_panel(
                         let label = kind.label();
                         if !q.is_empty() && !label.to_lowercase().contains(&q) { continue; }
                         let selected = b.transition_sel == Some(kind);
-                        let fill = if selected { rgba(200, 140, 115, 70) } else { Color32::TRANSPARENT };
+                        let fill = if selected { rgba(185, 193, 202, 46) } else { Color32::TRANSPARENT };
                         let resp = ui.add_sized(
                             [ui.available_width(), 28.0],
                             Button::new(label).fill(fill).frame(false).sense(Sense::click_and_drag()),
@@ -674,7 +799,7 @@ fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, dra
                 None => rounded_gradient(p, tr, 4.0, hsv(thumb_hue(m.seed, 0), 35.0, 55.0), hsv(thumb_hue(m.seed, 0), 45.0, 25.0)),
             }
             let on = *sel == i;
-            p.rect_stroke(tr, 4.0, Stroke::new(if on { 2.0 } else { 1.0 }, if on { TEXT } else { rgba(110, 125, 170, 120) }));
+            p.rect_stroke(tr, 4.0, Stroke::new(if on { 2.0 } else { 1.0 }, if on { TEXT } else { rgba(145, 151, 160, 120) }));
             if m.duration > 0.0 {
                 let badge = Rect::from_min_size(pos2(tr.right() - 44.0, tr.bottom() - 17.0), vec2(40.0, 13.0));
                 p.rect_filled(badge, 3.0, rgba(0, 0, 0, 150));
@@ -762,7 +887,7 @@ fn thumb_grid(ui: &mut Ui, sel: &mut usize) {
                 p.rect_stroke(
                     r,
                     5.0,
-                    if on { Stroke::new(1.5, TEXT) } else { Stroke::new(1.0, rgba(110, 125, 170, 255)) },
+                    if on { Stroke::new(1.5, TEXT) } else { Stroke::new(1.0, rgba(145, 151, 160, 255)) },
                 );
                 let col = if on { TEXT } else { MUTED };
                 let g = elided(ui, name, FontId::monospace(8.0), col, tw);
@@ -925,6 +1050,10 @@ struct App {
     engine: engine::Engine,
     jumped: bool,
     step_direction: Option<i8>,
+    track_mode: bool,
+    tracking_runtime: tracking::Runtime,
+    profile_hud: bool,
+    profile: ProfileStats,
     tex: Option<TextureHandle>,
     tex_aspect: f32,
     assets: Assets,
@@ -971,6 +1100,10 @@ impl App {
             engine: engine::Engine::new(),
             jumped: false,
             step_direction: None,
+            track_mode: false,
+            tracking_runtime: tracking::Runtime::default(),
+            profile_hud: false,
+            profile: ProfileStats::default(),
             tex: None,
             tex_aspect: 16.0 / 9.0,
             assets: Assets::new(),
@@ -1053,6 +1186,7 @@ impl App {
 
     fn rebuild_media_runtime(&mut self, ctx: &Context) {
         self.engine = engine::Engine::new();
+        self.tracking_runtime.clear();
         self.assets = Assets::new();
         for m in &self.proj.media {
             self.assets.spawn(ctx, m.id, &m.path, m.duration, m.has_audio);
@@ -1274,6 +1408,8 @@ impl App {
 
     /// Call after ANY change to the clip list (edit, undo, redo, import).
     fn after_edit(&mut self) {
+        // Keep serialized point data intact for undo/redo; only discard the transient templates.
+        self.tracking_runtime.clear();
         set_duration(self.proj.end().max(10.0));
         self.t = self.t.min(duration());
         let proj = &self.proj;
@@ -1399,6 +1535,9 @@ impl App {
         }
 
         // ---- transport
+        if k(Key::F3, none) {
+            self.profile_hud = !self.profile_hud;
+        }
         if k(Key::Space, none) {
             self.toggle_play();
         }
@@ -1567,6 +1706,16 @@ impl eframe::App for App {
         );
         // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
         let new_frame = self.engine.poll(self.t).is_some();
+        if new_frame {
+            if let Some(frame) = self.engine.current() {
+                self.profile.record_frame(frame);
+            }
+            if let (Some(clip), Some(frame)) = (self.proj.video_clip_at(self.t), self.engine.current()) {
+                let clip_id = clip.id;
+                let changed = self.tracking_runtime.update_points(frame, clip_id, &mut self.proj.tracking_points);
+                if changed && !self.dirty { self.mark_dirty(); }
+            }
+        }
         let active = self.proj.video_clip_at(self.t).map(|c| {
             (c.fx.eval(c.fx_time(self.t)), c.effects.clone(), (self.t - c.start).max(0.0), c.dur)
         });
@@ -1577,12 +1726,16 @@ impl eframe::App for App {
             self.last_params = params;
             self.last_effects = effects.clone();
             if let (Some(f), Some(pr), Some((_, fx, local_time, dur))) = (self.engine.current(), params, active) {
-                let (img, aspect) = preview_image(f, &pr, &fx, local_time, dur);
+                let (img, aspect, timings) = preview_image(f, &pr, &fx, local_time, dur);
                 self.tex_aspect = aspect;
+                self.profile.effects_ms = timings.effects_ms;
+                self.profile.image_ms = timings.image_ms;
+                let upload_started = Instant::now();
                 match &mut self.tex {
                     Some(t) => t.set(img, TextureOptions::LINEAR),
                     None => self.tex = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
                 }
+                self.profile.upload_ms = upload_started.elapsed().as_secs_f32() * 1000.0;
             }
         }
         if !self.engine.is_active() {
@@ -1594,6 +1747,12 @@ impl eframe::App for App {
             .filter(|c| c.gfx.is_some() && c.lane.is_video() && !self.proj.hidden[c.lane.slot()] && c.start <= self.t && self.t < c.end())
             .filter_map(|c| c.gfx.clone().map(|gfx| gfxdraw::Overlay { gfx, v: c.fx.eval(c.fx_time(self.t)) }))
             .collect();
+        let active_clip_id = self.proj.video_clip_at(self.t).map(|clip| clip.id);
+        let tracking_time = self.engine.current().map(|frame| frame.pts).or_else(|| self.proj.video_clip_at(self.t).map(|clip| clip.src_off + (self.t - clip.start)));
+        let tracked_points: Vec<(u32, String, f32, f32)> = self.proj.tracking_points.iter()
+            .filter(|point| Some(point.clip_id) == active_clip_id)
+            .filter_map(|point| tracking_time.and_then(|time| point.position_at(time)).map(|(x, y)| (point.id, point.name.clone(), x, y)))
+            .collect();
         let label = self.project.clone();
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1604,7 +1763,7 @@ impl eframe::App for App {
             let bg = ctx.layer_painter(LayerId::background());
             let r = ctx.screen_rect().shrink(0.5);
             bg.rect_filled(r, radius, rgba(255, 255, 255, 6));
-            bg.rect_stroke(r, radius, Stroke::new(1.2, rgba(110, 125, 170, 180)));
+            bg.rect_stroke(r, radius, Stroke::new(1.2, rgba(145, 151, 160, 180)));
         }
 
         let title = format!("Yoru  -  {}{}", self.project, if self.dirty { " *" } else { "" });
@@ -1615,12 +1774,17 @@ impl eframe::App for App {
             .show(ctx, |ui| title_bar(ui, ctx, &title, maximized));
 
         let (mut edited, mut seeked, mut play, mut export_clicked) = (false, false, false, false);
+        let mut add_tracking_at: Option<(f32, f32)> = None;
         let mut add_media: Option<u32> = None;
         let mut import_requested = false;
         let mut proxy_requested: Option<u32> = None;
         let mut fx_changed = false;
         {
-            let App { project, t, rate, levels, fit, timeline, inspector, browser, proj, assets, quality_idx, drag_media, effect_drag, transition_drag, ghost, .. } = self;
+            let App {
+                project, t, rate, levels, fit, timeline, inspector, browser, proj, assets,
+                quality_idx, drag_media, effect_drag, transition_drag, ghost, track_mode,
+                profile_hud, profile, ..
+            } = self;
             let playing = *rate > 0;
 
             TopBottomPanel::bottom("bottom")
@@ -1659,12 +1823,44 @@ impl eframe::App for App {
                             fx_changed |= fxui::inspector_panel(ui, inspector, proj, &mut timeline.sel, *t);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
-                        let (p, e) = monitor_panel(ui, &label, *t, playing, fit, quality_idx, video, &overlays);
+                        let (p, e, track_click) = monitor_panel(
+                            ui,
+                            &label,
+                            *t,
+                            playing,
+                            fit,
+                            quality_idx,
+                            video,
+                            &overlays,
+                            &tracked_points,
+                            track_mode,
+                            profile_hud,
+                            *profile,
+                        );
                         play |= p;
                         export_clicked |= e;
+                        add_tracking_at = track_click;
                     });
                 });
         }
+        // A point is seeded from the current decoded image, then tracked on later preview frames.
+        if let (Some((x, y)), Some(clip)) = (add_tracking_at, self.proj.video_clip_at(self.t)) {
+            let clip_id = clip.id;
+            if let Some(frame) = self.engine.current() {
+                let frame_pts = frame.pts;
+                if let Some(id) = self.proj.add_tracking_point(clip_id, frame_pts, x, y) {
+                    if let Some(point) = self.proj.tracking_points.iter().find(|point| point.id == id) {
+                        let seed_x = point.samples.first().map(|sample| sample.x).unwrap_or(x);
+                        let seed_y = point.samples.first().map(|sample| sample.y).unwrap_or(y);
+                        self.tracking_runtime.seed(id, frame, seed_x, seed_y);
+                    }
+                    self.mark_dirty();
+                    self.track_mode = false;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         // A dropped effect is either consumed by the timeline or cancelled if released elsewhere.
         if ctx.input(|i| i.pointer.primary_released()) {
             self.effect_drag = None;
@@ -1839,7 +2035,7 @@ fn setup(ctx: &Context) {
     v.panel_fill = Color32::TRANSPARENT;
     v.window_fill = Color32::TRANSPARENT;
     v.extreme_bg_color = rgba(0, 0, 0, 77);
-    v.selection.bg_fill = rgba(72, 82, 102, 242);
+    v.selection.bg_fill = rgba(78, 84, 92, 242);
     v.selection.stroke = Stroke::new(1.0, TEXT);
     v.widgets.hovered.bg_fill = rgba(139, 148, 158, 41);
     v.widgets.hovered.weak_bg_fill = rgba(139, 148, 158, 41);
