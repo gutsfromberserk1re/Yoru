@@ -1468,8 +1468,21 @@ impl App {
             return;
         }
         let k = |key: Key, m: Modifiers| ctx.input_mut(|i| {
+            // egui 0.29 exposes key-repeat state on Event::Key, not InputState.
+            // Check before consume_key, because consuming the key removes its event.
+            let repeated = i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: event_key,
+                        pressed: true,
+                        repeat: true,
+                        ..
+                    } if *event_key == key
+                )
+            });
             let pressed = i.consume_key(m, key);
-            pressed && !i.key_repeated(key)
+            pressed && !repeated
         });
         let (none, cmd, shift) = (Modifiers::NONE, Modifiers::COMMAND, Modifiers::SHIFT);
 
