@@ -1,8 +1,7 @@
 //! Yoru - video editor (Rust / egui)
 //!
-//! * Panels: solid French Blue (#394988), rounded, 1px border.
-//! * Everything else (title bar, gaps between panels, window background):
-//!   transparent frosted-glass (Windows acrylic blur, Windows 11 rounded corners).
+//! * Panels: near-black to electric-blue/cyan gradient, rounded, cool-blue border.
+//! * Window gaps retain a deep navy acrylic tint rather than picking up warm desktop colors.
 //!
 //! Run:  cargo run --release
 
@@ -27,7 +26,7 @@ mod project;
 mod timeline;
 
 use assets::Assets;
-use project::{Clip, EffectKind, EffectInstance, Gfx, Lane, Project, TransitionKind, NPARAM, PARAMS};
+use project::{BlendMode, Clip, EffectKind, EffectInstance, Gfx, Lane, Project, TransitionKind, NPARAM};
 use timeline::{timeline_panel, Ghost, Timeline, Tool};
 
 // ------------------------------------------------------------------ settings
@@ -64,7 +63,7 @@ fn peak_to_meter(peak: f32) -> f32 {
 const WINDOW_RADIUS: f32 = 12.0;
 
 /// Acrylic tint (R, G, B, A). Lower alpha = more see-through glass.
-const GLASS_TINT: (u8, u8, u8, u8) = (0x08, 0x18, 0x30, 116);
+const GLASS_TINT: (u8, u8, u8, u8) = (0x01, 0x06, 0x1C, 238);
 
 // ------------------------------------------------------------------ palette
 const POWDER: Color32 = Color32::from_rgb(0xF0, 0xF6, 0xFC);
@@ -73,8 +72,8 @@ const GLAUCOUS: Color32 = Color32::from_rgb(0x8B, 0x94, 0x9E);
 const TEXT: Color32 = POWDER;
 const MUTED: Color32 = GLAUCOUS;
 const DEEP: Color32 = Color32::from_rgb(0x22, 0x25, 0x30);
-/// Panel glass: very dark navy, ~84% opaque (premultiplied RGBA; lower the last number for more see-through).
-const PANEL_BG: Color32 = Color32::TRANSPARENT;
+/// Opaque navy fallback beneath the panel gradient, so no warm desktop color can bleed through.
+const PANEL_BG: Color32 = Color32::from_rgb(0x01, 0x05, 0x18);
 const DOT_COLORS: [Color32; 3] = [
     Color32::from_rgb(0x48, 0x52, 0x66),
     Color32::from_rgb(0x5E, 0x6B, 0x82),
@@ -275,35 +274,48 @@ fn paint_panel_gradient(ui: &Ui, left: f32, top: f32, right: f32, bottom: f32) {
         pos2(content.right() + right - 1.0, content.bottom() + bottom - 1.0),
     );
     if rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
-    let tl = rgba(5, 10, 20, 249);       // midnight ink
-    let tr = rgba(35, 101, 164, 249);   // restrained cobalt glow
-    let br = rgba(4, 8, 17, 249);       // near-black blue
-    let bl = rgba(10, 36, 70, 249);     // deep ocean blue
-    let mix = |a: Color32, b: Color32, t: f32| a.lerp_to_gamma(b, t.clamp(0.0, 1.0));
-    let mut mesh = Mesh::default();
-    let center_col = mix(mix(tl, tr, 0.5), mix(bl, br, 0.5), 0.5);
-    mesh.colored_vertex(rect.center(), center_col);
-    let corners = [
-        (rect.right() - 8.0, rect.top() + 8.0, -90.0f32),
-        (rect.right() - 8.0, rect.bottom() - 8.0, 0.0),
-        (rect.left() + 8.0, rect.bottom() - 8.0, 90.0),
-        (rect.left() + 8.0, rect.top() + 8.0, 180.0),
+
+    // Fixed cool palette: black/navy at the left and bottom, cobalt through the centre,
+    // and a cyan-blue bloom at the upper-right. The mesh is fully opaque so the Windows
+    // acrylic backdrop cannot introduce the warm pink/orange cast seen in earlier builds.
+    let rows = [
+        [rgba(0, 4, 18, 255), rgba(0, 18, 58, 255), rgba(0, 62, 143, 255), rgba(22, 190, 232, 255)],
+        [rgba(0, 2, 13, 255), rgba(0, 13, 48, 255), rgba(0, 48, 124, 255), rgba(0, 116, 196, 255)],
+        [rgba(0, 1, 8, 255), rgba(0, 8, 31, 255), rgba(0, 27, 78, 255), rgba(0, 48, 105, 255)],
+        [rgba(0, 0, 4, 255), rgba(0, 4, 18, 255), rgba(0, 10, 34, 255), rgba(0, 18, 50, 255)],
     ];
-    const SEG: usize = 5;
-    for (cx, cy, start) in corners {
-        for i in 0..=SEG {
-            let a = (start + 90.0 * i as f32 / SEG as f32).to_radians();
-            let point = pos2(cx + 8.0 * a.cos(), cy + 8.0 * a.sin());
-            let u = ((point.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-            let v = ((point.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-            let top_col = mix(tl, tr, u);
-            let bot_col = mix(bl, br, u);
-            let col = mix(top_col, bot_col, v);
-            mesh.colored_vertex(point, col);
+    const COLS: usize = 12;
+    const ROWS: usize = 8;
+    let mut mesh = Mesh::default();
+    for y in 0..=ROWS {
+        let v = y as f32 / ROWS as f32;
+        let row_f = v * (rows.len() - 1) as f32;
+        let row = (row_f.floor() as usize).min(rows.len() - 2);
+        let ry = row_f - row as f32;
+        for x in 0..=COLS {
+            let u = x as f32 / COLS as f32;
+            let col_f = u * 3.0;
+            let col = (col_f.floor() as usize).min(2);
+            let cx = col_f - col as f32;
+            let top = rows[row][col].lerp_to_gamma(rows[row][col + 1], cx);
+            let bottom = rows[row + 1][col].lerp_to_gamma(rows[row + 1][col + 1], cx);
+            let color = top.lerp_to_gamma(bottom, ry);
+            mesh.colored_vertex(
+                pos2(rect.left() + rect.width() * u, rect.top() + rect.height() * v),
+                color,
+            );
         }
     }
-    let n = mesh.vertices.len() as u32 - 1;
-    for i in 1..=n { mesh.add_triangle(0, i, if i == n { 1 } else { i + 1 }); }
+    for y in 0..ROWS as u32 {
+        for x in 0..COLS as u32 {
+            let a = y * (COLS as u32 + 1) + x;
+            let b = a + 1;
+            let c = a + COLS as u32 + 1;
+            let d = c + 1;
+            mesh.add_triangle(a, b, d);
+            mesh.add_triangle(a, d, c);
+        }
+    }
     ui.painter().add(Shape::mesh(mesh));
 }
 
@@ -354,27 +366,84 @@ fn slider(ui: &mut Ui, val: &mut f32, lo: f32, hi: f32, width: f32) {
     p.circle_filled(pos2(x, cy), 6.0, TEXT);
 }
 
-/// Monitor picture for one frame: the raw video when no effect is active (and it is 16:9),
-/// otherwise the frame composited into a 16:9 canvas with the clip's effects applied.
-fn preview_image(
-    f: &media::Frame,
-    params: &[f32; NPARAM],
-    effects: &[EffectInstance],
-    local_time: f64,
-    clip_duration: f64,
-) -> (ColorImage, f32) {
-    let asp = f.w as f32 / f.h.max(1) as f32;
-    let neutral = (0..NPARAM).all(|i| (params[i] - PARAMS[i].def).abs() < 1e-4);
-    let no_effects = effects.iter().all(|e| !e.enabled);
-    if neutral && no_effects && (asp - 16.0 / 9.0).abs() < 0.02 {
-        // alpha is always 255 after the RGBA conversion, so premultiplied == straight
-        return (ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba), asp);
+/// Blend one premultiplied RGBA layer over another. The renderer produces premultiplied
+/// pixels, matching egui's `ColorImage::from_rgba_premultiplied` convention.
+fn composite_over(dst: &mut [u8], src: &[u8], mode: BlendMode) {
+    if mode == BlendMode::Normal {
+        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            let inv_a = 255u32 - s[3] as u32;
+            for c in 0..3 {
+                d[c] = (s[c] as u32 + (d[c] as u32 * inv_a + 127) / 255).min(255) as u8;
+            }
+            d[3] = (s[3] as u32 + (d[3] as u32 * inv_a + 127) / 255).min(255) as u8;
+        }
+        return;
     }
-    let cw = f.w.max(320) & !1;
-    let ch = (cw * 9 / 16) & !1;
-    let mut buf = vec![0u8; cw * ch * 4];
-    fxrender::render_with_effects(&f.rgba, f.w, f.h, params, effects, local_time, clip_duration, &mut buf, cw, ch);
-    (ColorImage::from_rgba_premultiplied([cw, ch], &buf), cw as f32 / ch as f32)
+
+    // W3C source-over blend formula for premultiplied RGBA. This keeps chroma-key and
+    // feathered-mask alpha correct rather than treating transparent pixels as black paint.
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let sa = s[3] as f32 / 255.0;
+        if sa <= 0.00001 { continue; }
+        let da = d[3] as f32 / 255.0;
+        let out_a = sa + da * (1.0 - sa);
+        for c in 0..3 {
+            let sp = s[c] as f32 / 255.0;
+            let dp = d[c] as f32 / 255.0;
+            let cs = (sp / sa).clamp(0.0, 1.0);
+            let cb = if da > 0.00001 { (dp / da).clamp(0.0, 1.0) } else { 0.0 };
+            let blended = match mode {
+                BlendMode::Multiply => cs * cb,
+                BlendMode::Screen => cs + cb - cs * cb,
+                BlendMode::Overlay => if cb <= 0.5 { 2.0 * cs * cb } else { 1.0 - 2.0 * (1.0 - cs) * (1.0 - cb) },
+                BlendMode::Add => (cs + cb).min(1.0),
+                BlendMode::Difference => (cb - cs).abs(),
+                BlendMode::Darken => cs.min(cb),
+                BlendMode::Lighten => cs.max(cb),
+                BlendMode::Normal => cs,
+            };
+            let out_premul = (1.0 - sa) * dp + (1.0 - da) * sp + sa * da * blended;
+            d[c] = (out_premul * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        d[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Compose every active video clip from V1 upward into one transparent 16:9 monitor image.
+/// Each clip is rendered independently so its own effects, keying, transform and opacity are
+/// applied before alpha compositing, just like the layer order used by export.
+fn preview_composite(
+    clips: &[Clip],
+    frames: &[(u32, &media::Frame)],
+    t: f64,
+    output: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Option<ColorImage> {
+    if clips.is_empty() || frames.is_empty() { return None; }
+    let cw = frames.iter().map(|(_, f)| f.w).max().unwrap_or(640).max(320) & !1;
+    let ch = ((cw * 9 / 16).max(2)) & !1;
+    let bytes = cw.checked_mul(ch)?.checked_mul(4)?;
+    output.resize(bytes, 0);
+    output.fill(0); // transparent canvas: keyed footage can reveal the monitor checkerboard
+    scratch.resize(bytes, 0);
+
+    let mut rendered_any = false;
+    for (clip_index, clip) in clips.iter().enumerate() {
+        let Some(media_id) = clip.media else { continue };
+        // Engine holds one decoder per media ID. When the exact same source is stacked twice,
+        // display only its highest occurrence rather than reusing one decoded timestamp twice.
+        if clips.iter().skip(clip_index + 1).any(|later| later.media == Some(media_id)) { continue; }
+        let Some((_, frame)) = frames.iter().find(|(id, _)| *id == media_id) else { continue };
+        let params = clip.fx.eval(clip.fx_time(t));
+        let local_time = (t - clip.start).max(0.0);
+        fxrender::render_with_effects_mask(
+            &frame.rgba, frame.w, frame.h, &params, &clip.effects, clip.mask.as_ref(),
+            local_time, clip.dur, scratch, cw, ch,
+        );
+        composite_over(output, scratch, clip.blend_mode);
+        rendered_any = true;
+    }
+    rendered_any.then(|| ColorImage::from_rgba_premultiplied([cw, ch], output))
 }
 
 fn level_meter(ui: &Ui, rect: Rect, l: f32, r: f32) {
@@ -454,6 +523,17 @@ fn monitor_panel(
         let aw = area.width().min(area.height() * asp);
         let r = Rect::from_center_size(area.center(), vec2(aw, aw / asp));
         if let Some((id, _)) = video {
+            // Transparent pixels from Chroma Key / alpha effects reveal a neutral checkerboard.
+            // It is clipped to the monitor image bounds and disappears under fully opaque footage.
+            let checker = ui.painter().with_clip_rect(r);
+            let tile = 16.0;
+            let nx = (r.width() / tile).ceil() as usize;
+            let ny = (r.height() / tile).ceil() as usize;
+            for yy in 0..ny { for xx in 0..nx {
+                let cell = Rect::from_min_size(r.min + vec2(xx as f32 * tile, yy as f32 * tile), vec2(tile, tile));
+                let shade = if (xx + yy) % 2 == 0 { 42 } else { 58 };
+                checker.rect_filled(cell, 0.0, rgba(shade, shade + 3, shade + 8, 255));
+            }}
             Image::new(load::SizedTexture::new(id, r.size())).rounding(6.0).paint_at(ui, r);
         } else {
             rounded_gradient(ui.painter(), r, 6.0, rgba(0x22, 0x28, 0x38, 255), rgba(0x17, 0x1A, 0x24, 255));
@@ -498,14 +578,15 @@ fn placeholder(ui: &mut Ui, text: &str) {
 const CLIP_NAMES: [&str; 10] = [
     "Cabana", "Mountain gold", "Jungle forest", "Hammock", "Waterfall", "Beach", "Pool", "Rocks", "Trail", "Canopy",
 ];
-const EFFECTS: [(&str, &[&str]); 7] = [
+const EFFECTS: [(&str, &[&str]); 8] = [
     ("Distortion", &["Wave Warp", "Ripple", "Twirl", "RGB Split"]),
     ("Blur & Sharpen", &["Gaussian Blur", "Lens Blur", "Directional Motion Blur", "Sharpen"]),
     ("Light & Texture", &["Glow", "Vignette", "Film Grain", "Scanlines"]),
-    ("Color Looks", &["Sepia Tone", "Black & White", "Invert Colors", "Posterize", "Color Temperature"]),
+    ("Color Looks", &["Sepia Tone", "Black & White", "Invert Colors", "Posterize", "Color Temperature", "Duotone", "Thermal Vision", "Solarize"]),
     ("Retro & Detail", &["VHS / Tape", "Edge Detect"]),
-    ("Stylize", &["Pixelate", "Mirror"]),
+    ("Stylize", &["Pixelate", "Mirror", "Halftone Print", "Emboss"]),
     ("Flash & Fade", &["Flash", "Fade In", "Fade Out"]),
+    ("Keying & Compositing", &["Chroma Key"]),
 ];
 
 struct Browser {
@@ -620,7 +701,7 @@ fn browser_panel(
                         let label = kind.label();
                         if !q.is_empty() && !label.to_lowercase().contains(&q) { continue; }
                         let selected = b.transition_sel == Some(kind);
-                        let fill = if selected { rgba(200, 140, 115, 70) } else { Color32::TRANSPARENT };
+                        let fill = if selected { rgba(20, 150, 245, 86) } else { Color32::TRANSPARENT };
                         let resp = ui.add_sized(
                             [ui.available_width(), 28.0],
                             Button::new(label).fill(fill).frame(false).sense(Sense::click_and_drag()),
@@ -937,8 +1018,9 @@ struct App {
     effect_drag: Option<EffectKind>,
     transition_drag: Option<TransitionKind>,
     ghost: Option<Ghost>,
-    last_params: Option<[f32; NPARAM]>,
-    last_effects: Option<Vec<EffectInstance>>,
+    last_layers_state: Option<Vec<(u32, [f32; NPARAM], Vec<EffectInstance>, f64)>>,
+    composite_buffer: Vec<u8>,
+    layer_buffer: Vec<u8>,
     autosave_path: PathBuf,
     last_change: Instant,
     last_autosave: Instant,
@@ -983,8 +1065,9 @@ impl App {
             effect_drag: None,
             transition_drag: None,
             ghost: None,
-            last_params: None,
-            last_effects: None,
+            last_layers_state: None,
+            composite_buffer: Vec::new(),
+            layer_buffer: Vec::new(),
             autosave_path,
             last_change: now,
             last_autosave: now,
@@ -1564,24 +1647,32 @@ impl eframe::App for App {
             muted,
             self.proj.audio_gain_at(self.t),
         );
-        // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
-        let new_frame = self.engine.poll(self.t).is_some();
-        let active = self.proj.video_clip_at(self.t).map(|c| {
-            (c.fx.eval(c.fx_time(self.t)), c.effects.clone(), (self.t - c.start).max(0.0), c.dur)
-        });
-        let params = active.as_ref().map(|a| a.0);
-        let effects = active.as_ref().map(|a| a.1.clone());
-        let effects_changed = effects != self.last_effects;
-        if new_frame || params != self.last_params || effects_changed {
-            self.last_params = params;
-            self.last_effects = effects.clone();
-            if let (Some(f), Some(pr), Some((_, fx, local_time, dur))) = (self.engine.current(), params, active) {
-                let (img, aspect) = preview_image(f, &pr, &fx, local_time, dur);
-                self.tex_aspect = aspect;
+        // Poll every active video decoder, then refresh the monitor when any layer advances
+        // or when an animated transform/effect value changes at the playhead.
+        let new_frame = self.engine.poll_layers(self.t);
+        let active_clips: Vec<Clip> = self.proj.video_clips_at(self.t).into_iter().cloned().collect();
+        let layer_state: Vec<(u32, [f32; NPARAM], Vec<EffectInstance>, f64)> = active_clips.iter()
+            .map(|clip| {
+                // Quantize animated-effect invalidation to the editor frame rate: do not
+                // re-render the whole stack on every egui repaint between video frames.
+                let frame_time = (self.t * FPS).round() / FPS;
+                (clip.id, clip.fx.eval(clip.fx_time(self.t)), clip.effects.clone(), (frame_time - clip.start).max(0.0))
+            })
+            .collect();
+        let layers_changed = self.last_layers_state.as_ref() != Some(&layer_state);
+        if new_frame || layers_changed {
+            self.last_layers_state = Some(layer_state);
+            let frames = self.engine.layer_frames_at(self.t);
+            if let Some(img) = preview_composite(
+                &active_clips, &frames, self.t, &mut self.composite_buffer, &mut self.layer_buffer,
+            ) {
+                self.tex_aspect = 16.0 / 9.0;
                 match &mut self.tex {
-                    Some(t) => t.set(img, TextureOptions::LINEAR),
-                    None => self.tex = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
+                    Some(texture) => texture.set(img, TextureOptions::LINEAR),
+                    None => self.tex = Some(ctx.load_texture("video-composite", img, TextureOptions::LINEAR)),
                 }
+            } else if active_clips.is_empty() {
+                self.tex = None;
             }
         }
         if !self.engine.is_active() {
