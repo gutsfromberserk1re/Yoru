@@ -6,6 +6,12 @@
 //!   * Ripple (B), Rolling (N), Slip (Y), Razor (C), Zoom (Z), Hand (H)
 //!   * magnetic snapping to clip edges + playhead (toggle with S)
 //!   * smooth animated zoom, edge auto-scroll while dragging, follow-playhead
+//!
+//! Track layout: every track has an animated visibility factor (`vis`, 0..1). Row geometry is a
+//! pure function of those factors, computed once per frame and cached, so tracks grow and shrink
+//! smoothly instead of popping. While a clip is being dragged the visible track count may only
+//! GROW; it shrinks back to the used tracks after the drop. That removes the layout <-> pointer
+//! feedback loop that made dragging a clip down through many tracks flicker.
 
 use super::*;
 use crate::project::{nearest, DragOp, EffectKind, Lane, TransitionKind, NTRACKS, NV, NA};
@@ -17,6 +23,12 @@ const EDGE: f32 = 7.0; // trim handle width (px)
 const SNAP_PX: f64 = 9.0;
 const MIN_PPS: f64 = 0.4;
 const MAX_PPS: f64 = 600.0;
+/// Speed of the track grow/shrink animation (1/s): ~94% settled after 0.1 s.
+const LANE_ANIM: f64 = 28.0;
+/// Fresh upward/downward pointer travel (px) needed before a drag reveals one more empty track.
+const REVEAL_STEP: f32 = 10.0;
+/// Rows thinner than this are not hit-testable or drawn (they are mid grow/shrink animation).
+const MIN_ROW: f32 = 3.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -68,8 +80,14 @@ struct Drag {
     right: Option<u32>, // rolling edit: the clip on the other side of the cut
     grab_t: f64,
     grab_y: f32,
+    /// Pointer y at the last track reveal (or at the grab): the next reveal needs fresh travel.
+    ref_y: f32,
     pre: Vec<Clip>,
     sel: Vec<u32>,
+    /// Snap targets of the pre-drag project (without the clips being edited), built once at the
+    /// press instead of on every mouse move. Using the pre-drag state also stops ripple trims
+    /// from snapping to edges that move along with the clip.
+    snap: Vec<f64>,
     tool: Tool,
     moved: bool,
     changed: bool,
@@ -97,15 +115,28 @@ pub struct Timeline {
     last_t: f64,
     drag: Option<Drag>,
     snap_line: Option<f64>,
+    /// Snap targets for ruler scrubbing, built when the scrub starts.
+    scrub_snap: Vec<f64>,
     /// Rect of the last frame (the main loop uses it for drops coming from the browser).
     pub view: Rect,
-    /// Visible track counts start at one per media type and grow as clips are dragged.
+    /// Wanted track counts start at one per media type and grow as clips are dragged.
     visible_v: usize,
     visible_a: usize,
+    /// Per-slot animated visibility (0 = collapsed, 1 = full height).
+    vis: [f32; NTRACKS],
+    /// Cached geometry of the last layout: (y offset from the rect top, height) per slot, and the
+    /// lanes that currently take space in display order (highest video lane first).
+    rows: [(f32, f32); NTRACKS],
+    lanes: Vec<Lane>,
 }
 
 impl Timeline {
     pub fn new() -> Self {
+        let mut vis = [0.0f32; NTRACKS];
+        vis[0] = 1.0; // V1
+        if NV < NTRACKS {
+            vis[NV] = 1.0; // A1
+        }
         Self {
             pps: 10.0,
             scroll: 0.0,
@@ -120,9 +151,13 @@ impl Timeline {
             last_t: 0.0,
             drag: None,
             snap_line: None,
+            scrub_snap: Vec::new(),
             view: Rect::NOTHING,
             visible_v: 1,
             visible_a: 1,
+            vis,
+            rows: [(0.0, 0.0); NTRACKS],
+            lanes: Vec::with_capacity(NTRACKS),
         }
     }
 
@@ -134,38 +169,91 @@ impl Timeline {
         (x - r.left() - HEAD) as f64 / self.pps + self.scroll
     }
 
-    /// Display order keeps the highest video lane at the top and A1 at the bottom of the video group.
-    fn order(&self) -> Vec<Lane> {
-        let mut lanes = Vec::with_capacity(self.visible_v + self.visible_a);
-        for n in (0..self.visible_v.min(NV)).rev() { lanes.push(Lane::V(n as u8)); }
-        for n in 0..self.visible_a.min(NA) { lanes.push(Lane::A(n as u8)); }
-        lanes
+    /// Should this track slot be on screen (fully visible) right now?
+    fn wanted(&self, slot: usize) -> bool {
+        if slot < NV {
+            slot < self.visible_v
+        } else {
+            slot - NV < self.visible_a
+        }
     }
 
-    /// (y offset from the rect top, height) per track slot. Track heights adapt to the current
-    /// visible count; adding tracks never changes the outer panel's requested size.
-    fn rows(&self, h: f32) -> [(f32, f32); NTRACKS] {
-        let avail = (h - RULER - 8.0).max(60.0);
-        let video_n = self.visible_v.min(NV).max(1);
-        let audio_n = self.visible_a.min(NA).max(1);
-        let denom = video_n as f32 * 1.45 + audio_n as f32 + 0.8;
-        let ah = ((avail - 6.0) / denom).clamp(13.0, 36.0);
-        let vh = ah * 1.45;
-        let mut out = [(0.0, 0.0); NTRACKS];
-        let mut y = RULER + 3.0;
-        for (i, lane) in self.order().iter().enumerate() {
-            let hh = if lane.is_video() { vh } else { ah };
-            out[lane.slot()] = (y, hh);
-            y += hh + 1.0;
-            if i + 1 == video_n { y += 4.0; }
+    /// Animates every track's visibility factor toward its wanted state and rebuilds the cached
+    /// row geometry. Called once per frame; everything else only reads `rows` / `lanes`.
+    fn update_layout(&mut self, ctx: &Context, h: f32, dt: f64) {
+        let k = ((1.0 - (-dt * LANE_ANIM).exp()) as f32).max(0.05);
+        let mut animating = false;
+        for s in 0..NTRACKS {
+            let target = if self.wanted(s) { 1.0f32 } else { 0.0 };
+            let d = target - self.vis[s];
+            if d.abs() < 0.004 {
+                self.vis[s] = target;
+            } else {
+                self.vis[s] += d * k;
+                animating = true;
+            }
         }
-        out
+        if animating {
+            ctx.request_repaint();
+        }
+        self.relayout(h);
+    }
+
+    /// Display order keeps the highest video lane at the top and A1 at the bottom of the video
+    /// group. Track heights adapt to the (animated) visible count; adding tracks never changes
+    /// the outer panel's requested size.
+    fn relayout(&mut self, h: f32) {
+        let avail = (h - RULER - 8.0).max(60.0);
+        let mut video_w = 0.0f32;
+        let mut audio_w = 0.0f32;
+        for s in 0..NV.min(NTRACKS) {
+            video_w += self.vis[s];
+        }
+        for s in NV..NTRACKS {
+            audio_w += self.vis[s];
+        }
+        let denom = video_w.max(1.0) * 1.45 + audio_w.max(1.0) + 0.8;
+        let ah = ((avail - 6.0) / denom).clamp(10.0, 36.0);
+        let vh = ah * 1.45;
+
+        let mut rows = [(0.0f32, 0.0f32); NTRACKS];
+        self.lanes.clear();
+        let mut y = RULER + 3.0;
+        for n in (0..NV.min(NTRACKS)).rev() {
+            let v = self.vis[n];
+            if v <= 0.001 {
+                continue;
+            }
+            let hh = vh * v;
+            rows[n] = (y, hh);
+            self.lanes.push(Lane::V(n as u8));
+            y += hh + v;
+            if n == 0 {
+                y += 4.0; // gap between the video and audio groups
+            }
+        }
+        for n in 0..NA {
+            let s = NV + n;
+            if s >= NTRACKS {
+                break;
+            }
+            let v = self.vis[s];
+            if v <= 0.001 {
+                continue;
+            }
+            let hh = ah * v;
+            rows[s] = (y, hh);
+            self.lanes.push(Lane::A(n as u8));
+            y += hh + v;
+        }
+        self.rows = rows;
     }
 
     /// Keep every lane that already contains a clip visible. Empty higher lanes are created
     /// only while dragging, which gives a clean V1/A1 starting timeline without a hard ceiling
-    /// of three tracks.
-    fn reveal_used_tracks(&mut self, proj: &Project) {
+    /// of three tracks. With `grow_only` (a clip drag is in flight) the count never shrinks, so
+    /// the rows cannot reflow under the pointer; it settles once the drag ends.
+    fn reveal_used_tracks(&mut self, proj: &Project, grow_only: bool) {
         let mut v = 1usize;
         let mut a = 1usize;
         for c in &proj.clips {
@@ -174,44 +262,61 @@ impl Timeline {
                 Lane::A(n) => a = a.max(n as usize + 1),
             }
         }
-        self.visible_v = v.min(NV).max(1);
-        self.visible_a = a.min(NA).max(1);
+        let v = v.min(NV).max(1);
+        let a = a.min(NA).max(1);
+        if grow_only {
+            self.visible_v = self.visible_v.max(v);
+            self.visible_a = self.visible_a.max(a);
+        } else {
+            self.visible_v = v;
+            self.visible_a = a;
+        }
     }
 
-    /// Dragging a clip beyond the current top/bottom lane grows the appropriate track stack.
-    fn reveal_for_drag(&mut self, rect: Rect, d: &Drag, pos: Pos2) {
-        let Some(origin) = d.pre.iter().find(|c| c.id == d.id) else { return; };
-        let rows = self.rows(rect.height());
-        // Reveal the next lane as the pointer reaches roughly the row boundary, not after
-        // travelling a full row-height beyond it (which would force the cursor outside the panel).
-        let threshold = (rows[origin.lane.slot()].1 * 0.5).max(12.0);
-        match origin.lane {
-            Lane::V(n) if pos.y < d.grab_y => {
-                let steps = ((d.grab_y - pos.y) / threshold).floor() as usize;
-                self.visible_v = self.visible_v.max((n as usize + steps + 1).min(NV));
+    /// Dragging a clip beyond the top video lane (or the bottom audio lane) adds one empty track
+    /// at a time. The trigger only depends on the pointer and on the clip being on the outermost
+    /// lane, never on how big the rows currently are, and every extra track needs fresh pointer
+    /// travel (`ref_y`), so tracks neither flicker nor run away while the pointer rests.
+    fn reveal_for_drag(&mut self, proj: &Project, d: &mut Drag, pos: Pos2) {
+        let Some(c) = proj.clip(d.id) else { return };
+        match c.lane {
+            Lane::V(n) if (n as usize) + 1 >= self.visible_v && self.visible_v < NV => {
+                let (y, h) = self.rows[c.lane.slot()];
+                if d.ref_y - pos.y >= REVEAL_STEP && pos.y < self.view.top() + y + h * 0.35 {
+                    self.visible_v += 1;
+                    d.ref_y = pos.y;
+                }
             }
-            Lane::A(n) if pos.y > d.grab_y => {
-                let steps = ((pos.y - d.grab_y) / threshold).floor() as usize;
-                self.visible_a = self.visible_a.max((n as usize + steps + 1).min(NA));
+            Lane::A(n) if (n as usize) + 1 >= self.visible_a && self.visible_a < NA => {
+                let (y, h) = self.rows[c.lane.slot()];
+                if pos.y - d.ref_y >= REVEAL_STEP && pos.y > self.view.top() + y + h * 0.65 {
+                    self.visible_a += 1;
+                    d.ref_y = pos.y;
+                }
             }
             _ => {}
         }
     }
 
     fn lane_rect(&self, rect: Rect, lane: Lane) -> Rect {
-        let (y, hh) = self.rows(rect.height())[lane.slot()];
+        let (y, hh) = self.rows[lane.slot()];
         Rect::from_min_size(pos2(rect.left() + HEAD, rect.top() + y), vec2(rect.width() - HEAD, hh))
     }
 
     /// Track under screen y. `strict`: only inside the row; otherwise the nearest row.
     fn lane_at(&self, rect: Rect, y: f32, strict: bool) -> Option<Lane> {
-        let rows = self.rows(rect.height());
         let yr = y - rect.top();
         let mut best: Option<(f32, Lane)> = None;
-        for lane in self.order() {
-            let (ly, lh) = rows[lane.slot()];
+        for &lane in &self.lanes {
+            let (ly, lh) = self.rows[lane.slot()];
+            if lh < MIN_ROW {
+                continue;
+            }
             if yr >= ly && yr < ly + lh {
                 return Some(lane);
+            }
+            if strict {
+                continue;
             }
             let d = (yr - (ly + lh * 0.5)).abs();
             if best.map_or(true, |b| d < b.0) {
@@ -223,6 +328,19 @@ impl Timeline {
         } else {
             best.map(|b| b.1)
         }
+    }
+
+    /// Lane a dragged clip should land on. The lane it is already on is kept until the pointer
+    /// is a few pixels past its edge, so the clip does not flip back and forth on a row boundary.
+    fn lane_for_drag(&self, rect: Rect, y: f32, current: Option<Lane>) -> Option<Lane> {
+        if let Some(cur) = current {
+            let (ly, lh) = self.rows[cur.slot()];
+            let yr = y - rect.top();
+            if lh >= MIN_ROW && yr >= ly - 3.0 && yr < ly + lh + 3.0 {
+                return Some(cur);
+            }
+        }
+        self.lane_at(rect, y, false)
     }
 
     fn clip_rect(&self, rect: Rect, c: &Clip) -> Rect {
@@ -276,6 +394,10 @@ impl Timeline {
         let w = (self.view.width() - HEAD - 30.0).max(100.0) as f64;
         self.zoom_to(w / total.max(1.0), 0.0, 0.0);
     }
+    /// Keeps the view from being panned or auto-scrolled infinitely far past the project.
+    fn clamp_scroll(&mut self, limit: f64) {
+        self.scroll = self.scroll.min(limit.max(0.0)).max(0.0);
+    }
 
     // ---------------------------------------------------------------- snapping
     fn snap_thr(&self) -> f64 {
@@ -297,11 +419,38 @@ impl Timeline {
         }
     }
 
-    fn scrub_to(&mut self, proj: &Project, rect: Rect, x: f32, t: &mut f64) {
+    /// Closest snap point to `v` among pre-built targets plus the playhead.
+    #[allow(clippy::ptr_arg)]
+    fn snap_near(targets: &Vec<f64>, playhead: f64, v: f64, thr: f64) -> Option<f64> {
+        let a = nearest(targets, v, thr);
+        let b = ((playhead - v).abs() <= thr).then_some(playhead);
+        match (a, b) {
+            (Some(x), Some(y)) => Some(if (x - v).abs() <= (y - v).abs() { x } else { y }),
+            (a, None) => a,
+            (None, b) => b,
+        }
+    }
+
+    /// Snap a single edit point using the targets cached in the drag.
+    fn snap_cached(&mut self, targets: &Vec<f64>, v: f64, playhead: f64) -> f64 {
+        self.snap_line = None;
+        if !self.snap {
+            return v;
+        }
+        match Self::snap_near(targets, playhead, v, self.snap_thr()) {
+            Some(x) => {
+                self.snap_line = Some(x);
+                x
+            }
+            None => v,
+        }
+    }
+
+    fn scrub_to(&mut self, rect: Rect, x: f32, t: &mut f64) {
         let mut tt = self.t_of(rect, x).clamp(0.0, duration());
         self.snap_line = None;
         if self.snap {
-            if let Some(s) = nearest(&proj.snap_targets(&[]), tt, self.snap_thr()) {
+            if let Some(s) = nearest(&self.scrub_snap, tt, self.snap_thr()) {
                 tt = s;
                 self.snap_line = Some(s);
             }
@@ -340,9 +489,11 @@ impl Timeline {
 
     /// Lock / eye / mute buttons. True if something changed.
     fn header_click(&self, rect: Rect, pos: Pos2, proj: &mut Project) -> bool {
-        let rows = self.rows(rect.height());
-        for lane in self.order() {
-            let (y, hh) = rows[lane.slot()];
+        for &lane in &self.lanes {
+            let (y, hh) = self.rows[lane.slot()];
+            if hh < MIN_ROW {
+                continue;
+            }
             let r = Rect::from_min_size(pos2(rect.left(), rect.top() + y), vec2(HEAD, hh));
             if r.contains(pos) {
                 let (lock, eye) = Self::header_buttons(r);
@@ -363,24 +514,20 @@ impl Timeline {
     fn drag_step(&mut self, proj: &mut Project, d: &Drag, pos: Pos2, rect: Rect, playhead: f64) -> bool {
         let Some(o) = d.pre.iter().find(|c| c.id == d.id).cloned() else { return false };
         let tt = self.t_of(rect, pos.x);
-        let ids = proj.group_ids(d.id);
         self.snap_line = None;
 
         let op = if let Some(right) = d.right {
-            let nt = self.snap_edit(proj, tt, &ids, playhead);
+            let nt = self.snap_cached(&d.snap, tt, playhead);
             DragOp::Roll { new_t: nt, right }
         } else {
             match (d.zone, d.tool) {
                 (Zone::Body, Tool::Slip) => DragOp::Slip { delta: tt - d.grab_t },
                 (Zone::Body, _) => {
-                    let mv = proj.move_set(d.id, &d.sel);
                     let mut ns = (tt - (d.grab_t - o.start)).max(0.0);
                     if self.snap {
-                        let mut tg = proj.snap_targets(&mv);
-                        tg.push(playhead);
                         let thr = self.snap_thr();
-                        let head = nearest(&tg, ns, thr).map(|x| (x - ns, x));
-                        let tail = nearest(&tg, ns + o.dur, thr).map(|x| (x - (ns + o.dur), x));
+                        let head = Self::snap_near(&d.snap, playhead, ns, thr).map(|x| (x - ns, x));
+                        let tail = Self::snap_near(&d.snap, playhead, ns + o.dur, thr).map(|x| (x - (ns + o.dur), x));
                         let pick = match (head, tail) {
                             (Some(a), Some(b)) => Some(if a.0.abs() <= b.0.abs() { a } else { b }),
                             (a, None) => a,
@@ -391,14 +538,15 @@ impl Timeline {
                             self.snap_line = Some(line);
                         }
                     }
-                    DragOp::Move { new_start: ns, new_lane: self.lane_at(rect, pos.y, false) }
+                    let current = proj.clip(d.id).map(|c| c.lane);
+                    DragOp::Move { new_start: ns, new_lane: self.lane_for_drag(rect, pos.y, current) }
                 }
                 (Zone::Left, tool) => {
-                    let ns = self.snap_edit(proj, tt, &ids, playhead);
+                    let ns = self.snap_cached(&d.snap, tt, playhead);
                     DragOp::TrimL { new_start: ns, ripple: tool == Tool::Ripple }
                 }
                 (Zone::Right, tool) => {
-                    let ne = self.snap_edit(proj, tt, &ids, playhead);
+                    let ne = self.snap_cached(&d.snap, tt, playhead);
                     DragOp::TrimR { new_end: ne, ripple: tool == Tool::Ripple }
                 }
             }
@@ -475,14 +623,27 @@ impl Timeline {
                     };
                     if draggable {
                         let zone = if self.tool == Tool::Slip { Zone::Body } else { zone };
+                        // snap targets are built once here (the project is still in its pre-drag
+                        // state), excluding exactly the clips this edit moves
+                        let snap = if self.tool == Tool::Slip {
+                            Vec::new()
+                        } else if zone == Zone::Body {
+                            let mv = proj.move_set(grabbed, &self.sel);
+                            proj.snap_targets(&mv)
+                        } else {
+                            let ids = proj.group_ids(grabbed);
+                            proj.snap_targets(&ids)
+                        };
                         self.drag = Some(Drag {
                             zone,
                             id: grabbed,
                             right,
                             grab_t: tt,
                             grab_y: pos.y,
+                            ref_y: pos.y,
                             pre: proj.clips.clone(),
                             sel: self.sel.clone(),
+                            snap,
                             tool: self.tool,
                             moved: false,
                             changed: false,
@@ -502,6 +663,7 @@ impl Timeline {
     }
 
     /// Returns (edited, seeked).
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -515,7 +677,9 @@ impl Timeline {
         transition_duration: f32,
     ) -> (bool, bool) {
         self.view = rect;
-        self.reveal_used_tracks(proj);
+        // while a clip drag is in flight the track count may only grow (see module docs)
+        let dragging = self.drag.is_some();
+        self.reveal_used_tracks(proj, dragging);
         let (mut edited, mut seeked) = (false, false);
         let (hover, pressed, down, released, delta, scroll, zoom, mods, dt) = ui.input(|i| {
             (
@@ -530,8 +694,10 @@ impl Timeline {
                 i.stable_dt as f64,
             )
         });
+        let dt = dt.clamp(0.0, 0.05);
         let over = ui.rect_contains_pointer(rect);
         let content_left = rect.left() + HEAD;
+        let scroll_limit = proj.end().max(duration());
 
         // animated zoom
         if (self.pps_target - self.pps).abs() > self.pps * 0.003 {
@@ -558,10 +724,42 @@ impl Timeline {
                     }
                 } else if yrel < RULER {
                     self.scrub = true;
-                    self.scrub_to(proj, rect, pos.x, t);
+                    self.scrub_snap = proj.snap_targets(&[]);
+                    self.scrub_to(rect, pos.x, t);
                     seeked = true;
                 } else {
                     edited |= self.press_tracks(proj, rect, pos, mods, *t);
+                }
+            }
+        }
+
+        // ---- edge auto-scroll while dragging near the left/right edge. Runs before the drag step
+        //      so the dragged clip follows the scroll in the same frame (no one-frame lag), and
+        //      speeds up the closer the pointer gets to (or beyond) the edge.
+        if down && (self.scrub || self.drag.is_some() || self.marquee.is_some()) {
+            if let Some(p) = hover {
+                const ZONE: f32 = 36.0;
+                let left = p.x < content_left + ZONE;
+                let depth = if left {
+                    (content_left + ZONE - p.x) / ZONE
+                } else if p.x > rect.right() - ZONE {
+                    (p.x - (rect.right() - ZONE)) / ZONE
+                } else {
+                    0.0
+                };
+                if depth > 0.0 {
+                    let px_per_s = 250.0 + 1150.0 * (depth.min(1.5) as f64);
+                    let ds = px_per_s * dt / self.pps;
+                    let before = self.scroll;
+                    if left {
+                        self.scroll = (self.scroll - ds).max(0.0);
+                    } else {
+                        self.scroll += ds;
+                    }
+                    self.clamp_scroll(scroll_limit);
+                    if self.scroll != before {
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
         }
@@ -574,7 +772,7 @@ impl Timeline {
                     if d.moved || (tt - d.grab_t).abs() * self.pps > 3.0 || (p.y - d.grab_y).abs() > 6.0 {
                         d.moved = true; // dead zone so a plain click never edits
                         if d.zone == Zone::Body && d.tool == Tool::Select {
-                            self.reveal_for_drag(rect, &d, p);
+                            self.reveal_for_drag(proj, &mut d, p);
                         }
                         d.changed = self.drag_step(proj, &d, p, rect, *t);
                     }
@@ -662,30 +860,17 @@ impl Timeline {
             if down {
                 if self.scrub {
                     if let Some(p) = hover {
-                        self.scrub_to(proj, rect, p.x, t);
+                        self.scrub_to(rect, p.x, t);
                         seeked = true;
                     }
                 } else {
                     self.scroll = (self.scroll - delta.x as f64 / self.pps).max(0.0);
+                    self.clamp_scroll(scroll_limit);
                 }
             } else {
                 self.scrub = false;
                 self.panning = false;
                 self.snap_line = None;
-            }
-        }
-
-        // ---- edge auto-scroll while dragging near the left/right edge
-        if down && (self.scrub || self.drag.is_some() || self.marquee.is_some()) {
-            if let Some(p) = hover {
-                let speed = 900.0 * dt / self.pps;
-                if p.x < content_left + 26.0 {
-                    self.scroll = (self.scroll - speed).max(0.0);
-                    ui.ctx().request_repaint();
-                } else if p.x > rect.right() - 26.0 {
-                    self.scroll += speed;
-                    ui.ctx().request_repaint();
-                }
             }
         }
 
@@ -700,6 +885,7 @@ impl Timeline {
             } else if scroll != Vec2::ZERO {
                 let d = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
                 self.scroll = (self.scroll - d as f64 * 0.8 / self.pps).max(0.0);
+                self.clamp_scroll(scroll_limit);
             }
         }
 
@@ -739,6 +925,9 @@ impl Timeline {
             }
         }
 
+        // animate the track rows and rebuild the cached geometry for this frame's paint
+        self.update_layout(ui.ctx(), rect.height(), dt);
+
         self.paint(ui, rect, *t, if over && !self.scrub { hover } else { None }, proj, assets, ghost);
         (edited, seeked)
     }
@@ -752,9 +941,11 @@ impl Timeline {
         let font = FontId::monospace(8.0);
 
         // ---- track rows + headers
-        let rows = self.rows(rect.height());
-        for lane in self.order() {
-            let (y, hh) = rows[lane.slot()];
+        for &lane in &self.lanes {
+            let (y, hh) = self.rows[lane.slot()];
+            if hh < 1.0 {
+                continue;
+            }
             let lr = Rect::from_min_size(pos2(content.left(), rect.top() + y), vec2(content.width(), hh));
             let locked = proj.locked[lane.slot()];
             let hidden = proj.hidden[lane.slot()];
@@ -763,6 +954,9 @@ impl Timeline {
 
             let hr = Rect::from_min_size(pos2(rect.left(), rect.top() + y), vec2(HEAD, hh));
             p_all.rect_filled(hr, 0.0, rgba(8, 14, 36, 150));
+            if hh < 11.0 {
+                continue; // mid grow/shrink animation: skip the text and buttons
+            }
             p_all.text(
                 pos2(hr.left() + 8.0, hr.center().y),
                 Align2::LEFT_CENTER,
@@ -786,6 +980,19 @@ impl Timeline {
             [pos2(content.left(), rect.top() + RULER), pos2(content.left(), rect.bottom())],
             Stroke::new(1.0, rgba(145, 151, 160, 70)),
         );
+
+        // ---- the track the dragged clip will land on
+        if let Some(d) = &self.drag {
+            if d.moved && d.zone == Zone::Body && d.tool == Tool::Select {
+                if let Some(c) = proj.clip(d.id) {
+                    let lr = self.lane_rect(rect, c.lane);
+                    if lr.height() > MIN_ROW {
+                        p.rect_filled(lr, 0.0, rgba(180, 200, 255, 16));
+                        p.rect_stroke(lr, 0.0, Stroke::new(1.0, rgba(180, 200, 255, 70)));
+                    }
+                }
+            }
+        }
 
         // ---- ruler
         p.rect_filled(Rect::from_min_size(content.min, vec2(content.width(), RULER)), 0.0, rgba(40, 48, 70, 180));
@@ -883,8 +1090,8 @@ impl Timeline {
     fn draw_clip(&self, ui: &Ui, p: &Painter, rect: Rect, c: &Clip, proj: &Project, font: &FontId, assets: &Assets) {
         let lr = self.clip_rect(rect, c);
         let (x0, x1, y, hh) = (lr.left(), lr.right(), lr.top(), lr.height());
-        if x1 < rect.left() + HEAD || x0 > rect.right() {
-            return; // culled
+        if hh < MIN_ROW || x1 < rect.left() + HEAD || x0 > rect.right() {
+            return; // culled (off screen, or its track is still collapsed)
         }
         let r = Rect::from_min_max(pos2(x0 + 0.5, y), pos2((x1 - 0.5).max(x0 + 1.5), y + hh));
         let p = p.with_clip_rect(r.intersect(p.clip_rect()));
