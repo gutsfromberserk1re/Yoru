@@ -243,19 +243,30 @@ fn transform_filters(clip: &Clip, settings: &ExportSettings) -> Vec<String> {
     let t0 = clip.src_off;
     let position_x = clip_param_expr(clip, 0, t0);
     let position_y = clip_param_expr(clip, 1, t0);
-    let scale = clip.fx.base[2].clamp(1.0, 400.0) / 100.0;
-    let rotation = clip.fx.base[3];
+    let scale = clip_param_expr(clip, 2, t0).replace('T', "t");
+    let rotation = clip_param_expr(clip, 3, t0).replace('T', "t");
+    let scale_is_animated = !clip.fx.keys[2].is_empty();
+    let rotation_is_animated = !clip.fx.keys[3].is_empty();
     let brightness = clip_param_expr(clip, 5, t0);
     let contrast = clip_param_expr(clip, 6, t0);
     let saturation = clip_param_expr(clip, 7, t0);
     let mut out = vec![format!("scale={}:{}:force_original_aspect_ratio=decrease:force_divisible_by=2", settings.width, settings.height)];
-    if (scale - 1.0).abs() > 0.001 {
-        out.push(format!("scale=w='max(2,iw*{})':h='max(2,ih*{})':eval=init", fnum(scale), fnum(scale)));
+    if scale_is_animated || clip.fx.base[2] != 100.0 {
+        out.push(format!("scale=w='max(2,iw*max(({scale})/100,0.001))':h='max(2,ih*max(({scale})/100,0.001))':eval=frame"));
     }
-    if rotation.abs() > 0.01 {
-        out.push(format!("rotate={}:ow=rotw(iw):oh=roth(ih):fillcolor=black@0", num(rotation as f64 * std::f64::consts::PI / 180.0)));
+    if rotation_is_animated || clip.fx.base[3].abs() > 0.01 {
+        let angle = format!("({rotation})*PI/180");
+        if rotation_is_animated {
+            // The output dimensions must remain fixed while the angle changes. A diagonal-sized
+            // transparent canvas keeps every rotated frame centered without clipping its corners.
+            out.push(format!("rotate=angle='{angle}':ow='ceil(hypot(iw,ih)/2)*2':oh='ceil(hypot(iw,ih)/2)*2':fillcolor=black@0"));
+        } else {
+            out.push(format!("rotate=angle='{angle}':ow=rotw(iw):oh=roth(ih):fillcolor=black@0"));
+        }
     }
-    if clip.fx.base[5] != 0.0 || clip.fx.base[6] != 100.0 || clip.fx.base[7] != 100.0 {
+    if clip.fx.base[5] != 0.0 || clip.fx.base[6] != 100.0 || clip.fx.base[7] != 100.0
+        || (5..=7).any(|i| !clip.fx.keys[i].is_empty())
+    {
         out.push(format!("eq=brightness='({}-0)/100':contrast='({}/100)':saturation='({}/100)':eval=frame", brightness.replace('T', "t"), contrast.replace('T', "t"), saturation.replace('T', "t")));
     }
     if clip.fx.base[4] < 99.99 || !clip.fx.keys[4].is_empty() {
@@ -270,7 +281,8 @@ fn transform_filters(clip: &Clip, settings: &ExportSettings) -> Vec<String> {
 fn graphic_filter(clip: &Clip, duration: f64, settings: &ExportSettings, label: &str) -> String {
     let g = clip.gfx.as_ref().expect("graphic clip");
     let base_scale = (clip.fx.base[2] / 100.0).max(0.0);
-    let rotation = clip.fx.base[3];
+    let rotation = clip_param_expr(clip, 3, clip.src_off).replace('T', "t");
+    let rotation_is_animated = !clip.fx.keys[3].is_empty();
     let px = clip_param_expr(clip, 0, clip.src_off).replace('T', "t");
     let py = clip_param_expr(clip, 1, clip.src_off).replace('T', "t");
     let sc = clip_param_expr(clip, 2, clip.src_off).replace('T', "t");
@@ -324,12 +336,17 @@ fn graphic_filter(clip: &Clip, duration: f64, settings: &ExportSettings, label: 
                 num(g.outline as f64), alpha(g.outline_color), if g.shadow { "2" } else { "0" }, if g.shadow { "2" } else { "0" }));
         }
     }
-    if rotation.abs() > 0.01 {
-        chain.push_str(&format!(",rotate={}:ow=rotw(iw):oh=roth(ih):fillcolor=black@0", num(rotation as f64 * std::f64::consts::PI / 180.0)));
+    if rotation_is_animated || clip.fx.base[3].abs() > 0.01 {
+        let angle = format!("({rotation})*PI/180");
+        if rotation_is_animated {
+            chain.push_str(&format!(",rotate=angle='{angle}':ow='ceil(hypot(iw,ih)/2)*2':oh='ceil(hypot(iw,ih)/2)*2':fillcolor=black@0"));
+        } else {
+            chain.push_str(&format!(",rotate=angle='{angle}':ow=rotw(iw):oh=roth(ih):fillcolor=black@0"));
+        }
     }
     // geq uses uppercase T for frame time. This keeps opacity keyframes in exported graphic layers.
     let opg = clip_param_expr(clip, 4, clip.src_off);
-    chain.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*min(max(({})/100,0),1)'", opg));
+    chain.push_str(&format!(",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*min(max(({})/100,0),1)*if(gt(({}),0),1,0)'", opg, sc));
     chain.push_str(&format!(",setpts=PTS-STARTPTS+{}/TB[{}]", num(clip.start), label));
     let _ = (static_w, static_h, op);
     chain
@@ -345,7 +362,13 @@ pub fn build_args(project: &Project, output: &Path, settings: &ExportSettings, s
     let video_clips: Vec<Clip> = project.clips.iter().filter(|c| c.lane.is_video() && !project.hidden[c.lane.slot()] && (c.media.is_some() || c.gfx.is_some()) && c.dur > 0.0).cloned().collect();
     if !video_clips.iter().any(|c| c.media.is_some()) { return Err("Add at least one video clip before exporting.".into()); }
 
-    let mut all_clips: Vec<Clip> = project.clips.iter().filter(|c| c.media.is_some() && c.dur > 0.0).cloned().collect();
+    // Only open sources that can contribute to this render. A missing file on a hidden track
+    // must not block export of the visible edit, and omitting hidden clips also avoids redundant
+    // decoder inputs for media the render graph never references.
+    let mut all_clips: Vec<Clip> = project.clips.iter()
+        .filter(|c| !project.hidden[c.lane.slot()] && c.media.is_some() && c.dur > 0.0)
+        .cloned()
+        .collect();
     all_clips.sort_by(|a, b| a.id.cmp(&b.id));
     let mut inputs: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     let mut args: Vec<OsString> = vec!["-hide_banner".into(), "-y".into(), "-loglevel".into(), "error".into(), "-stats_period".into(), "0.25".into(), "-progress".into(), "pipe:1".into(), "-nostats".into()];

@@ -975,6 +975,7 @@ where
 {
     let ch = (cfg.channels as usize).max(1);
     let rate = cfg.sample_rate.0 as f64;
+    let mut current_gain = 1.0f32;
     dev.build_output_stream(
         cfg,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
@@ -985,18 +986,27 @@ where
             let ts = info.timestamp();
             let lat = ts.playback.duration_since(&ts.callback).map_or(0.0, |d| d.as_secs_f64());
             let frames = data.len() / ch;
-            let muted = sh.muted.load(Relaxed);
-            let gain = f32::from_bits(sh.gain.load(Relaxed)).clamp(0.0, 4.0);
+            let target_gain = if sh.muted.load(Relaxed) {
+                0.0
+            } else {
+                f32::from_bits(sh.gain.load(Relaxed)).clamp(0.0, 4.0)
+            };
+            // Smooth monitor gain and mute changes over a short ramp to avoid clicks when
+            // automation crosses a boundary or the user toggles a track's mute button.
+            let ramp_frames = (rate * 0.01).round().max(1.0) as usize;
+            let gain_start = current_gain;
             let mut b = sh.lock();
             let t0 = b.next_t;
             let (mut pl, mut pr) = (0f32, 0f32);
             let mut got = 0usize;
-            for frame in data.chunks_exact_mut(ch) {
+            for (frame_index, frame) in data.chunks_exact_mut(ch).enumerate() {
                 if b.q.len() < 2 {
                     break;
                 }
                 let (l, r) = (b.q.pop_front().unwrap_or(0.0), b.q.pop_front().unwrap_or(0.0));
-                let (l, r) = if muted { (0.0, 0.0) } else { (l * gain, r * gain) }; // still consumed: stays in sync
+                let ramp = ((frame_index + 1).min(ramp_frames) as f32) / ramp_frames as f32;
+                let gain = gain_start + (target_gain - gain_start) * ramp;
+                let (l, r) = (l * gain, r * gain); // muted samples are still consumed: stays in sync
                 pl = pl.max(l.abs());
                 pr = pr.max(r.abs());
                 if ch == 1 {
@@ -1018,6 +1028,7 @@ where
             let advanced = if silent_run { frames } else { got };
             b.next_t += advanced as f64 / rate;
             drop(b);
+            current_gain = target_gain;
             // clock = what is audible *right now* = start of this buffer minus output latency
             sh.clock.set(t0 - lat, !starved || silent_run);
             sh.peak_l.fetch_max(pl.to_bits(), Relaxed);

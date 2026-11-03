@@ -1070,10 +1070,12 @@ struct App {
     last_change: Instant,
     last_autosave: Instant,
     recovery_offer: bool,
+    pending_open: Option<PathBuf>,
     export_open: bool,
     export_settings: export::ExportSettings,
     export_job: Option<export::ExportJob>,
     export_error: Option<String>,
+    file_error: Option<String>,
     proxy_job: Option<export::ExportJob>,
     proxy_target: Option<(u32, PathBuf)>,
     proxy_error: Option<String>,
@@ -1120,10 +1122,12 @@ impl App {
             last_change: now,
             last_autosave: now,
             recovery_offer,
+            pending_open: None,
             export_open: false,
             export_settings: export::ExportSettings::default(),
             export_job: None,
             export_error: None,
+            file_error: None,
             proxy_job: None,
             proxy_target: None,
             proxy_error: None,
@@ -1172,8 +1176,18 @@ impl App {
         let periodic = self.last_autosave.elapsed() >= Duration::from_secs(20);
         if idle || periodic {
             match write_atomic(&self.autosave_path, &self.proj.to_text()) {
-                Ok(()) => self.last_autosave = Instant::now(),
-                Err(e) => eprintln!("Yoru autosave failed at {}: {e}", self.autosave_path.display()),
+                Ok(()) => {
+                    self.last_autosave = Instant::now();
+                    if self.file_error.as_deref().is_some_and(|error| error.starts_with("Autosave failed")) {
+                        self.file_error = None;
+                    }
+                }
+                Err(e) => {
+                    self.last_autosave = Instant::now(); // throttle retries after an I/O failure
+                    if self.file_error.is_none() {
+                        self.file_error = Some(format!("Autosave failed at {}: {e}", self.autosave_path.display()));
+                    }
+                }
             }
         }
     }
@@ -1219,12 +1233,13 @@ impl App {
                 self.last_change = Instant::now();
                 self.last_autosave = Instant::now();
                 self.recovery_offer = false;
+                self.file_error = None;
                 set_duration(self.proj.end().max(10.0));
                 self.timeline.fit(duration());
                 self.jumped = true;
             }
             Err(e) => {
-                eprintln!("cannot recover Yoru autosave: {e}");
+                self.file_error = Some(format!("Could not recover the autosave: {e}"));
                 self.recovery_offer = false;
             }
         }
@@ -1374,13 +1389,40 @@ impl App {
                 self.last_autosave = Instant::now();
                 self.clear_autosave();
                 self.recovery_offer = false;
+                self.file_error = None;
             }
-            Err(e) => eprintln!("cannot save {}: {e}", path.display()),
+            Err(e) => self.file_error = Some(format!("Could not save {}: {e}", path.display())),
         }
     }
 
+    fn file_error_window(&mut self, ctx: &Context) {
+        let Some(error) = self.file_error.clone() else { return };
+        let mut open = true;
+        Window::new("File Error")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(error).color(rgba(255, 130, 130, 255)));
+                if ui.button("OK").clicked() { self.file_error = None; }
+            });
+        if !open { self.file_error = None; }
+    }
+
     fn open_project(&mut self, ctx: &Context) {
+        if self.recovery_offer {
+            return;
+        }
         let Some(path) = Self::project_file_dialog().pick_file() else { return };
+        if self.dirty {
+            self.pending_open = Some(path);
+        } else {
+            self.open_project_path(ctx, path);
+        }
+    }
+
+    fn open_project_path(&mut self, ctx: &Context, path: PathBuf) {
         let loaded = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Project::from_text(&t));
         match loaded {
             Ok(p) => {
@@ -1401,8 +1443,9 @@ impl App {
                 self.last_autosave = Instant::now();
                 self.clear_autosave();
                 self.recovery_offer = false;
+                self.file_error = None;
             }
-            Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+            Err(e) => self.file_error = Some(format!("Could not open {}: {e}", path.display())),
         }
     }
 
@@ -1673,6 +1716,36 @@ impl eframe::App for App {
                     self.clear_autosave();
                     self.recovery_offer = false;
                 }
+                _ => {}
+            }
+        }
+
+        if self.pending_open.is_some() {
+            let mut choice = 0; // 1 = save then open, 2 = discard then open, 3 = cancel
+            Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Save changes to this project before opening another one?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save and Open").clicked() { choice = 1; }
+                        if ui.button("Discard and Open").clicked() { choice = 2; }
+                        if ui.button("Cancel").clicked() { choice = 3; }
+                    });
+                });
+            match choice {
+                1 => {
+                    self.save_project(false);
+                    if !self.dirty {
+                        if let Some(path) = self.pending_open.take() { self.open_project_path(ctx, path); }
+                    }
+                }
+                2 => {
+                    if let Some(path) = self.pending_open.take() { self.open_project_path(ctx, path); }
+                }
+                3 => self.pending_open = None,
                 _ => {}
             }
         }
@@ -1990,6 +2063,7 @@ impl eframe::App for App {
         if export_clicked { self.export_open = true; }
         self.export_windows(ctx);
         self.proxy_windows(ctx);
+        self.file_error_window(ctx);
     }
 }
 

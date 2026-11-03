@@ -1246,20 +1246,35 @@ impl Project {
         self.expand(&all)
     }
 
-    /// Re-derives the clip list from `pre` with the drag applied (no drift, no accumulated error).
-    /// Returns true if anything differs from `pre`. Does NOT touch undo.
+    /// Re-derives the timeline geometry from `pre` with the drag applied (no drift or accumulated
+    /// error). During a drag the clip list is structurally stable and only lane/start/duration/source
+    /// offset change, so restore those fields in place instead of deep-cloning every clip and its
+    /// effects/keyframes on each pointer update. Returns true if geometry differs from `pre`.
+    /// Does NOT touch undo.
     pub fn apply_drag(&mut self, pre: &[Clip], id: u32, sel: &[u32], op: DragOp) -> bool {
-        self.clips = pre.to_vec();
-        let Some(o) = pre.iter().find(|c| c.id == id).cloned() else { return false };
+        let same_clips = self.clips.len() == pre.len()
+            && self.clips.iter().zip(pre).all(|(current, original)| current.id == original.id);
+        if !same_clips {
+            self.clips = pre.to_vec();
+        } else {
+            for (current, original) in self.clips.iter_mut().zip(pre) {
+                current.lane = original.lane;
+                current.start = original.start;
+                current.dur = original.dur;
+                current.src_off = original.src_off;
+            }
+        }
+        let Some(o) = pre.iter().find(|c| c.id == id) else { return false };
         let ids = self.group_ids(id);
 
         match op {
             DragOp::Move { new_start, new_lane } => {
                 let mv = self.move_set(id, sel);
-                let min_start = pre.iter().filter(|c| mv.contains(&c.id)).map(|c| c.start).fold(f64::INFINITY, f64::min);
+                let moving: std::collections::HashSet<u32> = mv.iter().copied().collect();
+                let min_start = pre.iter().filter(|c| moving.contains(&c.id)).map(|c| c.start).fold(f64::INFINITY, f64::min);
                 let d = (new_start - o.start).max(-min_start);
                 let target = new_lane.filter(|l| *l != o.lane && l.is_video() == o.lane.is_video() && !self.is_locked(*l));
-                for c in self.clips.iter_mut().filter(|c| mv.contains(&c.id)) {
+                for c in self.clips.iter_mut().filter(|c| moving.contains(&c.id)) {
                     c.start += d;
                     if c.id == id {
                         if let Some(l) = target {
@@ -1325,7 +1340,7 @@ impl Project {
                 }
             }
             DragOp::Roll { new_t, right } => {
-                let Some(r0) = pre.iter().find(|c| c.id == right).cloned() else { return false };
+                let Some(r0) = pre.iter().find(|c| c.id == right) else { return false };
                 let rids = self.group_ids(right);
                 let lo = (o.start + MIN_DUR).max(r0.start - r0.src_off);
                 let hi = (r0.end() - MIN_DUR).min(o.start + (o.src_len - o.src_off));

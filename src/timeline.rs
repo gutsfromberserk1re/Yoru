@@ -512,7 +512,7 @@ impl Timeline {
 
     /// Applies one frame of a drag (snapping included). True if the project differs from `d.pre`.
     fn drag_step(&mut self, proj: &mut Project, d: &Drag, pos: Pos2, rect: Rect, playhead: f64) -> bool {
-        let Some(o) = d.pre.iter().find(|c| c.id == d.id).cloned() else { return false };
+        let Some(o) = d.pre.iter().find(|c| c.id == d.id) else { return false };
         let tt = self.t_of(rect, pos.x);
         self.snap_line = None;
 
