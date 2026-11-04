@@ -1,6 +1,6 @@
 //! Offline export pipeline using a bundled FFmpeg command-line build.
 //! The UI stays responsive while FFmpeg renders in a worker thread.
-use crate::project::{AudioPreset, Clip, EffectInstance, EffectKind, GfxKind, Project, TransitionKind};
+use crate::project::{Clip, EffectInstance, EffectKind, GfxKind, Project, TransitionKind};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -449,21 +449,9 @@ pub fn build_args(project: &Project, output: &Path, settings: &ExportSettings, s
         if !m.map_or(false, |m| m.has_audio) { continue; }
         let label = format!("aud{}", clip.id);
         let gain_expr = audio_gain_expr(clip).replace('T', "t");
-        let mut f = vec![format!("atrim=start={}:duration={}", num(clip.src_off), num(clip.dur)), "asetpts=PTS-STARTPTS".to_string(), format!("volume=volume='(({gain_expr})/100)':eval=frame")];
-        match clip.audio_preset {
-            AudioPreset::Neutral => {},
-            AudioPreset::Voice => f.extend(["highpass=f=85".to_string(), "equalizer=f=2800:t=q:w=1:g=2".to_string(), "acompressor=threshold=0.16:ratio=2.5:attack=10:release=120".to_string()]),
-            AudioPreset::MusicBed => f.extend(["equalizer=f=120:t=q:w=1:g=1.2".to_string(), "acompressor=threshold=0.28:ratio=1.6:attack=20:release=220".to_string()]),
-            AudioPreset::Cinematic => f.extend(["highpass=f=35".to_string(), "equalizer=f=70:t=q:w=1:g=2.5".to_string(), "acompressor=threshold=0.22:ratio=2.2:attack=8:release=180".to_string()]),
-            AudioPreset::Telephone => f.extend(["highpass=f=280".to_string(), "lowpass=f=3400".to_string(), "acompressor=threshold=0.20:ratio=3:attack=5:release=100".to_string()]),
-            AudioPreset::LoFi => f.extend(["highpass=f=150".to_string(), "lowpass=f=5000".to_string(), "acrusher=bits=10:mix=0.15".to_string()]),
-            AudioPreset::Underwater => f.extend(["lowpass=f=900".to_string(), "aecho=0.8:0.9:120:0.25".to_string()]),
-            AudioPreset::Podcast => f.extend(["highpass=f=75".to_string(), "lowpass=f=13500".to_string(), "equalizer=f=3200:t=q:w=1:g=2.5".to_string(), "acompressor=threshold=0.13:ratio=3:attack=8:release=130".to_string()]),
-            AudioPreset::BassBoost => f.extend(["equalizer=f=95:t=q:w=1:g=5".to_string(), "acompressor=threshold=0.25:ratio=1.8:attack=25:release=220".to_string()]),
-            AudioPreset::BrightVoice => f.extend(["highpass=f=100".to_string(), "equalizer=f=4800:t=q:w=1:g=3".to_string(), "acompressor=threshold=0.18:ratio=2.4:attack=6:release=100".to_string()]),
-            AudioPreset::Reverb => f.extend(["aecho=0.85:0.82:55|110|165:0.22|0.14|0.08".to_string()]),
-            AudioPreset::Muffled => f.extend(["lowpass=f=1900".to_string(), "highpass=f=120".to_string(), "aecho=0.8:0.85:90:0.12".to_string()]),
-        }
+        let mut f = vec![format!("atrim=start={}:duration={}", num(clip.src_off), num(clip.dur)), "asetpts=PTS-STARTPTS".to_string()];
+        f.extend(clip.audio_preset.ffmpeg_filters().iter().map(|filter| (*filter).to_string()));
+        f.push(format!("volume=volume='(({gain_expr})/100)':eval=frame"));
         if clip.fade_in > 0.0 { f.push(format!("afade=t=in:st=0:d={}", num(clip.fade_in.min(clip.dur)))); }
         if clip.fade_out > 0.0 { f.push(format!("afade=t=out:st={}:d={}", num((clip.dur - clip.fade_out).max(0.0)), num(clip.fade_out.min(clip.dur)))); }
         f.push(format!("adelay=delays={}:all=1", (clip.start.max(0.0) * 1000.0).round() as u64));

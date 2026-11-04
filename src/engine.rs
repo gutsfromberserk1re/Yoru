@@ -15,7 +15,7 @@
 //!   * exposes the active decoder's audio clock, mapped back to timeline time
 
 use crate::media::{Frame, Player};
-use crate::project::Project;
+use crate::project::{AudioPreset, Project};
 use eframe::egui::Context;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -233,6 +233,7 @@ impl Engine {
         step_direction: Option<i8>,
         muted: bool,
         gain: f32,
+        audio_preset: AudioPreset,
     ) {
         self.tick += 1;
         let play_changed = playing != self.playing;
@@ -306,6 +307,7 @@ impl Engine {
                 s.used = self.tick;
                 s.player.set_muted(muted);
                 s.player.set_volume(gain);
+                s.player.set_audio_preset(audio_preset, t + a.map);
             }
         }
 

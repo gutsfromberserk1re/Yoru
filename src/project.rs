@@ -522,7 +522,8 @@ impl Transition {
     pub fn new(kind: TransitionKind) -> Self { Self { kind, duration: 0.8, enabled: true } }
 }
 
-// Non-destructive audio processing presets. They are applied by the export mixer; raw source media is unchanged.
+// Non-destructive audio processing presets. The same FFmpeg filter chain is used for monitor
+// playback and export; raw source media is unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AudioPreset { Neutral, Voice, MusicBed, Cinematic, Telephone, LoFi, Underwater, Podcast, BassBoost, BrightVoice, Reverb, Muffled }
 impl AudioPreset {
@@ -534,6 +535,22 @@ impl AudioPreset {
             Self::LoFi => "Lo-Fi", Self::Underwater => "Underwater",
             Self::Podcast => "Podcast / Spoken Word", Self::BassBoost => "Bass Boost",
             Self::BrightVoice => "Bright Voice", Self::Reverb => "Room Reverb", Self::Muffled => "Muffled / Distant",
+        }
+    }
+    pub fn ffmpeg_filters(self) -> &'static [&'static str] {
+        match self {
+            Self::Neutral => &[],
+            Self::Voice => &["highpass=f=85", "equalizer=f=2800:t=q:w=1:g=2", "acompressor=threshold=0.16:ratio=2.5:attack=10:release=120"],
+            Self::MusicBed => &["equalizer=f=120:t=q:w=1:g=1.2", "acompressor=threshold=0.28:ratio=1.6:attack=20:release=220"],
+            Self::Cinematic => &["highpass=f=35", "equalizer=f=70:t=q:w=1:g=2.5", "acompressor=threshold=0.22:ratio=2.2:attack=8:release=180"],
+            Self::Telephone => &["highpass=f=280", "lowpass=f=3400", "acompressor=threshold=0.20:ratio=3:attack=5:release=100"],
+            Self::LoFi => &["highpass=f=150", "lowpass=f=5000", "acrusher=bits=10:mix=0.15"],
+            Self::Underwater => &["lowpass=f=900", "aecho=0.8:0.9:120:0.25"],
+            Self::Podcast => &["highpass=f=75", "lowpass=f=13500", "equalizer=f=3200:t=q:w=1:g=2.5", "acompressor=threshold=0.13:ratio=3:attack=8:release=130"],
+            Self::BassBoost => &["equalizer=f=95:t=q:w=1:g=5", "acompressor=threshold=0.25:ratio=1.8:attack=25:release=220"],
+            Self::BrightVoice => &["highpass=f=100", "equalizer=f=4800:t=q:w=1:g=3", "acompressor=threshold=0.18:ratio=2.4:attack=6:release=100"],
+            Self::Reverb => &["aecho=0.85:0.82:55|110|165:0.22|0.14|0.08"],
+            Self::Muffled => &["lowpass=f=1900", "highpass=f=120", "aecho=0.8:0.85:90:0.12"],
         }
     }
     pub fn id(self) -> u8 { Self::ALL.iter().position(|p| *p == self).unwrap_or(0) as u8 }
@@ -930,6 +947,15 @@ impl Project {
         g
     }
 
+    pub fn audio_preset_at(&self, t: f64) -> AudioPreset {
+        let Some(v) = self.video_clip_at(t) else { return AudioPreset::Neutral };
+        if v.link == 0 { return AudioPreset::Neutral; }
+        self.clips
+            .iter()
+            .find(|a| a.link == v.link && !a.lane.is_video())
+            .map_or(AudioPreset::Neutral, |a| a.audio_preset)
+    }
+
     fn alloc(&mut self) -> u32 {
         self.next_id += 1;
         self.next_id
@@ -1048,6 +1074,16 @@ impl Project {
     pub fn set_proxy_path(&mut self, media_id: u32, path: Option<PathBuf>) -> bool {
         let Some(m) = self.media.iter_mut().find(|m| m.id == media_id) else { return false };
         m.proxy_path = path;
+        true
+    }
+
+    /// Replace an offline source path while preserving its existing timeline edits and trims.
+    pub fn relink_media(&mut self, media_id: u32, path: PathBuf, has_audio: bool) -> bool {
+        let Some(m) = self.media.iter_mut().find(|m| m.id == media_id) else { return false };
+        m.name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| m.name.clone());
+        m.path = path;
+        m.has_audio = has_audio;
+        m.proxy_path = None;
         true
     }
 

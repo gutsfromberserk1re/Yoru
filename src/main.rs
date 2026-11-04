@@ -11,6 +11,7 @@
 
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, ecolor::Hsva, *};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::path::{Path, PathBuf};
@@ -639,6 +640,29 @@ struct Browser {
     fx_sel: Option<&'static str>,
     transition_sel: Option<TransitionKind>,
     transition_duration: f32,
+    source_paths: HashMap<u32, (PathBuf, bool)>,
+    source_check: Instant,
+}
+
+impl Browser {
+    fn refresh_source_status(&mut self, proj: &Project) {
+        let refresh_all = self.source_check.elapsed() >= Duration::from_secs(5);
+        for media in &proj.media {
+            let changed_path = self.source_paths.get(&media.id).map_or(true, |(path, _)| path != &media.path);
+            if refresh_all || changed_path {
+                self.source_paths.insert(media.id, (media.path.clone(), media.path.is_file()));
+            }
+        }
+        let media_ids: HashSet<u32> = proj.media.iter().map(|media| media.id).collect();
+        self.source_paths.retain(|id, _| media_ids.contains(id));
+        if refresh_all { self.source_check = Instant::now(); }
+    }
+
+    fn source_ready(&self, media_id: u32, path: &Path) -> bool {
+        self.source_paths.get(&media_id)
+            .filter(|(known_path, _)| known_path == path)
+            .map_or_else(|| path.is_file(), |(_, ready)| *ready)
+    }
 }
 
 /// Returns the media id the user asked to add to the timeline (double-click).
@@ -652,7 +676,9 @@ fn browser_panel(
     transition_drag: &mut Option<TransitionKind>,
     import_requested: &mut bool,
     proxy_requested: &mut Option<u32>,
+    relink_requested: &mut Option<u32>,
 ) -> Option<u32> {
+    if b.tab == 0 { b.refresh_source_status(proj); }
     let mut add = None;
     glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
         paint_panel_gradient(ui, 12.0, 8.0, 12.0, 12.0);
@@ -673,15 +699,24 @@ fn browser_panel(
                     });
                 });
                 add = if b.view == 0 {
-                    media_grid(ui, proj, assets, &mut b.sel, drag)
+                    media_grid(ui, proj, assets, &b.source_paths, &mut b.sel, drag)
                 } else {
-                    media_list(ui, proj, &mut b.sel, drag)
+                    media_list(ui, proj, &b.source_paths, &mut b.sel, drag)
                 };
                 if let Some(selected) = proj.media.get(b.sel) {
+                    let source_ready = b.source_ready(selected.id, &selected.path);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if source_ready { "Source file found" } else { "Source offline" }).size(9.0).color(if source_ready { rgba(150, 225, 185, 255) } else { rgba(255, 130, 130, 255) }));
+                        if !source_ready && ui.small_button("Relink…").clicked() {
+                            *relink_requested = Some(selected.id);
+                        }
+                    });
                     let ready = selected.proxy_path.as_ref().map_or(false, |p| p.is_file());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(if ready { "Proxy ready" } else { "Preview proxy: none" }).size(9.0).color(if ready { rgba(150, 225, 185, 255) } else { MUTED }));
-                        if ui.small_button(if ready { "Rebuild" } else { "Generate proxy" }).on_hover_text("Create a 960px proxy for smoother timeline playback; export uses the original source.").clicked() {
+                        if ui.add_enabled(source_ready, Button::new(if ready { "Rebuild" } else { "Generate proxy" }))
+                            .on_hover_text("Create a 960px proxy for smoother timeline playback; export uses the original source.")
+                            .clicked() {
                             *proxy_requested = Some(selected.id);
                         }
                     });
@@ -772,7 +807,7 @@ fn fmt_len(sec: f64) -> String {
 
 /// The Clips tab: one card per imported file with its real thumbnail. Click selects,
 /// double-click appends to the timeline, dragging it onto a track places it there.
-fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
+fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, source_paths: &HashMap<u32, (PathBuf, bool)>, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
     if proj.media.is_empty() {
         placeholder(ui, "Click + Import, or drop video files onto the window.");
         return None;
@@ -805,6 +840,11 @@ fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, dra
                 p.rect_filled(badge, 3.0, rgba(0, 0, 0, 150));
                 p.text(badge.center(), Align2::CENTER_CENTER, fmt_len(m.duration), FontId::monospace(8.0), TEXT);
             }
+            if !source_paths.get(&m.id).map_or_else(|| m.path.is_file(), |(path, ready)| path == &m.path && *ready) {
+                let offline = Rect::from_min_size(pos2(tr.left() + 5.0, tr.top() + 5.0), vec2(48.0, 14.0));
+                p.rect_filled(offline, 3.0, rgba(125, 35, 42, 230));
+                p.text(offline.center(), Align2::CENTER_CENTER, "OFFLINE", FontId::monospace(8.0), TEXT);
+            }
             let g = elided(ui, &m.name, FontId::monospace(9.0), if on { TEXT } else { MUTED }, cell_w);
             p.galley(pos2(cell.left(), tr.bottom() + 4.0), g, MUTED);
             if resp.clicked() {
@@ -822,7 +862,7 @@ fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, sel: &mut usize, dra
     add
 }
 
-fn media_list(ui: &mut Ui, proj: &Project, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
+fn media_list(ui: &mut Ui, proj: &Project, source_paths: &HashMap<u32, (PathBuf, bool)>, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
     if proj.media.is_empty() {
         placeholder(ui, "Click + Import, or drop video files onto the window.");
         return None;
@@ -832,8 +872,10 @@ fn media_list(ui: &mut Ui, proj: &Project, sel: &mut usize, drag: &mut Option<u3
     ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
         for (i, m) in proj.media.iter().enumerate() {
             let len = if m.duration > 0.0 { fmt_tc(m.duration) } else { "--".into() };
-            let text = format!("{}   {}{}", m.name, len, if m.has_audio { "" } else { "   (no audio)" });
-            let r = ui.selectable_label(*sel == i, text).interact(Sense::click_and_drag());
+            let source_ready = source_paths.get(&m.id).map_or_else(|| m.path.is_file(), |(path, ready)| path == &m.path && *ready);
+            let text = format!("{}   {}{}{}", m.name, len, if m.has_audio { "" } else { "   (no audio)" }, if source_ready { "" } else { "   (OFFLINE)" });
+            let label = RichText::new(text).color(if source_ready { if *sel == i { TEXT } else { MUTED } } else { rgba(255, 130, 130, 255) });
+            let r = ui.selectable_label(*sel == i, label).interact(Sense::click_and_drag());
             if r.clicked() {
                 *sel = i;
             }
@@ -1097,7 +1139,10 @@ impl App {
             fit: 0,
             timeline: Timeline::new(),
             inspector: fxui::Inspector::new(),
-            browser: Browser { tab: 0, sel: 0, view: 0, search: String::new(), fx_sel: None, transition_sel: None, transition_duration: 0.8 },
+            browser: Browser {
+                tab: 0, sel: 0, view: 0, search: String::new(), fx_sel: None, transition_sel: None,
+                transition_duration: 0.8, source_paths: HashMap::new(), source_check: Instant::now(),
+            },
             proj: Project::new(),
             engine: engine::Engine::new(),
             jumped: false,
@@ -1789,6 +1834,7 @@ impl eframe::App for App {
             step_direction,
             muted,
             self.proj.audio_gain_at(self.t),
+            self.proj.audio_preset_at(self.t),
         );
         // new decoded frame, or an effect value changed (slider, keyframe, playhead on an animated clip)
         let new_frame = self.engine.poll(self.t).is_some();
@@ -1862,6 +1908,7 @@ impl eframe::App for App {
         let (mut edited, mut seeked, mut play, mut export_clicked) = (false, false, false, false);
         let mut add_tracking_at: Option<(f32, f32)> = None;
         let mut add_media: Option<u32> = None;
+        let mut relink_requested: Option<u32> = None;
         let mut import_requested = false;
         let mut proxy_requested: Option<u32> = None;
         let mut fx_changed = false;
@@ -1887,7 +1934,7 @@ impl eframe::App for App {
                         .show_separator_line(false)
                         .frame(Frame::none().inner_margin(Margin { left: 12.0, ..Default::default() }))
                         .show_inside(ui, |ui| {
-                            add_media = browser_panel(ui, browser, proj, assets, drag_media, effect_drag, transition_drag, &mut import_requested, &mut proxy_requested);
+                            add_media = browser_panel(ui, browser, proj, assets, drag_media, effect_drag, transition_drag, &mut import_requested, &mut proxy_requested, &mut relink_requested);
                         });
                     CentralPanel::default().frame(Frame::none()).show_inside(ui, |ui| {
                         let r = timeline_panel(ui, timeline, t, project, *levels, proj, assets, ghost.as_ref(), effect_drag, transition_drag, browser.transition_duration);
@@ -1980,6 +2027,31 @@ impl eframe::App for App {
                 }
                 if imported_any {
                     self.mark_dirty();
+                }
+            }
+        }
+
+        if let Some(media_id) = relink_requested {
+            if let Some(offline) = self.proj.media(media_id).cloned() {
+                self.set_rate(0);
+                let replacement = rfd::FileDialog::new()
+                    .add_filter("Video media", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg"])
+                    .pick_file();
+                if let Some(path) = replacement {
+                    match media::Player::open(&path, ctx.clone()) {
+                        Ok(player) => {
+                            let has_audio = player.has_audio();
+                            self.engine.invalidate_media(media_id);
+                            if self.proj.relink_media(media_id, path.clone(), has_audio) {
+                                self.assets.spawn(ctx, media_id, &path, offline.duration, has_audio);
+                                self.engine.insert(media_id, player);
+                                self.browser.source_paths.insert(media_id, (path.clone(), true));
+                                self.mark_dirty();
+                                self.file_error = None;
+                            }
+                        }
+                        Err(e) => self.file_error = Some(format!("Could not relink '{}' to {}: {e}", offline.name, path.display())),
+                    }
                 }
             }
         }

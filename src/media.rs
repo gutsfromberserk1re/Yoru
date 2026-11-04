@@ -13,6 +13,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use eframe::egui::Context;
+use crate::project::AudioPreset;
 use ffmpeg::{
     codec, format,
     format::{sample::Type as SampleType, Sample as SampleFmt},
@@ -747,6 +748,7 @@ struct AudioShared {
     playing: AtomicBool,
     muted: AtomicBool,
     gain: AtomicU32, // linear playback gain, updated without locking the audio FIFO
+    preset: AtomicU32, // AudioPreset id; observed and applied by the decoder worker
     peak_l: AtomicU32, // positive f32 bit patterns order like the floats -> fetch_max = peak hold
     peak_r: AtomicU32,
 }
@@ -759,6 +761,7 @@ impl AudioShared {
             playing: AtomicBool::new(false),
             muted: AtomicBool::new(false),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            preset: AtomicU32::new(AudioPreset::Neutral.id() as u32),
             peak_l: AtomicU32::new(0),
             peak_r: AtomicU32::new(0),
         }
@@ -808,6 +811,47 @@ pub struct AudioWorker {
     out: AFrame,
     flushed: bool,
     skip_until: Option<f64>, // after a seek: trim samples that precede the target
+    filter: Option<ffmpeg::filter::Graph>,
+    preset: AudioPreset,
+    filter_pts: i64,
+}
+
+fn make_audio_filter(rate: u32, preset: AudioPreset) -> Result<Option<ffmpeg::filter::Graph>, ffmpeg::Error> {
+    let filters = preset.ffmpeg_filters();
+    if filters.is_empty() { return Ok(None); }
+
+    let mut graph = ffmpeg::filter::Graph::new();
+    let input_args = format!("time_base=1/{rate}:sample_rate={rate}:sample_fmt=flt:channel_layout=stereo");
+    graph.add(&ffmpeg::filter::find("abuffer").expect("FFmpeg abuffer filter is required"), "in", &input_args)?;
+    graph.add(&ffmpeg::filter::find("abuffersink").expect("FFmpeg abuffersink filter is required"), "out", "")?;
+    {
+        let mut output = graph.get("out").unwrap();
+        output.set_sample_format(SampleFmt::F32(SampleType::Packed));
+        output.set_channel_layout(ChannelLayout::STEREO);
+        output.set_sample_rate(rate);
+    }
+    graph.output("in", 0)?.input("out", 0)?.parse(&filters.join(","))?;
+    graph.validate()?;
+    Ok(Some(graph))
+}
+
+fn append_audio_frame(frame: &AFrame, rate: u32, skip_until: &mut Option<f64>, buf: &mut Vec<f32>) {
+    let n = frame.samples();
+    if n == 0 { return; }
+    let rate_f = rate as f64;
+    let mut start = 0usize;
+    if let Some(t0) = *skip_until {
+        let p = frame.timestamp().or(frame.pts()).map_or(t0, |pts| pts as f64 / rate_f);
+        if p + n as f64 / rate_f <= t0 { return; }
+        if p < t0 { start = (((t0 - p) * rate_f) as usize).min(n); }
+        *skip_until = None;
+    }
+    let data = frame.plane::<(f32, f32)>(0);
+    buf.reserve((n - start) * 2);
+    for &(l, r) in &data[start..n] {
+        buf.push(l);
+        buf.push(r);
+    }
 }
 
 fn make_resampler(dec: &ffmpeg::decoder::Audio, rate: u32) -> Result<resampling::Context, ffmpeg::Error> {
@@ -844,7 +888,22 @@ impl AudioWorker {
             out: AFrame::empty(),
             flushed: false,
             skip_until: None,
+            filter: None,
+            preset: AudioPreset::Neutral,
+            filter_pts: 0,
         }))
+    }
+
+    fn set_preset(&mut self, preset: AudioPreset) {
+        if self.preset == preset { return; }
+        self.preset = preset;
+        self.filter = match make_audio_filter(self.rate, preset) {
+            Ok(filter) => filter,
+            Err(e) => {
+                eprintln!("could not create live audio filter for {}: {e}", preset.label());
+                None
+            }
+        };
     }
 
     pub fn seek(&mut self, t: f64) {
@@ -856,8 +915,10 @@ impl AudioWorker {
             eprintln!("audio seek to {t:.3}s failed ({}): {err}; reopening source", self.path.display());
             let path = self.path.clone();
             let rate = self.rate;
+            let preset = self.preset;
             if let Ok(Some(fresh)) = Self::open(&path, rate) {
                 *self = fresh;
+                self.preset = preset;
             }
         }
         self.dec.flush();
@@ -866,6 +927,14 @@ impl AudioWorker {
         }
         self.flushed = false;
         self.skip_until = Some(t);
+        self.filter_pts = (t * self.rate as f64).round() as i64;
+        self.filter = match make_audio_filter(self.rate, self.preset) {
+            Ok(filter) => filter,
+            Err(e) => {
+                eprintln!("could not reset live audio filter for {}: {e}", self.preset.label());
+                None
+            }
+        };
     }
 
     /// Decode + resample the next chunk into `buf`. False at end of stream.
@@ -904,23 +973,24 @@ impl AudioWorker {
         if n == 0 {
             return;
         }
-        let rate = self.rate as f64;
-        let mut start = 0usize;
-        if let Some(t0) = self.skip_until {
-            let p = self.raw.timestamp().map_or(t0, |p| p as f64 * self.tb);
-            if p + n as f64 / rate <= t0 {
-                return; // whole frame is before the seek target
+        let frame_start = self.raw.timestamp().or(self.raw.pts())
+            .map_or(self.filter_pts as f64 / self.rate as f64, |pts| pts as f64 * self.tb);
+        self.filter_pts = (frame_start * self.rate as f64).round() as i64;
+        self.out.set_pts(Some(self.filter_pts));
+        self.filter_pts += n as i64;
+        if let Some(graph) = self.filter.as_mut() {
+            if let Err(e) = graph.get("in").unwrap().source().add(&self.out) {
+                eprintln!("live audio filter input failed: {e}");
+                append_audio_frame(&self.out, self.rate, &mut self.skip_until, buf);
+                return;
             }
-            if p < t0 {
-                start = (((t0 - p) * rate) as usize).min(n);
+            let mut filtered = AFrame::empty();
+            let output = graph.get("out").unwrap();
+            while output.sink().frame(&mut filtered).is_ok() {
+                append_audio_frame(&filtered, self.rate, &mut self.skip_until, buf);
             }
-            self.skip_until = None;
-        }
-        let data = self.out.plane::<(f32, f32)>(0);
-        buf.reserve((n - start) * 2);
-        for &(l, r) in &data[start..n] {
-            buf.push(l);
-            buf.push(r);
+        } else {
+            append_audio_frame(&self.out, self.rate, &mut self.skip_until, buf);
         }
     }
 }
@@ -929,9 +999,15 @@ fn audio_run(mut w: AudioWorker, rx: Receiver<(f64, u64)>, sh: Arc<AudioShared>,
     let high_water = rate as usize; // 0.5 s of stereo samples
     let mut epoch = 0u64;
     let mut eof = false;
+    let mut active_preset = AudioPreset::Neutral;
     let mut buf: Vec<f32> = Vec::with_capacity(16 * 1024);
 
     loop {
+        let requested = AudioPreset::from_id(sh.preset.load(Relaxed) as u8).unwrap_or(AudioPreset::Neutral);
+        if requested != active_preset {
+            w.set_preset(requested);
+            active_preset = requested;
+        }
         let idle = eof || sh.queued() >= high_water;
         let cmd = if idle {
             match rx.recv_timeout(Duration::from_millis(5)) {
@@ -1151,6 +1227,20 @@ impl Player {
     /// Set real-time linear audio gain (0..4). Safe to call during playback.
     pub fn set_volume(&self, gain: f32) {
         if let Some(a) = &self.audio { a.sh.gain.store(gain.clamp(0.0, 4.0).to_bits(), Relaxed); }
+    }
+
+    /// Apply the linked clip's audio preset in the live monitor. Changing presets flushes the
+    /// short decode queue and restarts at the current source time so old, unfiltered samples do
+    /// not play after the control changes.
+    pub fn set_audio_preset(&self, preset: AudioPreset, source_time: f64) {
+        if let Some(a) = &self.audio {
+            let id = preset.id() as u32;
+            if a.sh.preset.swap(id, Relaxed) != id {
+                let t = source_time.max(0.0);
+                let epoch = a.sh.reset(t);
+                let _ = a.cmd.send((t, epoch));
+            }
+        }
     }
 
     pub fn has_audio(&self) -> bool {

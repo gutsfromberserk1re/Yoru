@@ -482,7 +482,7 @@ fn audio_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[u32]
             .show_ui(ui, |ui| for preset in AudioPreset::ALL { ui.selectable_value(&mut audio_preset, preset, preset.label()); });
         if ui.small_button("Apply").clicked() { apply_audio_preset = true; changed = true; }
     });
-    ui.label(RichText::new("Audio tone presets render on export; live monitor filtering is not available yet.").size(9.0).color(MUTED));
+    ui.label(RichText::new("Audio presets use the same FFmpeg filter chain in preview and export.").size(9.0).color(MUTED));
     ui.horizontal(|ui| {
         ui.label("Volume");
         let slider_changed = ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%")).changed();
