@@ -887,6 +887,7 @@ fn browser_panel(
     if b.create_bin_open {
         let mut open = b.create_bin_open;
         let mut create = false;
+        let mut cancel = false;
         Window::new("Create Bin")
             .open(&mut open)
             .collapsible(false)
@@ -896,9 +897,10 @@ fn browser_panel(
                 ui.add(TextEdit::singleline(&mut b.new_bin_name).desired_width(240.0));
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() { create = true; }
-                    if ui.button("Cancel").clicked() { open = false; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
                 });
             });
+        if cancel { open = false; }
         b.create_bin_open = open;
         if create {
             b.pending = Some(BrowserCommand::CreateBin(b.new_bin_name.trim().to_string()));

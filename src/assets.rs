@@ -129,7 +129,7 @@ impl Assets {
         let b = ((t1.max(0.0) * PEAK_RATE).ceil() as usize).clamp(a + 1, e.peaks.len());
         let mut max = 0.0f32;
         let mut left = a;
-        let mut right = b;
+        let right = b;
         while left < right && left % PEAK_QUERY_BLOCK != 0 {
             max = max.max(e.peaks[left]);
             left += 1;

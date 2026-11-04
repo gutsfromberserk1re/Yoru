@@ -987,7 +987,7 @@ impl AudioWorker {
                 return;
             }
             let mut filtered = AFrame::empty();
-            let output = graph.get("out").unwrap();
+            let mut output = graph.get("out").unwrap();
             while output.sink().frame(&mut filtered).is_ok() {
                 append_audio_frame(&filtered, self.rate, &mut self.skip_until, buf);
             }
