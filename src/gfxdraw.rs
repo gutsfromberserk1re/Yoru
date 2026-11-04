@@ -43,6 +43,7 @@ fn draw_one(p: &Painter, canvas: Rect, k: f32, o: &Overlay) {
     };
 
     match g.kind {
+        GfxKind::Adjustment => return,
         GfxKind::Rect | GfxKind::Ellipse => {
             let (hw, hh) = (g.w * 0.5 * s, g.h * 0.5 * s);
             let pts: Vec<Pos2> = if g.kind == GfxKind::Rect {

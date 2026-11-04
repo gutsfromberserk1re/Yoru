@@ -14,6 +14,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 const THUMB_W: u32 = 192;
 const MAX_THUMBS: f64 = 150.0;
 const PEAK_RATE: f64 = 50.0; // waveform bins per second
+const PEAK_QUERY_BLOCK: usize = 16;
 const PEAK_AUDIO_HZ: u32 = 8000; // analysis sample rate (cheap, plenty for a waveform)
 const PEAK_BIN: usize = (PEAK_AUDIO_HZ as f64 / PEAK_RATE) as usize;
 const UPLOADS_PER_FRAME: usize = 6;
@@ -28,6 +29,9 @@ struct Entry {
     /// (source time, texture, aspect) sorted by time
     thumbs: Vec<(f64, TextureHandle, f32)>,
     peaks: Vec<f32>,
+    /// Max amplitude for each small peak block. Wide timeline zooms query these summaries
+    /// instead of rescanning hundreds of source bins for every screen column.
+    peak_blocks: Vec<f32>,
 }
 
 pub struct Assets {
@@ -74,7 +78,14 @@ impl Assets {
                 }
                 Msg::Peaks { media, data } => {
                     if let Some(e) = self.map.get_mut(&media) {
+                        let first = e.peaks.len();
                         e.peaks.extend(data);
+                        let blocks = (e.peaks.len() + PEAK_QUERY_BLOCK - 1) / PEAK_QUERY_BLOCK;
+                        e.peak_blocks.resize(blocks, 0.0);
+                        for index in first..e.peaks.len() {
+                            let block = index / PEAK_QUERY_BLOCK;
+                            e.peak_blocks[block] = e.peak_blocks[block].max(e.peaks[index]);
+                        }
                     }
                 }
             }
@@ -116,7 +127,22 @@ impl Assets {
             return None;
         }
         let b = ((t1.max(0.0) * PEAK_RATE).ceil() as usize).clamp(a + 1, e.peaks.len());
-        e.peaks[a..b].iter().copied().reduce(f32::max)
+        let mut max = 0.0f32;
+        let mut left = a;
+        let mut right = b;
+        while left < right && left % PEAK_QUERY_BLOCK != 0 {
+            max = max.max(e.peaks[left]);
+            left += 1;
+        }
+        while left + PEAK_QUERY_BLOCK <= right {
+            max = max.max(e.peak_blocks[left / PEAK_QUERY_BLOCK]);
+            left += PEAK_QUERY_BLOCK;
+        }
+        while left < right {
+            max = max.max(e.peaks[left]);
+            left += 1;
+        }
+        Some(max)
     }
 }
 

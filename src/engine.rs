@@ -14,8 +14,8 @@
 //!     playback stops, and failed opens are retried instead of being remembered forever
 //!   * exposes the active decoder's audio clock, mapped back to timeline time
 
-use crate::media::{Frame, Player};
-use crate::project::{AudioPreset, Project};
+use crate::media::{AudioMixer, Frame, Player};
+use crate::project::{AudioPreset, MediaKind, Project};
 use eframe::egui::Context;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -63,9 +63,12 @@ struct Upcoming {
 
 pub struct Engine {
     players: HashMap<u32, Slot>,
+    audio_mixer: Option<AudioMixer>,
     /// media id -> when the open failed
     failed: HashMap<u32, Instant>,
     active: Option<Mapping>,
+    /// Keep the outgoing held frame available while a cross dissolve is visible.
+    dissolve_media: Option<u32>,
     prepared: Option<Mapping>,
     /// decoder opened for the upcoming clip but not yet seeked (protected from eviction)
     warming: Option<u32>,
@@ -83,8 +86,10 @@ impl Engine {
     pub fn new() -> Self {
         Self {
             players: HashMap::new(),
+            audio_mixer: AudioMixer::new(),
             failed: HashMap::new(),
             active: None,
+            dissolve_media: None,
             prepared: None,
             warming: None,
             upcoming: None,
@@ -96,9 +101,15 @@ impl Engine {
         }
     }
 
+    pub fn open_player(&self, path: &std::path::Path, ctx: Context) -> Result<Player, String> {
+        if self.audio_mixer.is_some() { Player::open_video(path, ctx) }
+        else { Player::open(path, ctx) }
+    }
+
     /// Adds an already-open decoder (used right after import, which had to open the file anyway).
     pub fn insert(&mut self, media: u32, mut player: Player) {
         self.failed.remove(&media);
+        if self.audio_mixer.is_some() { player.disable_audio(); }
         player.set_quality(self.quality);
         // A replaced decoder has not been positioned yet: anything that assumed otherwise is void.
         if self.settled.map_or(false, |(m, _)| m == media) {
@@ -148,6 +159,7 @@ impl Engine {
 
     fn pinned(&self, id: u32) -> bool {
         self.active.map_or(false, |a| a.media == id)
+            || self.dissolve_media == Some(id)
             || self.prepared.map_or(false, |p| p.media == id)
             || self.warming == Some(id)
     }
@@ -183,8 +195,9 @@ impl Engine {
             None => {}
         }
         let Some(m) = proj.media(media) else { return false };
+        if m.kind != MediaKind::Video { return false; }
         let preview_path = m.proxy_path.as_ref().filter(|path| path.is_file()).unwrap_or(&m.path);
-        match Player::open(preview_path, ctx.clone()) {
+        match self.open_player(preview_path, ctx.clone()) {
             Ok(p) => {
                 self.insert(media, p);
                 true
@@ -238,6 +251,12 @@ impl Engine {
         self.tick += 1;
         let play_changed = playing != self.playing;
         self.playing = playing;
+        self.dissolve_media = proj.dissolve_at(t).and_then(|(outgoing, incoming, _)| {
+            if outgoing.media != incoming.media { outgoing.media } else { None }
+        });
+        if let Some(mixer) = self.audio_mixer.as_mut() {
+            mixer.update(&proj.audio_sources_at(t), playing, jumped);
+        }
         if playing {
             self.settled = None; // the decoder is moving on its own now
         }
@@ -305,9 +324,14 @@ impl Engine {
         if let Some(a) = self.active {
             if let Some(s) = self.players.get_mut(&a.media) {
                 s.used = self.tick;
-                s.player.set_muted(muted);
-                s.player.set_volume(gain);
-                s.player.set_audio_preset(audio_preset, t + a.map);
+                if self.audio_mixer.is_some() {
+                    s.player.set_muted(true);
+                    s.player.set_volume(0.0);
+                } else {
+                    s.player.set_muted(muted);
+                    s.player.set_volume(gain);
+                    s.player.set_audio_preset(audio_preset, t + a.map);
+                }
             }
         }
 
@@ -403,6 +427,11 @@ impl Engine {
         self.players.get(&a.media)?.player.current.as_ref()
     }
 
+    /// Last held frame for a decoder retained in the preview pool, used to compose transitions.
+    pub fn frame_for_media(&self, media: u32) -> Option<&Frame> {
+        self.players.get(&media)?.player.current.as_ref()
+    }
+
     pub fn is_active(&self) -> bool {
         self.active.is_some()
     }
@@ -419,20 +448,22 @@ impl Engine {
     pub fn poll(&mut self, t: f64) -> Option<&Frame> {
         let a = self.active?;
         let s = self.players.get_mut(&a.media)?;
-        if s.player.poll(t + a.map) {
-            s.player.current.as_ref()
-        } else {
-            None
-        }
+        if s.player.poll(t + a.map) { s.player.current.as_ref() } else { None }
     }
 
     /// Audio master clock in timeline seconds (None without audio -> caller uses the wall clock).
     pub fn clock(&self) -> Option<f64> {
+        if let Some(clock) = self.audio_mixer.as_ref().and_then(AudioMixer::clock) {
+            return Some(clock);
+        }
         let a = self.active?;
         self.players.get(&a.media)?.player.clock().map(|c| c - a.map)
     }
 
     pub fn peaks(&self) -> Option<(f32, f32)> {
+        if let Some(peaks) = self.audio_mixer.as_ref().and_then(AudioMixer::peaks) {
+            return Some(peaks);
+        }
         let a = self.active?;
         self.players.get(&a.media)?.player.peaks()
     }

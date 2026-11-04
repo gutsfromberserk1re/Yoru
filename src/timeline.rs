@@ -101,6 +101,49 @@ pub struct Ghost {
     pub name: String,
 }
 
+#[derive(Clone, Copy)]
+struct ClipSpan {
+    start: f64,
+    end: f64,
+    index: usize,
+}
+
+struct ClipIndex {
+    lanes: [Vec<ClipSpan>; NTRACKS],
+    prefix_max_end: [Vec<f64>; NTRACKS],
+    valid: bool,
+}
+
+impl ClipIndex {
+    fn new() -> Self {
+        Self {
+            lanes: std::array::from_fn(|_| Vec::new()),
+            prefix_max_end: std::array::from_fn(|_| Vec::new()),
+            valid: false,
+        }
+    }
+
+    fn rebuild(&mut self, proj: &Project) {
+        for lane in &mut self.lanes { lane.clear(); }
+        for lane in &mut self.prefix_max_end { lane.clear(); }
+        for (index, clip) in proj.clips.iter().enumerate() {
+            self.lanes[clip.lane.slot()].push(ClipSpan { start: clip.start, end: clip.end(), index });
+        }
+        for lane in 0..NTRACKS {
+            self.lanes[lane].sort_by(|a, b| {
+                a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.index.cmp(&b.index))
+            });
+            let mut max_end = f64::NEG_INFINITY;
+            for span in &self.lanes[lane] {
+                max_end = max_end.max(span.end);
+                self.prefix_max_end[lane].push(max_end);
+            }
+        }
+        self.valid = true;
+    }
+}
+
 pub struct Timeline {
     pub pps: f64,
     pub scroll: f64,
@@ -128,6 +171,9 @@ pub struct Timeline {
     /// lanes that currently take space in display order (highest video lane first).
     rows: [(f32, f32); NTRACKS],
     lanes: Vec<Lane>,
+    /// Sorted clip ranges keep drawing and hit tests proportional to the visible timeline.
+    /// Live clip drags use the direct path and rebuild this index after the drop.
+    clip_index: ClipIndex,
 }
 
 impl Timeline {
@@ -158,7 +204,57 @@ impl Timeline {
             vis,
             rows: [(0.0, 0.0); NTRACKS],
             lanes: Vec::with_capacity(NTRACKS),
+            clip_index: ClipIndex::new(),
         }
+    }
+
+    fn refresh_clip_index(&mut self, proj: &Project) {
+        if self.drag.is_some() { return; }
+        if !self.clip_index.valid {
+            self.clip_index.rebuild(proj);
+        }
+    }
+
+    pub fn invalidate_clip_index(&mut self) { self.clip_index.valid = false; }
+
+    fn indices_in_range(&self, proj: &Project, lane: Lane, start: f64, end: f64) -> Vec<usize> {
+        if self.clip_index.valid && self.drag.is_none() {
+            let slot = lane.slot();
+            let spans = &self.clip_index.lanes[slot];
+            let high = spans.partition_point(|span| span.start <= end);
+            let prefix = &self.clip_index.prefix_max_end[slot];
+            let low = prefix[..high].partition_point(|end| *end < start);
+            let mut indices: Vec<usize> = spans[low..high].iter()
+                .filter(|span| span.end >= start)
+                .map(|span| span.index)
+                .collect();
+            indices.sort_unstable(); // match draw order when clips overlap on a lane
+            return indices;
+        }
+        proj.clips.iter().enumerate()
+            .filter(|(_, clip)| clip.lane == lane && clip.start <= end && clip.end() >= start)
+            .map(|(index, _)| index).collect()
+    }
+
+    fn visible_indices(&self, proj: &Project, rect: Rect) -> Vec<usize> {
+        let from = self.scroll - 2.0 / self.pps;
+        let to = self.scroll + ((rect.width() - HEAD).max(0.0) as f64 / self.pps) + 2.0 / self.pps;
+        let mut indices = Vec::new();
+        if self.clip_index.valid && self.drag.is_none() {
+            for slot in 0..NTRACKS {
+                let spans = &self.clip_index.lanes[slot];
+                let high = spans.partition_point(|span| span.start <= to);
+                let prefix = &self.clip_index.prefix_max_end[slot];
+                let low = prefix[..high].partition_point(|end| *end < from);
+                indices.extend(spans[low..high].iter().filter(|span| span.end >= from).map(|span| span.index));
+            }
+        } else {
+            indices.extend(proj.clips.iter().enumerate()
+                .filter(|(_, clip)| clip.start <= to && clip.end() >= from)
+                .map(|(index, _)| index));
+        }
+        indices.sort_unstable();
+        indices
     }
 
     // ---------------------------------------------------------------- geometry
@@ -256,10 +352,19 @@ impl Timeline {
     fn reveal_used_tracks(&mut self, proj: &Project, grow_only: bool) {
         let mut v = 1usize;
         let mut a = 1usize;
-        for c in &proj.clips {
-            match c.lane {
-                Lane::V(n) => v = v.max(n as usize + 1),
-                Lane::A(n) => a = a.max(n as usize + 1),
+        if self.clip_index.valid && !grow_only {
+            for slot in 0..NV.min(NTRACKS) {
+                if !self.clip_index.lanes[slot].is_empty() { v = v.max(slot + 1); }
+            }
+            for slot in NV..NTRACKS {
+                if !self.clip_index.lanes[slot].is_empty() { a = a.max(slot - NV + 1); }
+            }
+        } else {
+            for c in &proj.clips {
+                match c.lane {
+                    Lane::V(n) => v = v.max(n as usize + 1),
+                    Lane::A(n) => a = a.max(n as usize + 1),
+                }
             }
         }
         let v = v.min(NV).max(1);
@@ -351,10 +456,10 @@ impl Timeline {
     /// Clip under the pointer and which part of it (body / trim handles).
     fn hit(&self, proj: &Project, rect: Rect, pos: Pos2) -> Option<(usize, Zone)> {
         let lane = self.lane_at(rect, pos.y, true)?;
-        for (i, c) in proj.clips.iter().enumerate().rev() {
-            if c.lane != lane {
-                continue;
-            }
+        let at = self.t_of(rect, pos.x);
+        let indices = self.indices_in_range(proj, lane, at - 3.0 / self.pps, at + 3.0 / self.pps);
+        for i in indices.into_iter().rev() {
+            let c = &proj.clips[i];
             let (x0, x1) = (self.x_of(rect, c.start), self.x_of(rect, c.end()));
             if pos.x >= x0 - 2.0 && pos.x <= x1 + 2.0 {
                 let edge = if x1 - x0 > 28.0 { EDGE } else { (x1 - x0) * 0.2 };
@@ -677,6 +782,7 @@ impl Timeline {
         transition_duration: f32,
     ) -> (bool, bool) {
         self.view = rect;
+        self.refresh_clip_index(proj);
         // while a clip drag is in flight the track count may only grow (see module docs)
         let dragging = self.drag.is_some();
         self.reveal_used_tracks(proj, dragging);
@@ -786,6 +892,7 @@ impl Timeline {
                         proj.resolve_overwrite(&mv);
                     }
                     proj.push_undo(d.pre);
+                    self.clip_index.valid = false;
                     edited = true;
                 }
             }
@@ -799,7 +906,8 @@ impl Timeline {
                     if let Some((idx, _)) = self.hit(proj, rect, pos) {
                         if let Some(c) = proj.clips.get(idx) {
                             let id = c.id;
-                            let is_target = c.lane.is_video() && c.media.is_some() && !proj.is_locked(c.lane);
+                            let is_adjustment = c.gfx.as_ref().map_or(false, |gfx| gfx.kind == crate::project::GfxKind::Adjustment);
+                            let is_target = c.lane.is_video() && (c.media.is_some() || is_adjustment) && !proj.is_locked(c.lane);
                             let local_time = (self.t_of(rect, pos.x) - c.start).clamp(0.0, c.dur);
                             if is_target && proj.apply_effect(id, kind, local_time) {
                                 self.sel.clear();
@@ -840,7 +948,8 @@ impl Timeline {
                 if let Some(p) = hover {
                     let mr = Rect::from_two_pos(start, p);
                     let mut sel = base.clone();
-                    for c in &proj.clips {
+                    for index in self.visible_indices(proj, rect) {
+                        let Some(c) = proj.clips.get(index) else { continue };
                         if !proj.is_locked(c.lane) && self.clip_rect(rect, c).intersects(mr) {
                             for g in proj.group_ids(c.id) {
                                 if !sel.contains(&g) {
@@ -898,6 +1007,10 @@ impl Timeline {
         }
         self.last_t = *t;
 
+        if edited && self.drag.is_none() {
+            self.clip_index.valid = false;
+        }
+
         // ---- cursor feedback
         if let Some(d) = &self.drag {
             ui.ctx().set_cursor_icon(if d.zone == Zone::Body && d.tool != Tool::Slip {
@@ -905,6 +1018,8 @@ impl Timeline {
             } else {
                 CursorIcon::ResizeHorizontal
             });
+        } else if effect_drag.is_some() || transition_drag.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         } else if self.panning {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         } else if over && !self.scrub {
@@ -928,13 +1043,19 @@ impl Timeline {
         // animate the track rows and rebuild the cached geometry for this frame's paint
         self.update_layout(ui.ctx(), rect.height(), dt);
 
-        self.paint(ui, rect, *t, if over && !self.scrub { hover } else { None }, proj, assets, ghost);
+        self.paint(
+            ui, rect, *t, if over && !self.scrub { hover } else { None }, proj, assets, ghost,
+            effect_drag, transition_drag,
+        );
         (edited, seeked)
     }
 
     // ---------------------------------------------------------------- painting
     #[allow(clippy::too_many_arguments)]
-    fn paint(&self, ui: &Ui, rect: Rect, t: f64, hover: Option<Pos2>, proj: &Project, assets: &Assets, ghost: Option<&Ghost>) {
+    fn paint(
+        &self, ui: &Ui, rect: Rect, t: f64, hover: Option<Pos2>, proj: &Project, assets: &Assets,
+        ghost: Option<&Ghost>, effect_drag: &Option<EffectKind>, transition_drag: &Option<TransitionKind>,
+    ) {
         let p_all = ui.painter_at(rect);
         let content = Rect::from_min_max(pos2(rect.left() + HEAD, rect.top()), rect.max);
         let p = p_all.with_clip_rect(content);
@@ -1029,8 +1150,37 @@ impl Timeline {
         }
 
         // ---- clips
-        for c in &proj.clips {
-            self.draw_clip(ui, &p, rect, c, proj, &font, assets);
+        for index in self.visible_indices(proj, rect) {
+            if let Some(c) = proj.clips.get(index) {
+                self.draw_clip(ui, &p, rect, c, proj, &font, assets);
+            }
+        }
+
+        // A bright target outline makes the drop destination explicit while dragging an effect
+        // or transition out of the browser.
+        if effect_drag.is_some() || transition_drag.is_some() {
+            if let Some(pos) = hover.filter(|pos| pos.x >= content.left() && pos.y - rect.top() >= RULER) {
+                if let Some((index, _)) = self.hit(proj, rect, pos) {
+                    if let Some(c) = proj.clips.get(index) {
+                        let adjustment = c.gfx.as_ref().map_or(false, |gfx| gfx.kind == crate::project::GfxKind::Adjustment);
+                        let targetable = if transition_drag.is_some() { c.media.is_some() } else { c.media.is_some() || adjustment };
+                        let valid = c.lane.is_video() && targetable && !proj.is_locked(c.lane);
+                        if valid {
+                            let target = self.clip_rect(rect, c).intersect(content);
+                            let color = if effect_drag.is_some() { rgba(180, 140, 255, 235) } else { rgba(255, 210, 130, 235) };
+                            p.rect_filled(target, 3.0, if effect_drag.is_some() { rgba(150, 105, 240, 42) } else { rgba(245, 180, 70, 42) });
+                            p.rect_stroke(target, 3.0, Stroke::new(2.0, color));
+                            let label = if let Some(kind) = effect_drag { format!("DROP {}", kind.label()) }
+                                else if let Some(kind) = transition_drag { format!("DROP {}", kind.label()) }
+                                else { String::new() };
+                            let label_w = (label.chars().count() as f32 * 5.2 + 14.0).min(target.width().max(30.0));
+                            let tag = Rect::from_min_size(target.left_top() + vec2(4.0, 4.0), vec2(label_w, 17.0));
+                            p.rect_filled(tag, 4.0, rgba(14, 18, 32, 225));
+                            p.text(tag.center(), Align2::CENTER_CENTER, label, FontId::monospace(8.0), color);
+                        }
+                    }
+                }
+            }
         }
 
         // ---- drag-in preview from the browser
@@ -1149,6 +1299,14 @@ impl Timeline {
         }
 
         // label strip
+        if let Some(tr) = c.transition_in.filter(|tr| tr.enabled) {
+            let fade_w = (tr.duration as f64 * self.pps) as f32;
+            let body = Rect::from_min_size(pos2(x0, y + LABEL), vec2(fade_w.min(x1 - x0).max(0.0), (hh - LABEL).max(0.0)));
+            if body.width() >= 3.0 {
+                p.rect_filled(body, 0.0, rgba(255, 190, 90, 30));
+                p.line_segment([body.left_bottom(), body.right_top()], Stroke::new(1.0, rgba(255, 210, 140, 170)));
+            }
+        }
         p.rect_filled(Rect::from_min_size(pos2(x0, y), vec2(x1 - x0, LABEL)), 0.0, rgba(40, 48, 70, 230));
         let mut room = x1 - x0 - 12.0;
         let effect_count = c.effects.len();
@@ -1163,13 +1321,23 @@ impl Timeline {
             room -= bw + 8.0;
         }
         let mut label_x = x0 + 6.0;
-        if let Some(_tr) = c.transition_in.filter(|tr| tr.enabled) {
+        if let Some(tr) = c.transition_in.filter(|tr| tr.enabled) {
             if x1 - x0 > 52.0 {
                 let br = Rect::from_min_size(pos2(x0 + 3.0, y + 2.0), vec2(20.0, LABEL - 4.0));
                 p.rect_filled(br, 3.0, rgba(250, 190, 100, 75));
-                p.text(br.center(), Align2::CENTER_CENTER, "TR", FontId::monospace(7.0), rgba(255, 220, 160, 255));
+                let badge = if tr.kind == TransitionKind::Dissolve { "DISS" } else { "TR" };
+                p.text(br.center(), Align2::CENTER_CENTER, badge, FontId::monospace(6.0), rgba(255, 220, 160, 255));
                 room -= 24.0;
                 label_x += 24.0;
+            }
+        }
+        if let Some(effect) = c.effects.iter().find(|effect| effect.enabled) {
+            let title = effect.kind.label();
+            let width = title.chars().count() as f32 * 4.8 + 12.0;
+            if x1 - x0 > width + 12.0 && hh - LABEL > 18.0 {
+                let tag = Rect::from_min_size(pos2(x1 - width - 4.0, y + LABEL + 4.0), vec2(width, 16.0));
+                p.rect_filled(tag, 4.0, rgba(70, 45, 120, 220));
+                p.text(tag.center(), Align2::CENTER_CENTER, title, FontId::monospace(7.0), rgba(226, 211, 255, 255));
             }
         }
         if x1 - x0 > 40.0 {

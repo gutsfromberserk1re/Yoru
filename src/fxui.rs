@@ -56,11 +56,17 @@ fn effect_controls(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &[
         placeholder(ui, "Select a video clip on the timeline to edit its effects.");
         return false;
     };
-    let stack_changed = if clip.media.is_some() && clip.gfx.is_none() {
+    let adjustment = clip.gfx.as_ref().map_or(false, |gfx| gfx.kind == GfxKind::Adjustment);
+    let stack_changed = if (clip.media.is_some() && clip.gfx.is_none()) || adjustment {
         effect_stack(ui, ins, proj, clip.id, t)
     } else {
         false
     };
+    if adjustment {
+        ui.label(RichText::new(&clip.name).color(TEXT));
+        ui.label(RichText::new("Effects on this layer change the picture beneath it.").size(9.0).color(MUTED));
+        return stack_changed;
+    }
     let ts = clip.fx_time(t); // keyframe time = source seconds
     let snapshot = proj.clips.clone();
     let mut fx = clip.fx.clone();
@@ -219,6 +225,7 @@ fn add_graphic_button(ui: &mut Ui, proj: &mut Project, sel: &mut Vec<u32>, t: f6
         GfxKind::Text => ("Title", Gfx::title("Your title")),
         GfxKind::Rect => ("Rectangle", Gfx::rect()),
         GfxKind::Ellipse => ("Ellipse", Gfx::ellipse()),
+        GfxKind::Adjustment => ("Adjustment Layer", Gfx { kind: GfxKind::Adjustment, ..Gfx::rect() }),
     };
     if ui.button(format!("+ {name}")).clicked() {
         let id = proj.add_graphic(t, gfx, name);
@@ -374,7 +381,11 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     let mut fx = proj.clip(id).map(|c| c.fx.clone()).unwrap_or_default();
     let fx_time = proj.clip(id).map(|c| c.fx_time(t)).unwrap_or(0.0);
     let mut transform_changed = false;
-    ui.label(RichText::new(match gfx.kind { GfxKind::Text => "TEXT LAYER", GfxKind::Rect => "RECTANGLE", GfxKind::Ellipse => "ELLIPSE" }).color(MUTED).strong());
+    ui.label(RichText::new(match gfx.kind { GfxKind::Text => "TEXT LAYER", GfxKind::Rect => "RECTANGLE", GfxKind::Ellipse => "ELLIPSE", GfxKind::Adjustment => "ADJUSTMENT LAYER" }).color(MUTED).strong());
+    if gfx.kind == GfxKind::Adjustment {
+        ui.label(RichText::new("Add and edit its effects in the Effect Controls tab.").size(9.0).color(MUTED));
+        return false;
+    }
     if gfx.kind == GfxKind::Text {
         ui.label("Text content");
         let text_resp = ui.add(egui::TextEdit::multiline(&mut gfx.text).hint_text("Type your title...").desired_rows(3).desired_width(f32::INFINITY));

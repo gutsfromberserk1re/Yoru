@@ -29,7 +29,7 @@ mod timeline;
 mod tracking;
 
 use assets::Assets;
-use project::{Clip, EffectKind, EffectInstance, Gfx, Lane, Project, TransitionKind, NPARAM, PARAMS};
+use project::{Clip, EffectKind, EffectInstance, Gfx, GfxKind, Lane, MediaKind, Project, TransitionKind, NPARAM, PARAMS};
 use timeline::{timeline_panel, Ghost, Timeline, Tool};
 
 // ------------------------------------------------------------------ settings
@@ -397,6 +397,43 @@ fn preview_image(
     )
 }
 
+/// Blend two preview images without assuming both source clips have the same dimensions.
+fn blend_preview(base: &mut ColorImage, over: &ColorImage, amount: f32) {
+    if base.pixels.is_empty() || over.pixels.is_empty() { return; }
+    let alpha = amount.clamp(0.0, 1.0);
+    let (bw, bh) = (base.size[0].max(1), base.size[1].max(1));
+    let (ow, oh) = (over.size[0].max(1), over.size[1].max(1));
+    for y in 0..bh {
+        let oy = (y * oh / bh).min(oh - 1);
+        for x in 0..bw {
+            let oi = oy * ow + (x * ow / bw).min(ow - 1);
+            let bi = y * bw + x;
+            let a = base.pixels[bi];
+            let b = over.pixels[oi];
+            let mix = |av: u8, bv: u8| (av as f32 * (1.0 - alpha) + bv as f32 * alpha).round() as u8;
+            base.pixels[bi] = Color32::from_rgba_premultiplied(
+                mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), mix(a.a(), b.a()),
+            );
+        }
+    }
+}
+
+fn apply_adjustment_preview(image: &mut ColorImage, clip: &Clip, timeline_t: f64) -> f32 {
+    if clip.effects.iter().all(|effect| !effect.enabled) { return 0.0; }
+    let (w, h) = (image.size[0], image.size[1]);
+    let mut input = Vec::with_capacity(image.pixels.len() * 4);
+    for pixel in &image.pixels { input.extend_from_slice(&pixel.to_array()); }
+    let mut output = vec![0u8; input.len()];
+    let neutral = std::array::from_fn(|i| PARAMS[i].def);
+    let started = Instant::now();
+    fxrender::render_with_effects(
+        &input, w, h, &neutral, &clip.effects, (timeline_t - clip.start).max(0.0), clip.dur,
+        &mut output, w, h,
+    );
+    *image = ColorImage::from_rgba_premultiplied([w, h], &output);
+    started.elapsed().as_secs_f32() * 1000.0
+}
+
 #[derive(Clone, Copy, Default)]
 struct PreviewTimings {
     effects_ms: f32,
@@ -632,6 +669,13 @@ const EFFECTS: [(&str, &[&str]); 7] = [
     ("Flash & Fade", &["Flash", "Fade In", "Fade Out"]),
 ];
 
+enum BrowserCommand {
+    CreateBin(String),
+    MoveToBin(u32, String),
+    CreateItem(MediaKind),
+    Place(u32),
+}
+
 struct Browser {
     tab: usize,
     sel: usize,
@@ -640,6 +684,10 @@ struct Browser {
     fx_sel: Option<&'static str>,
     transition_sel: Option<TransitionKind>,
     transition_duration: f32,
+    bin_filter: Option<String>,
+    create_bin_open: bool,
+    new_bin_name: String,
+    pending: Option<BrowserCommand>,
     source_paths: HashMap<u32, (PathBuf, bool)>,
     source_check: Instant,
 }
@@ -648,6 +696,7 @@ impl Browser {
     fn refresh_source_status(&mut self, proj: &Project) {
         let refresh_all = self.source_check.elapsed() >= Duration::from_secs(5);
         for media in &proj.media {
+            if media.kind != MediaKind::Video { continue; }
             let changed_path = self.source_paths.get(&media.id).map_or(true, |(path, _)| path != &media.path);
             if refresh_all || changed_path {
                 self.source_paths.insert(media.id, (media.path.clone(), media.path.is_file()));
@@ -658,7 +707,8 @@ impl Browser {
         if refresh_all { self.source_check = Instant::now(); }
     }
 
-    fn source_ready(&self, media_id: u32, path: &Path) -> bool {
+    fn source_ready(&self, media_id: u32, path: &Path, proj: &Project) -> bool {
+        if proj.media(media_id).map_or(false, |media| media.kind != MediaKind::Video) { return true; }
         self.source_paths.get(&media_id)
             .filter(|(known_path, _)| known_path == path)
             .map_or_else(|| path.is_file(), |(_, ready)| *ready)
@@ -680,7 +730,7 @@ fn browser_panel(
 ) -> Option<u32> {
     if b.tab == 0 { b.refresh_source_status(proj); }
     let mut add = None;
-    glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
+    let panel = glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
         paint_panel_gradient(ui, 12.0, 8.0, 12.0, 12.0);
         ui.spacing_mut().item_spacing.y = 8.0;
         // The Project bin owns the imported media pool. Grid/list are two views of the same
@@ -691,6 +741,21 @@ fn browser_panel(
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Project bin").size(10.0).color(MUTED));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.menu_button("⋯", |ui| {
+                            if ui.button("Create Bin…").clicked() {
+                                b.new_bin_name.clear();
+                                b.create_bin_open = true;
+                                ui.close_menu();
+                            }
+                            ui.menu_button("New Item", |ui| {
+                                for kind in [MediaKind::Black, MediaKind::White, MediaKind::Adjustment] {
+                                    if ui.button(kind.label()).clicked() {
+                                        b.pending = Some(BrowserCommand::CreateItem(kind));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
                         if ui.selectable_label(b.view == 1, "List").clicked() { b.view = 1; }
                         if ui.selectable_label(b.view == 0, "Grid").clicked() { b.view = 0; }
                         if ui.button("+ Import").on_hover_text("Import video files into the Project bin").clicked() {
@@ -698,28 +763,38 @@ fn browser_panel(
                         }
                     });
                 });
+                ComboBox::from_id_source("project_bin_filter")
+                    .selected_text(b.bin_filter.as_deref().map_or("All Items", |bin| if bin.is_empty() { "Root" } else { bin }))
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut b.bin_filter, None, "All Items");
+                        ui.selectable_value(&mut b.bin_filter, Some(String::new()), "Root");
+                        for bin in &proj.bins {
+                            ui.selectable_value(&mut b.bin_filter, Some(bin.clone()), bin);
+                        }
+                    });
                 add = if b.view == 0 {
-                    media_grid(ui, proj, assets, &b.source_paths, &mut b.sel, drag)
+                    media_grid(ui, proj, assets, &b.source_paths, &b.bin_filter, &proj.bins, &mut b.sel, drag, &mut b.pending)
                 } else {
-                    media_list(ui, proj, &b.source_paths, &mut b.sel, drag)
+                    media_list(ui, proj, &b.source_paths, &b.bin_filter, &proj.bins, &mut b.sel, drag, &mut b.pending)
                 };
-                if let Some(selected) = proj.media.get(b.sel) {
-                    let source_ready = b.source_ready(selected.id, &selected.path);
+                if let Some(selected) = proj.media.get(b.sel).filter(|media| b.bin_filter.as_ref().map_or(true, |bin| &media.bin == bin)) {
+                    let source_ready = b.source_ready(selected.id, &selected.path, proj);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(if source_ready { "Source file found" } else { "Source offline" }).size(9.0).color(if source_ready { rgba(150, 225, 185, 255) } else { rgba(255, 130, 130, 255) }));
-                        if !source_ready && ui.small_button("Relink…").clicked() {
+                        if selected.kind == MediaKind::Video && !source_ready && ui.small_button("Relink…").clicked() {
                             *relink_requested = Some(selected.id);
                         }
                     });
                     let ready = selected.proxy_path.as_ref().map_or(false, |p| p.is_file());
-                    ui.horizontal(|ui| {
+                    if selected.kind == MediaKind::Video { ui.horizontal(|ui| {
                         ui.label(RichText::new(if ready { "Proxy ready" } else { "Preview proxy: none" }).size(9.0).color(if ready { rgba(150, 225, 185, 255) } else { MUTED }));
                         if ui.add_enabled(source_ready, Button::new(if ready { "Rebuild" } else { "Generate proxy" }))
                             .on_hover_text("Create a 960px proxy for smoother timeline playback; export uses the original source.")
                             .clicked() {
                             *proxy_requested = Some(selected.id);
                         }
-                    });
+                    }); }
                 }
             }
             1 => {
@@ -793,6 +868,43 @@ fn browser_panel(
             }
         }
     });
+    if b.tab == 0 {
+        panel.response.context_menu(|ui| {
+            if ui.button("Create Bin…").clicked() {
+                b.pending = Some(BrowserCommand::CreateBin(String::new()));
+                ui.close_menu();
+            }
+            ui.menu_button("New Item", |ui| {
+                for kind in [MediaKind::Black, MediaKind::White, MediaKind::Adjustment] {
+                    if ui.button(kind.label()).clicked() {
+                        b.pending = Some(BrowserCommand::CreateItem(kind));
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    }
+    if b.create_bin_open {
+        let mut open = b.create_bin_open;
+        let mut create = false;
+        Window::new("Create Bin")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label("Give this bin a name.");
+                ui.add(TextEdit::singleline(&mut b.new_bin_name).desired_width(240.0));
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() { create = true; }
+                    if ui.button("Cancel").clicked() { open = false; }
+                });
+            });
+        b.create_bin_open = open;
+        if create {
+            b.pending = Some(BrowserCommand::CreateBin(b.new_bin_name.trim().to_string()));
+            b.create_bin_open = false;
+        }
+    }
     add
 }
 
@@ -807,9 +919,40 @@ fn fmt_len(sec: f64) -> String {
 
 /// The Clips tab: one card per imported file with its real thumbnail. Click selects,
 /// double-click appends to the timeline, dragging it onto a track places it there.
-fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, source_paths: &HashMap<u32, (PathBuf, bool)>, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
-    if proj.media.is_empty() {
-        placeholder(ui, "Click + Import, or drop video files onto the window.");
+fn media_context_menu(ui: &mut Ui, media: &project::Media, bins: &[String], pending: &mut Option<BrowserCommand>) {
+    if ui.button("Add to Timeline").clicked() {
+        *pending = Some(BrowserCommand::Place(media.id));
+        ui.close_menu();
+    }
+    ui.menu_button("Move to Bin", |ui| {
+        if ui.button("Root").clicked() { *pending = Some(BrowserCommand::MoveToBin(media.id, String::new())); ui.close_menu(); }
+        for bin in bins {
+            if ui.button(bin).clicked() { *pending = Some(BrowserCommand::MoveToBin(media.id, bin.clone())); ui.close_menu(); }
+        }
+    });
+    if ui.button("Create Bin…").clicked() {
+        *pending = Some(BrowserCommand::CreateBin(String::new()));
+        ui.close_menu();
+    }
+    ui.menu_button("New Item", |ui| {
+        for kind in [MediaKind::Black, MediaKind::White, MediaKind::Adjustment] {
+            if ui.button(kind.label()).clicked() {
+                *pending = Some(BrowserCommand::CreateItem(kind));
+                ui.close_menu();
+            }
+        }
+    });
+}
+
+fn media_grid(
+    ui: &mut Ui, proj: &Project, assets: &Assets, source_paths: &HashMap<u32, (PathBuf, bool)>,
+    bin_filter: &Option<String>, bins: &[String], sel: &mut usize, drag: &mut Option<u32>,
+    pending: &mut Option<BrowserCommand>,
+) -> Option<u32> {
+    let visible: Vec<(usize, &project::Media)> = proj.media.iter().enumerate()
+        .filter(|(_, media)| bin_filter.as_ref().map_or(true, |bin| &media.bin == bin)).collect();
+    if visible.is_empty() {
+        placeholder(ui, if proj.media.is_empty() { "Click + Import, or drop video files onto the window." } else { "This bin is empty. Right-click to create an item or import media." });
         return None;
     }
     let mut add = None;
@@ -818,29 +961,37 @@ fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, source_paths: &HashM
         let cell_w = ((ui.available_width() - gap) / 2.0).floor().max(60.0);
         let thumb_h = (cell_w * 9.0 / 16.0).floor();
         let cell_h = thumb_h + 22.0;
-        let rows = proj.media.len().div_ceil(2) as f32;
+        let rows = visible.len().div_ceil(2) as f32;
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), rows * (cell_h + gap)), Sense::hover());
-        for (i, m) in proj.media.iter().enumerate() {
-            let x = area.left() + (i % 2) as f32 * (cell_w + gap);
-            let y = area.top() + (i / 2) as f32 * (cell_h + gap);
+        for (visual, (i, m)) in visible.iter().copied().enumerate() {
+            let x = area.left() + (visual % 2) as f32 * (cell_w + gap);
+            let y = area.top() + (visual / 2) as f32 * (cell_h + gap);
             let cell = Rect::from_min_size(pos2(x, y), vec2(cell_w, cell_h));
             let tr = Rect::from_min_size(cell.min, vec2(cell_w, thumb_h));
             let resp = ui.interact(cell, ui.id().with(("media_cell", m.id)), Sense::click_and_drag());
             let p = ui.painter();
-            match assets.thumb_at(m.id, 0.0) {
+            match m.kind {
+                MediaKind::Black => { p.rect_filled(tr, 4.0, Color32::BLACK); }
+                MediaKind::White => { p.rect_filled(tr, 4.0, Color32::WHITE); }
+                MediaKind::Adjustment => {
+                    rounded_gradient(p, tr, 4.0, rgba(120, 95, 200, 255), rgba(45, 35, 75, 255));
+                    p.text(tr.center(), Align2::CENTER_CENTER, "ADJUSTMENT", FontId::monospace(9.0), TEXT);
+                }
+                MediaKind::Video => match assets.thumb_at(m.id, 0.0) {
                 Some((tex, _)) => {
                     p.image(tex.id(), tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
                 None => rounded_gradient(p, tr, 4.0, hsv(thumb_hue(m.seed, 0), 35.0, 55.0), hsv(thumb_hue(m.seed, 0), 45.0, 25.0)),
+                },
             }
             let on = *sel == i;
             p.rect_stroke(tr, 4.0, Stroke::new(if on { 2.0 } else { 1.0 }, if on { TEXT } else { rgba(145, 151, 160, 120) }));
-            if m.duration > 0.0 {
+            if m.duration > 0.0 && m.kind == MediaKind::Video {
                 let badge = Rect::from_min_size(pos2(tr.right() - 44.0, tr.bottom() - 17.0), vec2(40.0, 13.0));
                 p.rect_filled(badge, 3.0, rgba(0, 0, 0, 150));
                 p.text(badge.center(), Align2::CENTER_CENTER, fmt_len(m.duration), FontId::monospace(8.0), TEXT);
             }
-            if !source_paths.get(&m.id).map_or_else(|| m.path.is_file(), |(path, ready)| path == &m.path && *ready) {
+            if m.kind == MediaKind::Video && !source_paths.get(&m.id).map_or_else(|| m.path.is_file(), |(path, ready)| path == &m.path && *ready) {
                 let offline = Rect::from_min_size(pos2(tr.left() + 5.0, tr.top() + 5.0), vec2(48.0, 14.0));
                 p.rect_filled(offline, 3.0, rgba(125, 35, 42, 230));
                 p.text(offline.center(), Align2::CENTER_CENTER, "OFFLINE", FontId::monospace(8.0), TEXT);
@@ -857,23 +1008,29 @@ fn media_grid(ui: &mut Ui, proj: &Project, assets: &Assets, source_paths: &HashM
                 *sel = i;
                 *drag = Some(m.id);
             }
+            resp.context_menu(|ui| media_context_menu(ui, m, bins, pending));
         }
     });
     add
 }
 
-fn media_list(ui: &mut Ui, proj: &Project, source_paths: &HashMap<u32, (PathBuf, bool)>, sel: &mut usize, drag: &mut Option<u32>) -> Option<u32> {
-    if proj.media.is_empty() {
-        placeholder(ui, "Click + Import, or drop video files onto the window.");
+fn media_list(
+    ui: &mut Ui, proj: &Project, source_paths: &HashMap<u32, (PathBuf, bool)>, bin_filter: &Option<String>,
+    bins: &[String], sel: &mut usize, drag: &mut Option<u32>, pending: &mut Option<BrowserCommand>,
+) -> Option<u32> {
+    let visible: Vec<(usize, &project::Media)> = proj.media.iter().enumerate()
+        .filter(|(_, media)| bin_filter.as_ref().map_or(true, |bin| &media.bin == bin)).collect();
+    if visible.is_empty() {
+        placeholder(ui, if proj.media.is_empty() { "Click + Import, or drop video files onto the window." } else { "This bin is empty. Right-click to create an item or import media." });
         return None;
     }
     ui.label(RichText::new("Double-click to append - drag onto a track (Ctrl = insert)").size(10.0).color(MUTED));
     let mut add = None;
     ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        for (i, m) in proj.media.iter().enumerate() {
+        for (i, m) in visible.iter().copied() {
             let len = if m.duration > 0.0 { fmt_tc(m.duration) } else { "--".into() };
-            let source_ready = source_paths.get(&m.id).map_or_else(|| m.path.is_file(), |(path, ready)| path == &m.path && *ready);
-            let text = format!("{}   {}{}{}", m.name, len, if m.has_audio { "" } else { "   (no audio)" }, if source_ready { "" } else { "   (OFFLINE)" });
+            let source_ready = m.kind != MediaKind::Video || source_paths.get(&m.id).map_or_else(|| m.path.is_file(), |(path, ready)| path == &m.path && *ready);
+            let text = format!("{}   {}{}{}", m.name, if m.kind == MediaKind::Video { len } else { m.kind.label().to_string() }, if m.has_audio { "" } else { "   (no audio)" }, if source_ready { "" } else { "   (OFFLINE)" });
             let label = RichText::new(text).color(if source_ready { if *sel == i { TEXT } else { MUTED } } else { rgba(255, 130, 130, 255) });
             let r = ui.selectable_label(*sel == i, label).interact(Sense::click_and_drag());
             if r.clicked() {
@@ -886,6 +1043,7 @@ fn media_list(ui: &mut Ui, proj: &Project, source_paths: &HashMap<u32, (PathBuf,
                 *sel = i;
                 *drag = Some(m.id);
             }
+            r.context_menu(|ui| media_context_menu(ui, m, bins, pending));
         }
     });
     add
@@ -1108,6 +1266,7 @@ struct App {
     ghost: Option<Ghost>,
     last_params: Option<[f32; NPARAM]>,
     last_effects: Option<Vec<EffectInstance>>,
+    last_adjustment_effects: Vec<(u32, Vec<EffectInstance>)>,
     autosave_path: PathBuf,
     last_change: Instant,
     last_autosave: Instant,
@@ -1141,7 +1300,8 @@ impl App {
             inspector: fxui::Inspector::new(),
             browser: Browser {
                 tab: 0, sel: 0, view: 0, search: String::new(), fx_sel: None, transition_sel: None,
-                transition_duration: 0.8, source_paths: HashMap::new(), source_check: Instant::now(),
+                transition_duration: 0.8, bin_filter: None, create_bin_open: false, new_bin_name: String::new(),
+                pending: None, source_paths: HashMap::new(), source_check: Instant::now(),
             },
             proj: Project::new(),
             engine: engine::Engine::new(),
@@ -1163,6 +1323,7 @@ impl App {
             ghost: None,
             last_params: None,
             last_effects: None,
+            last_adjustment_effects: Vec::new(),
             autosave_path,
             last_change: now,
             last_autosave: now,
@@ -1248,9 +1409,10 @@ impl App {
         self.tracking_runtime.clear();
         self.assets = Assets::new();
         for m in &self.proj.media {
+            if m.kind != MediaKind::Video { continue; }
             self.assets.spawn(ctx, m.id, &m.path, m.duration, m.has_audio);
             let preview_path = m.proxy_path.as_ref().filter(|path| path.is_file()).unwrap_or(&m.path);
-            match media::Player::open(preview_path, ctx.clone()) {
+            match self.engine.open_player(preview_path, ctx.clone()) {
                 Ok(player) => self.engine.insert(m.id, player),
                 Err(e) => eprintln!("cannot reopen media {}: {e}", preview_path.display()),
             }
@@ -1498,6 +1660,7 @@ impl App {
     fn after_edit(&mut self) {
         // Keep serialized point data intact for undo/redo; only discard the transient templates.
         self.tracking_runtime.clear();
+        self.timeline.invalidate_clip_index();
         set_duration(self.proj.end().max(10.0));
         self.t = self.t.min(duration());
         let proj = &self.proj;
@@ -1848,17 +2011,49 @@ impl eframe::App for App {
                 if changed && !self.dirty { self.mark_dirty(); }
             }
         }
-        let active = self.proj.video_clip_at(self.t).map(|c| {
-            (c.fx.eval(c.fx_time(self.t)), c.effects.clone(), (self.t - c.start).max(0.0), c.dur)
+        let active_clip = self.proj.video_clip_at(self.t);
+        let params = active_clip.map(|c| c.fx.eval(c.fx_time(self.t)));
+        let effects = active_clip.map(|c| c.effects.as_slice());
+        let effects_changed = effects.map_or(self.last_effects.is_some(), |fx| {
+            self.last_effects.as_deref() != Some(fx)
         });
-        let params = active.as_ref().map(|a| a.0);
-        let effects = active.as_ref().map(|a| a.1.clone());
-        let effects_changed = effects != self.last_effects;
-        if new_frame || params != self.last_params || effects_changed {
+        let active_adjustments: Vec<&Clip> = self.proj.clips.iter()
+            .filter(|clip| clip.gfx.as_ref().map_or(false, |gfx| gfx.kind == GfxKind::Adjustment)
+                && clip.lane.is_video() && !self.proj.hidden[clip.lane.slot()] && clip.start <= self.t && self.t < clip.end())
+            .collect();
+        let adjustment_effects_changed = active_adjustments.len() != self.last_adjustment_effects.len()
+            || active_adjustments.iter().zip(&self.last_adjustment_effects)
+                .any(|(clip, (id, effects))| clip.id != *id || clip.effects != *effects);
+        if adjustment_effects_changed {
+            self.last_adjustment_effects = active_adjustments.iter().map(|clip| (clip.id, clip.effects.clone())).collect();
+        }
+        if new_frame || params != self.last_params || effects_changed || adjustment_effects_changed {
             self.last_params = params;
-            self.last_effects = effects.clone();
-            if let (Some(f), Some(pr), Some((_, fx, local_time, dur))) = (self.engine.current(), params, active) {
-                let (img, aspect, timings) = preview_image(f, &pr, &fx, local_time, dur);
+            if effects_changed {
+                self.last_effects = effects.map(|fx| fx.to_vec());
+            }
+            if let (Some(f), Some(pr), Some(clip)) = (self.engine.current(), params, active_clip) {
+                let (mut img, aspect, mut timings) = preview_image(f, &pr, &clip.effects, (self.t - clip.start).max(0.0), clip.dur);
+                if let Some((outgoing, incoming, progress)) = self.proj.dissolve_at(self.t) {
+                    if let Some(media_id) = outgoing.media {
+                        if Some(media_id) != incoming.media {
+                            if let Some(out_frame) = self.engine.frame_for_media(media_id) {
+                                let local_time = (out_frame.pts - outgoing.src_off).clamp(0.0, outgoing.dur);
+                                let out_params = outgoing.fx.eval(out_frame.pts);
+                                let (out_img, _, out_timings) = preview_image(
+                                    out_frame, &out_params, &outgoing.effects, local_time, outgoing.dur,
+                                );
+                                let blend_started = Instant::now();
+                                blend_preview(&mut img, &out_img, 1.0 - progress);
+                                timings.effects_ms += out_timings.effects_ms;
+                                timings.image_ms += out_timings.image_ms + blend_started.elapsed().as_secs_f32() * 1000.0;
+                            }
+                        }
+                    }
+                }
+                for adjustment in &active_adjustments {
+                    timings.effects_ms += apply_adjustment_preview(&mut img, adjustment, self.t);
+                }
                 self.tex_aspect = aspect;
                 self.profile.effects_ms = timings.effects_ms;
                 self.profile.image_ms = timings.image_ms;
@@ -1876,7 +2071,7 @@ impl eframe::App for App {
         let aspect = self.tex_aspect;
         let video = self.tex.as_ref().map(|t| (t.id(), aspect));
         let overlays: Vec<gfxdraw::Overlay> = self.proj.clips.iter()
-            .filter(|c| c.gfx.is_some() && c.lane.is_video() && !self.proj.hidden[c.lane.slot()] && c.start <= self.t && self.t < c.end())
+            .filter(|c| c.gfx.as_ref().map_or(false, |gfx| gfx.kind != GfxKind::Adjustment) && c.lane.is_video() && !self.proj.hidden[c.lane.slot()] && c.start <= self.t && self.t < c.end())
             .filter_map(|c| c.gfx.clone().map(|gfx| gfxdraw::Overlay { gfx, v: c.fx.eval(c.fx_time(self.t)) }))
             .collect();
         let active_clip_id = self.proj.video_clip_at(self.t).map(|clip| clip.id);
@@ -1975,6 +2170,48 @@ impl eframe::App for App {
                         add_tracking_at = track_click;
                     });
                 });
+        }
+        match self.browser.pending.take() {
+            Some(BrowserCommand::CreateBin(name)) if name.is_empty() => {
+                self.browser.new_bin_name.clear();
+                self.browser.create_bin_open = true;
+            }
+            Some(BrowserCommand::CreateBin(name)) => {
+                if self.proj.create_bin(&name) {
+                    self.browser.bin_filter = Some(name);
+                    self.mark_dirty();
+                } else {
+                    self.browser.new_bin_name = name;
+                    self.browser.create_bin_open = true;
+                }
+            }
+            Some(BrowserCommand::MoveToBin(id, bin)) => {
+                if self.proj.move_media_to_bin(id, &bin) { self.mark_dirty(); }
+            }
+            Some(BrowserCommand::CreateItem(kind)) => {
+                let id = self.proj.create_media_item(kind);
+                self.browser.bin_filter = None;
+                self.browser.sel = self.proj.media.iter().position(|media| media.id == id).unwrap_or(0);
+                self.mark_dirty();
+            }
+            Some(BrowserCommand::Place(id)) => add_media = Some(id),
+            None => {}
+        }
+        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+            let drag_label = self.effect_drag.map(|kind| format!("✊  {} · drop on clip", kind.label()))
+                .or_else(|| self.transition_drag.map(|kind| format!("✊  {} · drop on clip", kind.label())));
+            if let Some(label) = drag_label {
+                egui::Area::new(Id::new("effect_drag_cursor"))
+                    .fixed_pos(pos + vec2(18.0, 18.0))
+                    .order(Order::Tooltip)
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::none().fill(rgba(14, 18, 32, 235)).rounding(6.0).inner_margin(6.0).show(ui, |ui| {
+                            ui.label(RichText::new(label).monospace().size(10.0).color(TEXT));
+                        });
+                    });
+                ctx.request_repaint();
+            }
         }
         // A point is seeded from the current decoded image, then tracked on later preview frames.
         if let (Some((x, y)), Some(clip)) = (add_tracking_at, self.proj.video_clip_at(self.t)) {

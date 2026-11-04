@@ -5,7 +5,7 @@
 //! (hundreds of entries), so a snapshot is cheaper and far less bug-prone than per-edit inverses,
 //! and a whole mouse drag (or slider drag) collapses into one undo step.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const EPS: f64 = 1e-6;
 pub const MIN_DUR: f64 = 0.1;
@@ -559,7 +559,19 @@ impl AudioPreset {
 
 // ---------------------------------------------------------------- title / shape graphics
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GfxKind { Text, Rect, Ellipse }
+pub enum GfxKind { Text, Rect, Ellipse, Adjustment }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaKind { Video, Black, White, Adjustment }
+impl MediaKind {
+    pub fn label(self) -> &'static str {
+        match self { Self::Video => "Video", Self::Black => "Black Video", Self::White => "White Video", Self::Adjustment => "Adjustment Layer" }
+    }
+    pub fn id(self) -> u8 { match self { Self::Video => 0, Self::Black => 1, Self::White => 2, Self::Adjustment => 3 } }
+    pub fn from_id(id: u8) -> Option<Self> {
+        Some(match id { 0 => Self::Video, 1 => Self::Black, 2 => Self::White, 3 => Self::Adjustment, _ => return None })
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Gfx {
@@ -700,8 +712,25 @@ pub struct Media {
     pub duration: f64,
     pub has_audio: bool,
     pub seed: u32,
+    pub kind: MediaKind,
+    /// Empty string is the root of the Project bin.
+    pub bin: String,
     /// Optional low-resolution proxy used for interactive preview only. Export uses `path`.
     pub proxy_path: Option<PathBuf>,
+}
+
+/// One audible media clip at the current timeline position, prepared for the live mix bus.
+#[derive(Clone)]
+pub struct AudioSource<'a> {
+    pub clip_id: u32,
+    pub media_id: u32,
+    pub path: &'a Path,
+    pub source_t: f64,
+    /// source time = timeline time + map
+    pub map: f64,
+    pub gain: f32,
+    pub preset: AudioPreset,
+    pub master: bool,
 }
 
 /// One normalized point sample from a source-media frame (0..1 in each axis).
@@ -760,6 +789,7 @@ pub enum DragOp {
 
 pub struct Project {
     pub media: Vec<Media>,
+    pub bins: Vec<String>,
     pub clips: Vec<Clip>,
     /// Point-tracking samples are clip-scoped and saved with the project.
     pub tracking_points: Vec<TrackingPoint>,
@@ -799,6 +829,7 @@ impl Project {
     fn empty() -> Self {
         Project {
             media: vec![],
+            bins: vec![],
             clips: vec![],
             tracking_points: vec![],
             locked: [false; NTRACKS],
@@ -900,7 +931,8 @@ impl Project {
     /// Applies a non-destructive effect to a video clip and records one undo step.
     pub fn apply_effect(&mut self, clip_id: u32, kind: EffectKind, local_time: f64) -> bool {
         let Some(c) = self.clip(clip_id) else { return false };
-        if !c.lane.is_video() || c.gfx.is_some() || c.media.is_none() { return false; }
+        let adjustment = c.gfx.as_ref().map_or(false, |g| g.kind == GfxKind::Adjustment);
+        if !c.lane.is_video() || (!adjustment && (c.gfx.is_some() || c.media.is_none())) { return false; }
         let pre = self.clips.clone();
         if let Some(c) = self.clip_mut(clip_id) {
             c.effects.push(EffectInstance::new(kind, local_time));
@@ -954,6 +986,33 @@ impl Project {
             .iter()
             .find(|a| a.link == v.link && !a.lane.is_video())
             .map_or(AudioPreset::Neutral, |a| a.audio_preset)
+    }
+
+    /// Every unmuted audio clip crossing `t`, including independent music and voiceover lanes.
+    pub fn audio_sources_at(&self, t: f64) -> Vec<AudioSource<'_>> {
+        let linked = self.video_clip_at(t).map(|clip| clip.link).filter(|link| *link != 0);
+        self.clips.iter().filter_map(|clip| {
+            if clip.lane.is_video() || self.hidden[clip.lane.slot()] || clip.start > t || t >= clip.end() {
+                return None;
+            }
+            let media_id = clip.media?;
+            let media = self.media(media_id)?;
+            if !media.has_audio { return None; }
+            let local = t - clip.start;
+            let mut gain = (clip.audio_gain_at(local) / 100.0).clamp(0.0, 4.0);
+            if clip.fade_in > 0.0 { gain *= (local / clip.fade_in).clamp(0.0, 1.0) as f32; }
+            if clip.fade_out > 0.0 { gain *= ((clip.end() - t) / clip.fade_out).clamp(0.0, 1.0) as f32; }
+            Some(AudioSource {
+                clip_id: clip.id,
+                media_id,
+                path: media.path.as_path(),
+                source_t: clip.src_off + local,
+                map: clip.src_off - clip.start,
+                gain,
+                preset: clip.audio_preset,
+                master: linked.map_or(false, |link| link == clip.link),
+            })
+        }).collect()
     }
 
     fn alloc(&mut self) -> u32 {
@@ -1010,6 +1069,21 @@ impl Project {
             .filter(|c| c.lane.is_video() && c.media.is_some() && !self.hidden[c.lane.slot()] && c.start <= t && t < c.end())
             .max_by_key(|c| c.lane.slot())
     }
+
+    /// Active cross dissolve and the outgoing clip on the same track. The outgoing frame is kept
+    /// by the preview decoder after the cut, allowing the monitor to blend without reopening it.
+    pub fn dissolve_at(&self, t: f64) -> Option<(&Clip, &Clip, f32)> {
+        let incoming = self.video_clip_at(t)?;
+        let transition = incoming.transition_in.filter(|tr| tr.enabled && tr.kind == TransitionKind::Dissolve)?;
+        let elapsed = t - incoming.start;
+        if elapsed < 0.0 || elapsed >= transition.duration as f64 { return None; }
+        let outgoing = self.clips.iter()
+            .filter(|c| c.lane == incoming.lane && c.media.is_some() && c.end() <= incoming.start + EPS)
+            .max_by(|a, b| a.end().partial_cmp(&b.end()).unwrap_or(std::cmp::Ordering::Equal))?;
+        if (outgoing.end() - incoming.start).abs() > EPS { return None; }
+        Some((outgoing, incoming, (elapsed / transition.duration as f64).clamp(0.0, 1.0) as f32))
+    }
+
     pub fn next_video_clip_after(&self, t: f64) -> Option<&Clip> {
         self.clips
             .iter()
@@ -1066,7 +1140,32 @@ impl Project {
             return m.id;
         }
         let id = self.alloc();
-        self.media.push(Media { id, path, name, duration, has_audio, seed: id % 9 + 1, proxy_path: None });
+        self.media.push(Media { id, path, name, duration, has_audio, seed: id % 9 + 1, kind: MediaKind::Video, bin: String::new(), proxy_path: None });
+        id
+    }
+
+    pub fn create_bin(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || name.chars().any(|ch| ch == '\t' || ch == '\n' || ch == '\r')
+            || self.bins.iter().any(|bin| bin.eq_ignore_ascii_case(name)) { return false; }
+        self.bins.push(name.to_string());
+        true
+    }
+
+    pub fn move_media_to_bin(&mut self, media_id: u32, bin: &str) -> bool {
+        if !bin.is_empty() && !self.bins.iter().any(|known| known == bin) { return false; }
+        let Some(media) = self.media.iter_mut().find(|media| media.id == media_id) else { return false };
+        if media.bin == bin { return false; }
+        media.bin = bin.to_string();
+        true
+    }
+
+    pub fn create_media_item(&mut self, kind: MediaKind) -> u32 {
+        let id = self.alloc();
+        self.media.push(Media {
+            id, path: PathBuf::new(), name: kind.label().to_string(), duration: 10.0,
+            has_audio: false, seed: id % 9 + 1, kind, bin: String::new(), proxy_path: None,
+        });
         id
     }
 
@@ -1080,6 +1179,7 @@ impl Project {
     /// Replace an offline source path while preserving its existing timeline edits and trims.
     pub fn relink_media(&mut self, media_id: u32, path: PathBuf, has_audio: bool) -> bool {
         let Some(m) = self.media.iter_mut().find(|m| m.id == media_id) else { return false };
+        if m.kind != MediaKind::Video { return false; }
         m.name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| m.name.clone());
         m.path = path;
         m.has_audio = has_audio;
@@ -1089,7 +1189,7 @@ impl Project {
 
     /// Appends the media after the last clip on V1.
     pub fn append_media(&mut self, media_id: u32) -> bool {
-        let at = self.clips.iter().filter(|c| c.lane == Lane::V1 && c.media.is_some()).map(Clip::end).fold(0.0, f64::max);
+        let at = self.clips.iter().filter(|c| c.lane == Lane::V1 && (c.media.is_some() || c.gfx.is_some())).map(Clip::end).fold(0.0, f64::max);
         self.place_media(media_id, Lane::V1, at, false).is_some()
     }
 
@@ -1100,6 +1200,38 @@ impl Project {
             return None;
         }
         let m = self.media(media_id)?;
+        if m.kind != MediaKind::Video {
+            let (kind, name, seed, dur) = (m.kind, m.name.clone(), m.seed, m.duration.max(MIN_DUR));
+            let pre = self.clips.clone();
+            let start = start.max(0.0);
+            if self.clips.iter().all(|c| c.media.is_none() && c.gfx.is_none()) { self.clips.clear(); }
+            if insert {
+                self.cut_inner(start);
+                let locked = self.locked;
+                for c in self.clips.iter_mut().filter(|c| !locked[c.lane.slot()] && c.start >= start - EPS) { c.start += dur; }
+            }
+            let mut gfx = Gfx::rect();
+            gfx.w = 1920.0;
+            gfx.h = 1080.0;
+            gfx.outline = 0.0;
+            gfx.color = match kind {
+                MediaKind::Black => [0, 0, 0, 255],
+                MediaKind::White => [255, 255, 255, 255],
+                MediaKind::Adjustment => [0, 0, 0, 0],
+                MediaKind::Video => unreachable!(),
+            };
+            gfx.kind = if kind == MediaKind::Adjustment { GfxKind::Adjustment } else { GfxKind::Rect };
+            let id = self.alloc();
+            self.clips.push(Clip {
+                id, link: 0, lane, start, dur, src_off: 0.0, src_len: dur, name,
+                seed, media: None, fx: Fx::default(), effects: Vec::new(), transition_in: None,
+                gfx: Some(gfx), audio_gain: 100.0, audio_preset: AudioPreset::Neutral,
+                fade_in: 0.0, fade_out: 0.0, audio_keys: Vec::new(),
+            });
+            if !insert { self.resolve_overwrite(&[id]); }
+            self.push_undo(pre);
+            return Some(id);
+        }
         let (name, seed, audio) = (m.name.clone(), m.seed, m.has_audio);
         let known = m.duration > MIN_DUR;
         let dur = if known { m.duration } else { 10.0 };
@@ -1461,8 +1593,12 @@ impl Project {
     // ---------------------------------------------------------------- save / load
     /// Plain-text project format (tab separated; names/paths are the last field of a line).
     pub fn to_text(&self) -> String {
-        let mut s = String::from("YORU 10\n");
+        let mut s = String::from("YORU 11\n");
         s += &format!("N\t{}\n", self.next_id);
+        for bin in &self.bins {
+            let escaped = bin.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
+            s += &format!("BIN\t{}\n", escaped);
+        }
         for m in &self.media {
             s += &format!(
                 "M\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -1470,6 +1606,11 @@ impl Project {
             );
             if let Some(proxy) = &m.proxy_path {
                 s += &format!("P\t{}\t{}\n", m.id, proxy.to_string_lossy());
+            }
+            if m.kind != MediaKind::Video { s += &format!("MK\t{}\t{}\n", m.id, m.kind.id()); }
+            if !m.bin.is_empty() {
+                let escaped = m.bin.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
+                s += &format!("MB\t{}\t{}\n", m.id, escaped);
             }
         }
         for point in &self.tracking_points {
@@ -1499,7 +1640,7 @@ impl Project {
         }
         for c in &self.clips {
             if let Some(g) = &c.gfx {
-                let kind = match g.kind { GfxKind::Text => 0, GfxKind::Rect => 1, GfxKind::Ellipse => 2 };
+                let kind = match g.kind { GfxKind::Text => 0, GfxKind::Rect => 1, GfxKind::Ellipse => 2, GfxKind::Adjustment => 3 };
                 let esc = g.text.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
                 s += &format!("G\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     c.id, kind, g.w, g.h, g.color[0], g.color[1], g.color[2], g.color[3],
@@ -1547,6 +1688,7 @@ impl Project {
             Some("YORU 8") => 8,
             Some("YORU 9") => 9,
             Some("YORU 10") => 10,
+            Some("YORU 11") => 11,
             _ => return Err("not a Yoru project file".into()),
         };
         let mut p = Project::empty();
@@ -1558,6 +1700,7 @@ impl Project {
             let f: Vec<&str> = if line.starts_with("C\t") { line.splitn(19, '\t').collect() } else if line.starts_with("P\t") { line.splitn(3, '\t').collect() } else { line.splitn(32, '\t').collect() };
             match f[0] {
                 "N" => p.next_id = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
+                "BIN" if ver >= 11 && f.len() == 2 => p.bins.push(unescape_gfx(f[1])),
                 "TP" if ver >= 10 && f.len() == 4 => {
                     let id: u32 = f[1].parse().map_err(|_| bad())?;
                     let clip_id: u32 = f[2].parse().map_err(|_| bad())?;
@@ -1582,8 +1725,19 @@ impl Project {
                     seed: f[4].parse().map_err(|_| bad())?,
                     name: f[5].to_string(),
                     path: PathBuf::from(f[6..].join("\t")),
+                    kind: MediaKind::Video,
+                    bin: String::new(),
                     proxy_path: None,
                 }),
+                "MK" if ver >= 11 && f.len() == 3 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    let kind = MediaKind::from_id(f[2].parse().map_err(|_| bad())?).ok_or_else(bad)?;
+                    if let Some(media) = p.media.iter_mut().find(|media| media.id == id) { media.kind = kind; }
+                }
+                "MB" if ver >= 11 && f.len() == 3 => {
+                    let id: u32 = f[1].parse().map_err(|_| bad())?;
+                    if let Some(media) = p.media.iter_mut().find(|media| media.id == id) { media.bin = unescape_gfx(f[2]); }
+                }
                 "C" if (ver == 1 && f.len() == 11) || (ver >= 2 && f.len() == 19) => {
                     let media: u32 = f[9].parse().map_err(|_| bad())?;
                     let mut fx = Fx::default();
@@ -1676,7 +1830,7 @@ impl Project {
                 "G" if f.len() >= 24 => {
                     let id: u32 = f[1].parse().map_err(|_| bad())?;
                     let kind = match f[2].parse::<u8>().map_err(|_| bad())? {
-                        0 => GfxKind::Text, 1 => GfxKind::Rect, 2 => GfxKind::Ellipse, _ => return Err(bad()),
+                        0 => GfxKind::Text, 1 => GfxKind::Rect, 2 => GfxKind::Ellipse, 3 => GfxKind::Adjustment, _ => return Err(bad()),
                     };
                     let unesc = unescape_gfx(&f[23..].join("\t"));
                     let color = [f[5].parse().map_err(|_| bad())?, f[6].parse().map_err(|_| bad())?, f[7].parse().map_err(|_| bad())?, f[8].parse().map_err(|_| bad())?];
@@ -1862,7 +2016,7 @@ mod tests {
         let id = p.add_tracking_point(clip_id, 0.25, 0.42, 0.61).unwrap();
         assert!(p.set_tracking_sample(id, 0.50, 0.48, 0.65));
         let saved = p.to_text();
-        assert!(saved.starts_with("YORU 10\n"));
+        assert!(saved.starts_with("YORU 11\n"));
         let q = Project::from_text(&saved).expect("tracking project parses");
         assert_eq!(q.tracking_points.len(), 1);
         assert_eq!(q.tracking_points[0].name, "Point 1");
@@ -1921,8 +2075,8 @@ mod tests {
         p.clip_mut(audio_id).unwrap().audio_preset = AudioPreset::Podcast;
 
         let saved = p.to_text();
-        assert!(saved.starts_with("YORU 10\n"));
-        let q = Project::from_text(&saved).expect("YORU 10 project parses");
+        assert!(saved.starts_with("YORU 11\n"));
+        let q = Project::from_text(&saved).expect("YORU 11 project parses");
         assert_eq!(q.media(media_id).unwrap().proxy_path.as_deref(), Some(Path::new("proxies/a.mp4")));
         assert_eq!(q.clip(video_id).unwrap().transition_in.unwrap().kind, TransitionKind::DiamondIris);
         assert_eq!(q.clip(video_id).unwrap().effects[0].keys[0].len(), 2);
@@ -1933,7 +2087,7 @@ mod tests {
     #[test]
     fn yoru9_projects_still_load_after_v10_expansion() {
         let (p, _) = media_project();
-        let old_text = p.to_text().replacen("YORU 10\n", "YORU 9\n", 1);
+        let old_text = p.to_text().replacen("YORU 11\n", "YORU 9\n", 1);
         let q = Project::from_text(&old_text).expect("YORU 9 project remains readable");
         for c in &q.clips {
             assert_eq!(c.audio_preset, AudioPreset::Neutral);

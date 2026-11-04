@@ -298,6 +298,7 @@ fn graphic_filter(clip: &Clip, duration: f64, settings: &ExportSettings, label: 
     let font_size = format!("max(1,{}*({sc})/100*h/1080)", num(g.size as f64));
     let mut chain = format!("color=c=black@0.0:s={}x{}:r={}:d={},format=rgba", settings.width, settings.height, settings.fps, num(duration));
     match g.kind {
+        GfxKind::Adjustment => {},
         GfxKind::Rect | GfxKind::Ellipse => {
             chain.push_str(&format!(",drawbox=x='{}':y='{}':w='{}':h='{}':color={}:t=fill", x, y, w, h, alpha(g.color)));
             if g.outline > 0.0 {
@@ -360,7 +361,9 @@ pub fn build_args(project: &Project, output: &Path, settings: &ExportSettings, s
     let fps = settings.fps.clamp(12, 120);
     let duration = project.end().max(0.1);
     let video_clips: Vec<Clip> = project.clips.iter().filter(|c| c.lane.is_video() && !project.hidden[c.lane.slot()] && (c.media.is_some() || c.gfx.is_some()) && c.dur > 0.0).cloned().collect();
-    if !video_clips.iter().any(|c| c.media.is_some()) { return Err("Add at least one video clip before exporting.".into()); }
+    if !video_clips.iter().any(|clip| clip.media.is_some() || clip.gfx.as_ref().map_or(false, |gfx| gfx.kind != GfxKind::Adjustment)) {
+        return Err("Add a video clip or generated video item before exporting.".into());
+    }
 
     // Only open sources that can contribute to this render. A missing file on a hidden track
     // must not block export of the visible edit, and omitting hidden clips also avoids redundant
@@ -392,7 +395,28 @@ pub fn build_args(project: &Project, output: &Path, settings: &ExportSettings, s
     let mut layer_count = 0usize;
     for clip in &ordered_video {
         let stream = format!("vclip{}", clip.id);
-        if clip.gfx.is_some() && clip.media.is_none() {
+        let is_adjustment = clip.gfx.as_ref().map_or(false, |gfx| gfx.kind == GfxKind::Adjustment) && clip.media.is_none();
+        if is_adjustment {
+            if clip.effects.iter().all(|effect| !effect.enabled) { continue; }
+            let base = format!("adjbase{}", clip.id);
+            let source = format!("adjsrc{}", clip.id);
+            let adjusted = format!("adjout{}", clip.id);
+            graph.push(format!("[{}]split=2[{}][{}]", prev, base, source));
+            let mut filters = vec![
+                format!("trim=start={}:duration={}", num(clip.start), num(clip.dur)),
+                "setpts=PTS-STARTPTS".to_string(),
+                "format=rgba".to_string(),
+            ];
+            for effect in &clip.effects { filters.extend(filters_for_effect(effect, clip.dur)); }
+            filters.push(format!("setpts=PTS-STARTPTS+{}/TB", num(clip.start)));
+            graph.push(format!("[{}]{}[{}]", source, filters.join(","), adjusted));
+            let next = format!("vcomp{}", layer_count);
+            graph.push(format!("[{}][{}]overlay=x=0:y=0:eval=frame:eof_action=pass:shortest=0:enable='between(t,{}, {})'[{}]",
+                base, adjusted, num(clip.start), num(clip.end()), next));
+            prev = next;
+            layer_count += 1;
+            continue;
+        } else if clip.gfx.is_some() && clip.media.is_none() {
             graph.push(graphic_filter(clip, clip.dur, &settings, &stream));
         } else if let Some(index) = inputs.get(&clip.id).copied() {
             let local_t = clip.src_off;

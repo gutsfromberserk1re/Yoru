@@ -13,7 +13,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use eframe::egui::Context;
-use crate::project::AudioPreset;
+use crate::project::{AudioPreset, AudioSource};
 use ffmpeg::{
     codec, format,
     format::{sample::Type as SampleType, Sample as SampleFmt},
@@ -24,13 +24,13 @@ use ffmpeg::{
 };
 use ffmpeg_next as ffmpeg;
 use ffmpeg::ffi;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 const MAX_PREVIEW_W: u32 = 1920; // 'Full' playback resolution cap
@@ -748,6 +748,7 @@ struct AudioShared {
     playing: AtomicBool,
     muted: AtomicBool,
     gain: AtomicU32, // linear playback gain, updated without locking the audio FIFO
+    ramp_gain: AtomicU32, // callback-side smoothed gain used by the shared timeline mixer
     preset: AtomicU32, // AudioPreset id; observed and applied by the decoder worker
     peak_l: AtomicU32, // positive f32 bit patterns order like the floats -> fetch_max = peak hold
     peak_r: AtomicU32,
@@ -761,6 +762,7 @@ impl AudioShared {
             playing: AtomicBool::new(false),
             muted: AtomicBool::new(false),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            ramp_gain: AtomicU32::new(1.0f32.to_bits()),
             preset: AtomicU32::new(AudioPreset::Neutral.id() as u32),
             peak_l: AtomicU32::new(0),
             peak_r: AtomicU32::new(0),
@@ -1115,6 +1117,216 @@ where
     )
 }
 
+struct MixerBus {
+    voices: Mutex<Vec<(u32, Arc<AudioShared>)>>,
+    peak_l: AtomicU32,
+    peak_r: AtomicU32,
+}
+
+struct MixerVoice {
+    shared: Arc<AudioShared>,
+    cmd: Sender<(f64, u64)>,
+    path: PathBuf,
+    map: f64,
+    last_source_t: f64,
+    master: bool,
+    preset: AudioPreset,
+    playing: bool,
+}
+
+/// One output stream for all timeline audio clips. Decoders fill per-clip FIFOs on worker threads;
+/// the device callback sums them without allocating or waiting on decoder work.
+pub struct AudioMixer {
+    rate: u32,
+    voices: HashMap<u32, MixerVoice>,
+    bus: Arc<MixerBus>,
+    bus_ids: Vec<u32>,
+    _stream: cpal::Stream,
+}
+
+impl AudioMixer {
+    pub fn new() -> Option<Self> {
+        let dev = cpal::default_host().default_output_device()?;
+        let supported = dev.default_output_config().ok()?;
+        let fmt = supported.sample_format();
+        let cfg: cpal::StreamConfig = supported.into();
+        let bus = Arc::new(MixerBus {
+            voices: Mutex::new(Vec::new()),
+            peak_l: AtomicU32::new(0),
+            peak_r: AtomicU32::new(0),
+        });
+        let stream = match fmt {
+            cpal::SampleFormat::F32 => build_mixer_stream::<f32>(&dev, &cfg, bus.clone()),
+            cpal::SampleFormat::I16 => build_mixer_stream::<i16>(&dev, &cfg, bus.clone()),
+            cpal::SampleFormat::U16 => build_mixer_stream::<u16>(&dev, &cfg, bus.clone()),
+            _ => return None,
+        }.ok()?;
+        stream.play().ok()?;
+        Some(Self { rate: cfg.sample_rate.0, voices: HashMap::new(), bus, bus_ids: Vec::new(), _stream: stream })
+    }
+
+    pub fn update(&mut self, sources: &[AudioSource<'_>], playing: bool, jumped: bool) {
+        let mut bus_dirty = false;
+        for source in sources {
+            let stale_path = self.voices.get(&source.clip_id).map_or(false, |voice| voice.path.as_path() != source.path);
+            if stale_path { self.voices.remove(&source.clip_id); bus_dirty = true; }
+            if !self.voices.contains_key(&source.clip_id) {
+                let shared = Arc::new(AudioShared::new());
+                let (cmd, rx) = channel::<(f64, u64)>();
+                let (path, sh, rate) = (source.path.to_path_buf(), shared.clone(), self.rate);
+                let _ = std::thread::Builder::new().name("timeline-audio".into()).spawn(move || {
+                    match AudioWorker::open(&path, rate) {
+                        Ok(Some(worker)) => audio_run(worker, rx, sh, rate),
+                        _ => {
+                            let epoch = sh.lock().epoch;
+                            sh.mark_eof(epoch);
+                        }
+                    }
+                });
+                let epoch = shared.reset(source.source_t);
+                let _ = cmd.send((source.source_t, epoch));
+                self.voices.insert(source.clip_id, MixerVoice {
+                    shared,
+                    cmd,
+                    path: source.path.to_path_buf(),
+                    map: source.map,
+                    last_source_t: source.source_t,
+                    master: source.master,
+                    preset: source.preset,
+                    playing,
+                });
+            }
+            if let Some(voice) = self.voices.get_mut(&source.clip_id) {
+                let resync = jumped || voice.preset != source.preset || (playing && !voice.playing)
+                    || (!playing && (source.source_t - voice.last_source_t).abs() > 0.05);
+                if resync {
+                    let epoch = voice.shared.reset(source.source_t);
+                    let _ = voice.cmd.send((source.source_t, epoch));
+                }
+                voice.shared.preset.store(source.preset.id() as u32, Relaxed);
+                voice.shared.gain.store(source.gain.clamp(0.0, 4.0).to_bits(), Relaxed);
+                voice.shared.muted.store(false, Relaxed);
+                voice.shared.playing.store(playing, Relaxed);
+                voice.map = source.map;
+                voice.last_source_t = source.source_t;
+                voice.master = source.master;
+                voice.preset = source.preset;
+                voice.playing = playing;
+            }
+        }
+
+        self.voices.retain(|id, voice| {
+            if sources.iter().any(|source| source.clip_id == *id) { true }
+            else {
+                voice.shared.playing.store(false, Relaxed);
+                false
+            }
+        });
+        let mut ids: Vec<u32> = self.voices.keys().copied().collect();
+        ids.sort_unstable();
+        if bus_dirty || ids != self.bus_ids {
+            let mut list = self.bus.voices.lock().unwrap_or_else(|e| e.into_inner());
+            list.clear();
+            list.extend(ids.iter().filter_map(|id| self.voices.get(id).map(|voice| (*id, voice.shared.clone()))));
+            self.bus_ids = ids;
+        }
+    }
+
+    pub fn clock(&self) -> Option<f64> {
+        self.voices.values().find(|voice| voice.master)
+            .or_else(|| self.voices.values().next())
+            .map(|voice| voice.shared.clock.now() - voice.map)
+    }
+
+    pub fn peaks(&self) -> Option<(f32, f32)> {
+        if self.voices.is_empty() { return None; }
+        Some((f32::from_bits(self.bus.peak_l.swap(0, Relaxed)), f32::from_bits(self.bus.peak_r.swap(0, Relaxed))))
+    }
+}
+
+fn build_mixer_stream<T>(dev: &cpal::Device, cfg: &cpal::StreamConfig, bus: Arc<MixerBus>) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let channels = (cfg.channels as usize).max(1);
+    let rate = cfg.sample_rate.0 as f64;
+    let ramp_frames = (rate * 0.01).round().max(1.0) as usize;
+    // Typical device callbacks contain far fewer than 2048 stereo frames. Reserve before the
+    // stream starts so the first audio callback does not pay an allocator cost.
+    let mut mix = Vec::<f32>::with_capacity(4096);
+    dev.build_output_stream(
+        cfg,
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let frames = data.len() / channels;
+            mix.clear();
+            mix.resize(frames * 2, 0.0);
+            let stamp = info.timestamp();
+            let latency = stamp.playback.duration_since(&stamp.callback).map_or(0.0, |d| d.as_secs_f64());
+            let voices = bus.voices.lock().unwrap_or_else(|e| e.into_inner());
+            for (_id, shared) in voices.iter() {
+                if !shared.playing.load(Relaxed) {
+                    let b = match shared.buf.try_lock() {
+                        Ok(b) => b,
+                        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                        Err(TryLockError::WouldBlock) => continue,
+                    };
+                    shared.clock.set(b.next_t, false);
+                    continue;
+                }
+                let target_gain = if shared.muted.load(Relaxed) { 0.0 }
+                    else { f32::from_bits(shared.gain.load(Relaxed)).clamp(0.0, 4.0) };
+                let gain_start = f32::from_bits(shared.ramp_gain.load(Relaxed));
+                let mut buffer = match shared.buf.try_lock() {
+                    Ok(b) => b,
+                    Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                    // Keep the device callback real-time: a decoder holding its FIFO for a short
+                    // refill must not stall every other voice or the output device.
+                    Err(TryLockError::WouldBlock) => continue,
+                };
+                let start_t = buffer.next_t;
+                let mut got = 0usize;
+                for frame in 0..frames {
+                    if buffer.q.len() < 2 { break; }
+                    let left = buffer.q.pop_front().unwrap_or(0.0);
+                    let right = buffer.q.pop_front().unwrap_or(0.0);
+                    let ramp = ((frame + 1).min(ramp_frames) as f32) / ramp_frames as f32;
+                    let gain = gain_start + (target_gain - gain_start) * ramp;
+                    mix[frame * 2] += left * gain;
+                    mix[frame * 2 + 1] += right * gain;
+                    got += 1;
+                }
+                let starved = got < frames;
+                let silent_run = starved && buffer.eof;
+                buffer.next_t += (if silent_run { frames } else { got }) as f64 / rate;
+                shared.clock.set(start_t - latency, !starved || silent_run);
+                shared.ramp_gain.store(target_gain.to_bits(), Relaxed);
+            }
+            drop(voices);
+
+            let mut peak_l = 0.0f32;
+            let mut peak_r = 0.0f32;
+            for frame in 0..frames {
+                let left = mix[frame * 2].clamp(-1.0, 1.0);
+                let right = mix[frame * 2 + 1].clamp(-1.0, 1.0);
+                peak_l = peak_l.max(left.abs());
+                peak_r = peak_r.max(right.abs());
+                let output = &mut data[frame * channels..(frame + 1) * channels];
+                if channels == 1 { output[0] = T::from_sample((left + right) * 0.5); }
+                else {
+                    output[0] = T::from_sample(left);
+                    output[1] = T::from_sample(right);
+                    for sample in &mut output[2..] { *sample = T::EQUILIBRIUM; }
+                }
+            }
+            for sample in &mut data[frames * channels..] { *sample = T::EQUILIBRIUM; }
+            bus.peak_l.fetch_max(peak_l.to_bits(), Relaxed);
+            bus.peak_r.fetch_max(peak_r.to_bits(), Relaxed);
+        },
+        |e| eprintln!("audio mixer stream error: {e}"),
+        None,
+    )
+}
+
 struct Audio {
     sh: Arc<AudioShared>,
     cmd: Sender<(f64, u64)>,
@@ -1162,6 +1374,7 @@ fn open_audio(path: &Path) -> Option<Audio> {
 pub struct Player {
     pub info: Info,
     pub current: Option<Frame>,
+    audio_available: bool,
     cmd: Sender<Cmd>,
     frames: Receiver<PreviewFrame>,
     pending: VecDeque<PreviewFrame>,
@@ -1178,6 +1391,14 @@ pub struct Player {
 
 impl Player {
     pub fn open(path: &Path, ctx: Context) -> Result<Self, String> {
+        Self::open_impl(path, ctx, true)
+    }
+
+    pub fn open_video(path: &Path, ctx: Context) -> Result<Self, String> {
+        Self::open_impl(path, ctx, false)
+    }
+
+    fn open_impl(path: &Path, ctx: Context, with_audio: bool) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| e.to_string())?;
         let (cmd_tx, cmd_rx) = channel();
         let (fr_tx, fr_rx) = sync_channel(VIDEO_QUEUE);
@@ -1198,9 +1419,11 @@ impl Player {
             .map_err(|e| e.to_string())?;
 
         let info: Info = info_rx.recv().map_err(|e| e.to_string())??;
+        let audio = if with_audio { open_audio(path) } else { None };
         Ok(Self {
             info,
             current: None,
+            audio_available: audio.is_some(),
             cmd: cmd_tx,
             frames: fr_rx,
             pending: VecDeque::new(),
@@ -1212,12 +1435,18 @@ impl Player {
             requested_pts: None,
             cache_changed: false,
             decoder_out_of_sync: false,
-            audio: open_audio(path),
+            audio,
         })
     }
 
     pub fn set_quality(&mut self, div: u32) {
         let _ = self.cmd.send(Cmd::Quality(div));
+    }
+
+    /// The timeline mixer owns audio output when available; dropping this per-player stream avoids
+    /// opening one device stream for every video decoder kept in the preview pool.
+    pub fn disable_audio(&mut self) {
+        self.audio = None;
     }
 
     pub fn set_muted(&self, on: bool) {
@@ -1244,7 +1473,7 @@ impl Player {
     }
 
     pub fn has_audio(&self) -> bool {
-        self.audio.is_some()
+        self.audio_available
     }
 
     /// Master clock in seconds (None when the file has no usable audio).
