@@ -94,8 +94,6 @@ pub enum VideoDecodeStep {
 
 #[derive(Clone, Copy)]
 pub struct Info {
-    pub w: u32,
-    pub h: u32,
     pub fps: f64,
     pub duration: f64,
 }
@@ -317,7 +315,7 @@ impl VideoWorker {
         let w = (sw.min(max_w) & !1).max(2);
         let h = ((((sh as u64 * w as u64) / sw as u64) as u32) & !1).max(2);
         let dur = ictx.duration();
-        let info = Info { w, h, fps, duration: if dur > 0 { dur as f64 / 1_000_000.0 } else { 0.0 } };
+        let info = Info { fps, duration: if dur > 0 { dur as f64 / 1_000_000.0 } else { 0.0 } };
         let me = Self {
             path: path.to_path_buf(),
             ictx,

@@ -661,16 +661,6 @@ fn placeholder(ui: &mut Ui, text: &str) {
 const CLIP_NAMES: [&str; 10] = [
     "Cabana", "Mountain gold", "Jungle forest", "Hammock", "Waterfall", "Beach", "Pool", "Rocks", "Trail", "Canopy",
 ];
-const EFFECTS: [(&str, &[&str]); 7] = [
-    ("Distortion", &["Wave Warp", "Ripple", "Twirl", "RGB Split"]),
-    ("Blur & Sharpen", &["Gaussian Blur", "Lens Blur", "Directional Motion Blur", "Sharpen"]),
-    ("Light & Texture", &["Glow", "Vignette", "Film Grain", "Scanlines"]),
-    ("Color Looks", &["Sepia Tone", "Black & White", "Invert Colors", "Posterize", "Color Temperature"]),
-    ("Retro & Detail", &["VHS / Tape", "Edge Detect"]),
-    ("Stylize", &["Pixelate", "Mirror"]),
-    ("Flash & Fade", &["Flash", "Fade In", "Fade Out"]),
-];
-
 enum BrowserCommand {
     CreateBin(String),
     MoveToBin(u32, String),
@@ -834,11 +824,18 @@ fn browser_panel(
                                 }
                             });
                     }
-                    for (folder, kids) in EFFECTS {
-                        let vis: Vec<&'static str> = kids
-                            .iter()
-                            .copied()
-                            .filter(|k| q.is_empty() || k.to_lowercase().contains(&q))
+                    let mut effect_groups: Vec<(&'static str, Vec<EffectKind>)> = Vec::new();
+                    for kind in EffectKind::ALL {
+                        let category = kind.category();
+                        if let Some((_, kinds)) = effect_groups.iter_mut().find(|(name, _)| *name == category) {
+                            kinds.push(kind);
+                        } else {
+                            effect_groups.push((category, vec![kind]));
+                        }
+                    }
+                    for (folder, kinds) in effect_groups {
+                        let vis: Vec<EffectKind> = kinds.into_iter()
+                            .filter(|kind| q.is_empty() || kind.label().to_lowercase().contains(&q))
                             .collect();
                         if vis.is_empty() {
                             continue;
@@ -848,7 +845,8 @@ fn browser_panel(
                             h = h.open(Some(true));
                         }
                         h.show(ui, |ui| {
-                            for k in vis {
+                            for kind in vis {
+                                let k = kind.label();
                                 let selected = b.fx_sel == Some(k);
                                 let fill = if selected { rgba(185, 193, 202, 42) } else { Color32::TRANSPARENT };
                                 let resp = ui.add_sized(
@@ -857,7 +855,7 @@ fn browser_panel(
                                 ).on_hover_text("Drag onto a video clip to apply this effect");
                                 if resp.clicked() { b.fx_sel = Some(k); }
                                 if resp.drag_started() {
-                                    *effect_drag = EffectKind::from_label(k);
+                                    *effect_drag = Some(kind);
                                     b.fx_sel = Some(k);
                                 }
                             }

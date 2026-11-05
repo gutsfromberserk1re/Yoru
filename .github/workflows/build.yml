@@ -97,55 +97,53 @@ jobs:
           # ffmpeg.exe export helper continue to work without a separate installer.
           $iexpress = Join-Path $env:WINDIR "System32\iexpress.exe"
           if (-not (Test-Path $iexpress)) { throw "IExpress is required to make the single-file package" }
-          $sed = @'
-          [Version]
-          Class=IEXPRESS
-          [Options]
-          PackagePurpose=InstallApp
-          ShowInstallProgramWindow=1
-          HideExtractAnimation=1
-          UseLongFileName=1
-          InsideCompressed=0
-          CAB_FixedSize=0
-          CAB_ResvCodeSigning=0
-          RebootMode=N
-          InstallPrompt=%InstallPrompt%
-          DisplayLicense=%DisplayLicense%
-          FinishMessage=%FinishMessage%
-          TargetName=%TargetName%
-          FriendlyName=%FriendlyName%
-          AppLaunched=%AppLaunched%
-          PostInstallCmd=%PostInstallCmd%
-          AdminQuietInstCmd=%AdminQuietInstCmd%
-          UserQuietInstCmd=%UserQuietInstCmd%
-          SourceFiles=SourceFiles
-          [SourceFiles]
-          SourceFiles0=payload\
-          [SourceFiles0]
-          '@
           $sedLines = [System.Collections.Generic.List[string]]::new()
-          $sedLines.AddRange([string[]]($sed -split "`r?`n"))
           $payloadFiles = @(Get-ChildItem payload -File)
-          for ($i = 0; $i -lt $payloadFiles.Count; $i++) {
-            $sedLines.Add("%FILE$i%=")
-          }
+          $payloadDir = (Resolve-Path payload).Path.TrimEnd('\') + '\'
+          $packagePath = Join-Path $env:GITHUB_WORKSPACE "Yoru.exe"
+          $sedLines.Add('[Version]')
+          $sedLines.Add('Class=IEXPRESS')
+          $sedLines.Add('SEDVersion=3')
+          $sedLines.Add('[Options]')
+          $sedLines.Add('PackagePurpose=InstallApp')
+          $sedLines.Add('ShowInstallProgramWindow=1')
+          $sedLines.Add('HideExtractAnimation=1')
+          $sedLines.Add('UseLongFileName=1')
+          $sedLines.Add('InsideCompressed=0')
+          $sedLines.Add('CAB_FixedSize=0')
+          $sedLines.Add('CAB_ResvCodeSigning=0')
+          $sedLines.Add('RebootMode=N')
+          $sedLines.Add('InstallPrompt=%InstallPrompt%')
+          $sedLines.Add('DisplayLicense=%DisplayLicense%')
+          $sedLines.Add('FinishMessage=%FinishMessage%')
+          $sedLines.Add('TargetName=%TargetName%')
+          $sedLines.Add('FriendlyName=%FriendlyName%')
+          $sedLines.Add('AppLaunched=%AppLaunched%')
+          $sedLines.Add('PostInstallCmd=%PostInstallCmd%')
+          $sedLines.Add('AdminQuietInstCmd=%AdminQuietInstCmd%')
+          $sedLines.Add('UserQuietInstCmd=%UserQuietInstCmd%')
+          $sedLines.Add('SourceFiles=SourceFiles')
           $sedLines.Add('[Strings]')
           $sedLines.Add('InstallPrompt=')
           $sedLines.Add('DisplayLicense=')
           $sedLines.Add('FinishMessage=')
-          $sedLines.Add('TargetName=Yoru.exe')
+          $sedLines.Add(('TargetName=' + $packagePath))
           $sedLines.Add('FriendlyName=Yoru Video Editor')
           $sedLines.Add('AppLaunched=yoru-app.exe')
           $sedLines.Add('PostInstallCmd=<None>')
-          $sedLines.Add('AdminQuietInstCmd=yoru-app.exe')
-          $sedLines.Add('UserQuietInstCmd=yoru-app.exe')
+          $sedLines.Add('AdminQuietInstCmd=')
+          $sedLines.Add('UserQuietInstCmd=')
           for ($i = 0; $i -lt $payloadFiles.Count; $i++) {
             $sedLines.Add(('FILE' + $i + '="' + $payloadFiles[$i].Name + '"'))
           }
+          $sedLines.Add('[SourceFiles]')
+          $sedLines.Add(('SourceFiles0=' + $payloadDir))
+          $sedLines.Add('[SourceFiles0]')
+          for ($i = 0; $i -lt $payloadFiles.Count; $i++) { $sedLines.Add("%FILE$i%=") }
           Set-Content -Path yoru.sed -Value $sedLines -Encoding ASCII
           & $iexpress /N /Q (Join-Path $env:GITHUB_WORKSPACE "yoru.sed")
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path Yoru.exe)) { throw "IExpress failed to create Yoru.exe" }
-          Compress-Archive -Path Yoru.exe -DestinationPath yoru-windows-x64.zip -Force
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $packagePath)) { throw "IExpress failed to create $packagePath from yoru.sed" }
+          Compress-Archive -Path $packagePath -DestinationPath yoru-windows-x64.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:

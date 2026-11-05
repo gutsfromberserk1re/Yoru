@@ -24,6 +24,7 @@ pub enum Lane {
 
 impl Lane {
     pub const V1: Lane = Lane::V(0);
+    #[cfg(test)]
     pub const A1: Lane = Lane::A(0);
 
     pub fn is_video(self) -> bool {
@@ -34,13 +35,6 @@ impl Lane {
         match self {
             Lane::V(n) => (n as usize).min(NV - 1),
             Lane::A(n) => NV + (n as usize).min(NA - 1),
-        }
-    }
-    pub fn from_slot(s: usize) -> Lane {
-        if s < NV {
-            Lane::V(s as u8)
-        } else {
-            Lane::A((s - NV).min(NA - 1) as u8)
         }
     }
     /// V(n) <-> A(n)
@@ -510,7 +504,6 @@ impl TransitionKind {
     }
     pub fn id(self) -> u8 { Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as u8 }
     pub fn from_id(id: u8) -> Option<Self> { Self::ALL.get(id as usize).copied() }
-    pub fn from_label(s: &str) -> Option<Self> { Self::ALL.into_iter().find(|v| v.label() == s) }
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Transition {
@@ -620,7 +613,6 @@ impl Gfx {
             color: [60, 120, 240, 210], outline: 3.0, outline_color: [245, 247, 255, 255],
             mono: false, size: 48.0, pad: 0.0, bg: [0, 0, 0, 0], align: 1, shadow: false }
     }
-    pub fn ellipse() -> Self { Self { kind: GfxKind::Ellipse, ..Self::rect() } }
 }
 
 // ---------------------------------------------------------------- clips & media
@@ -723,7 +715,6 @@ pub struct Media {
 #[derive(Clone)]
 pub struct AudioSource<'a> {
     pub clip_id: u32,
-    pub media_id: u32,
     pub path: &'a Path,
     pub source_t: f64,
     /// source time = timeline time + map
@@ -846,6 +837,7 @@ impl Project {
     }
 
     /// Demo timeline retained for development tests and sample fixtures only.
+    #[cfg(test)]
     pub fn demo() -> Self {
         let mut p = Project::empty();
         let story = [
@@ -865,6 +857,7 @@ impl Project {
         p
     }
 
+    #[cfg(test)]
     fn push_placeholder(&mut self, lane: Lane, start: f64, dur: f64, name: &str, seed: u32) {
         let id = self.alloc();
         self.clips.push(Clip {
@@ -911,14 +904,8 @@ impl Project {
         Some(id)
     }
 
-    /// Remove one point tracker and its saved samples.
-    pub fn remove_tracking_point(&mut self, id: u32) -> bool {
-        let before = self.tracking_points.len();
-        self.tracking_points.retain(|point| point.id != id);
-        before != self.tracking_points.len()
-    }
-
     /// Record an automatically tracked point sample.
+    #[cfg(test)]
     pub fn set_tracking_sample(&mut self, id: u32, source_t: f64, x: f32, y: f32) -> bool {
         if let Some(point) = self.tracking_points.iter_mut().find(|point| point.id == id) {
             point.set_sample(source_t, x, y);
@@ -941,30 +928,15 @@ impl Project {
         true
     }
 
-    pub fn remove_effect(&mut self, clip_id: u32, index: usize) -> bool {
-        let Some(c) = self.clip(clip_id) else { return false };
-        if index >= c.effects.len() { return false; }
-        let pre = self.clips.clone();
-        if let Some(c) = self.clip_mut(clip_id) { c.effects.remove(index); }
-        self.push_undo(pre);
-        true
-    }
-
     pub fn apply_transition(&mut self, clip_id: u32, kind: TransitionKind, duration: f32) -> bool {
         let Some(c) = self.clip(clip_id) else { return false };
         if !c.lane.is_video() || c.gfx.is_some() || c.media.is_none() { return false; }
         let pre = self.clips.clone();
         if let Some(c) = self.clip_mut(clip_id) {
-            c.transition_in = Some(Transition { kind, duration: duration.clamp(0.05, 5.0).min(c.dur as f32), enabled: true });
+            let mut transition = Transition::new(kind);
+            transition.duration = duration.clamp(0.05, 5.0).min(c.dur as f32);
+            c.transition_in = Some(transition);
         }
-        self.push_undo(pre);
-        true
-    }
-
-    pub fn remove_transition(&mut self, clip_id: u32) -> bool {
-        if !self.clip(clip_id).map_or(false, |c| c.transition_in.is_some()) { return false; }
-        let pre = self.clips.clone();
-        if let Some(c) = self.clip_mut(clip_id) { c.transition_in = None; }
         self.push_undo(pre);
         true
     }
@@ -1004,7 +976,6 @@ impl Project {
             if clip.fade_out > 0.0 { gain *= ((clip.end() - t) / clip.fade_out).clamp(0.0, 1.0) as f32; }
             Some(AudioSource {
                 clip_id: clip.id,
-                media_id,
                 path: media.path.as_path(),
                 source_t: clip.src_off + local,
                 map: clip.src_off - clip.start,
