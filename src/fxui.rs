@@ -3,13 +3,15 @@
 //! clip's `Fx`; a slider/graph drag becomes a single undo step.
 
 use super::*;
-use crate::project::{AudioPreset, Ease, EffectKind, Fx, Gfx, GfxKind, Key, NPARAM, PARAMS};
+use crate::project::{AudioPreset, Ease, EffectKind, Fx, Gfx, GfxKind, NPARAM, PARAMS};
 
 pub struct Inspector {
     pub tab: usize,
     sel_param: usize,
     sel_key: Option<usize>,
     graph_key: Option<usize>,
+    graph_key_token: Option<u64>,
+    graph_fit: bool,
     sel_effect: Option<usize>,
     sel_effect_clip: Option<u32>,
     /// Clip list from before the current edit; pushed as one undo step when the mouse is released.
@@ -21,7 +23,7 @@ pub struct Inspector {
 
 impl Inspector {
     pub fn new() -> Self {
-        Self { tab: 0, sel_param: 0, sel_key: None, graph_key: None, sel_effect: None, sel_effect_clip: None, session: None, goto: None, focus_text_on_next_frame: false }
+        Self { tab: 0, sel_param: 0, sel_key: None, graph_key: None, graph_key_token: None, graph_fit: true, sel_effect: None, sel_effect_clip: None, session: None, goto: None, focus_text_on_next_frame: false }
     }
 }
 
@@ -30,15 +32,15 @@ const KEY_STEEL: Color32 = Color32::from_rgb(174, 184, 196);
 /// Returns true if an effect value changed this frame.
 pub fn inspector_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
     let mut changed = false;
+    ins.tab = ins.tab.min(2);
     glass(14.0, 8.0, 14.0, 12.0).show(ui, |ui| {
         paint_panel_gradient(ui, 14.0, 8.0, 14.0, 12.0);
         ui.spacing_mut().item_spacing.y = 4.0;
-        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Text Animation", "Essential Graphics", "Audio"]);
+        tab_strip(ui, &mut ins.tab, &["Effect Controls", "Essential Graphics", "Audio"]);
         ui.add_space(6.0);
         match ins.tab {
             0 => changed = effect_controls(ui, ins, proj, sel, t),
-            1 => changed = text_panel(ui, ins, proj, sel, t),
-            2 => changed = graphics_panel(ui, ins, proj, sel, t),
+            1 => changed = graphics_panel(ui, ins, proj, sel, t),
             _ => changed = audio_panel(ui, ins, proj, sel, t),
         }
     });
@@ -231,110 +233,6 @@ fn add_graphic_button(ui: &mut Ui, proj: &mut Project, sel: &mut Vec<u32>, t: f6
         let id = proj.add_graphic(t, gfx, name);
         sel.clear();
         sel.push(id);
-        return true;
-    }
-    false
-}
-
-fn set_text_track(fx: &mut Fx, index: usize, keys: &[(f64, f32, Ease)]) {
-    if index >= NPARAM { return; }
-    fx.keys[index].clear();
-    for &(t, v, ease) in keys {
-        fx.keys[index].push(Key { t: t.max(0.0), v: v.clamp(PARAMS[index].lo, PARAMS[index].hi), ease });
-    }
-}
-
-fn apply_text_animation(clip: &mut Clip, preset: &str) {
-    let base = clip.fx.base;
-    let start = clip.src_off.max(0.0);
-    let end = start + clip.dur.max(0.1);
-    let d = clip.dur.min(0.7).max(0.18);
-    let x = base[0];
-    let y = base[1];
-    let scale = base[2];
-    let opacity = base[4];
-    match preset {
-        "Fade In" => set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]),
-        "Rise Up" => {
-            set_text_track(&mut clip.fx, 1, &[(start, (y + 90.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Slide Left" => {
-            set_text_track(&mut clip.fx, 0, &[(start, (x - 180.0).clamp(PARAMS[0].lo, PARAMS[0].hi), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Slide Right" => {
-            set_text_track(&mut clip.fx, 0, &[(start, (x + 180.0).clamp(PARAMS[0].lo, PARAMS[0].hi), Ease::EaseOut), (start + d, x, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Drop In" => {
-            set_text_track(&mut clip.fx, 1, &[(start, (y - 130.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Pop In" => {
-            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.78).clamp(1.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Fade Out" => set_text_track(&mut clip.fx, 4, &[(end - d, opacity, Ease::Linear), (end, 0.0, Ease::EaseIn)]),
-        "Float In" => {
-            set_text_track(&mut clip.fx, 1, &[(start, (y + 28.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Zoom In" => {
-            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.55).clamp(0.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Soft Zoom" => {
-            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.94).clamp(0.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::EaseOut), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Bounce In" => {
-            set_text_track(&mut clip.fx, 2, &[(start, (scale * 0.72).clamp(0.0,400.0), Ease::EaseOut), (start + d * 0.72, (scale * 1.12).clamp(0.0,400.0), Ease::EaseOut), (start + d, scale, Ease::EaseInOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d * 0.55, opacity, Ease::EaseOut)]);
-        }
-        "Slam In" => {
-            set_text_track(&mut clip.fx, 2, &[(start, (scale * 1.38).clamp(0.0,400.0), Ease::EaseIn), (start + d, scale, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseIn), (start + d, y, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d * 0.55, opacity, Ease::EaseOut)]);
-        }
-        "Rotate In" => {
-            let r = base[3];
-            set_text_track(&mut clip.fx, 3, &[(start, (r - 35.0).clamp(PARAMS[3].lo, PARAMS[3].hi), Ease::EaseOut), (start + d, r, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::EaseOut)]);
-        }
-        "Drift Up" => set_text_track(&mut clip.fx, 1, &[(start, (y + 45.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
-        "Drift Down" => set_text_track(&mut clip.fx, 1, &[(start, (y - 45.0).clamp(PARAMS[1].lo, PARAMS[1].hi), Ease::EaseOut), (start + d, y, Ease::EaseOut)]),
-        "Scale Pulse" => set_text_track(&mut clip.fx, 2, &[(start, scale, Ease::EaseOut), (start + d * 0.5, (scale * 1.10).clamp(0.0,400.0), Ease::EaseInOut), (start + d, scale, Ease::EaseOut)]),
-        "Soft Reveal" => {
-            // A gentle left-to-right entrance built from transform/opacity keys, not per-character typing.
-            set_text_track(&mut clip.fx, 0, &[(start, (x - 30.0).clamp(PARAMS[0].lo, PARAMS[0].hi), Ease::Linear), (start + d, x, Ease::EaseOut)]);
-            set_text_track(&mut clip.fx, 4, &[(start, 0.0, Ease::Linear), (start + d, opacity, Ease::Linear)]);
-        }
-        _ => {}
-    }
-}
-
-fn text_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, _t: f64) -> bool {
-    let Some((id, gfx)) = selected_graphic(proj, sel) else {
-        placeholder(ui, "Select a title or press T to create one.");
-        return false;
-    };
-    if gfx.kind != GfxKind::Text {
-        ui.label(RichText::new("Select a text layer to apply title animations.").color(MUTED));
-        return false;
-    }
-    let pre = proj.clips.clone();
-    ui.label(RichText::new("TEXT ANIMATION PRESETS").color(MUTED).strong());
-    ui.label(RichText::new("Presets create editable transform keyframes on this title clip.").size(9.0).color(MUTED));
-    let mut apply_anim: Option<&'static str> = None;
-    ui.horizontal_wrapped(|ui| {
-        for name in ["Fade In", "Rise Up", "Slide Left", "Slide Right", "Drop In", "Pop In", "Float In", "Fade Out", "Zoom In", "Soft Zoom", "Bounce In", "Slam In", "Rotate In", "Drift Up", "Drift Down", "Scale Pulse", "Soft Reveal"] {
-            if ui.small_button(name).clicked() { apply_anim = Some(name); }
-        }
-    });
-    if let Some(preset) = apply_anim {
-        if ins.session.is_none() { ins.session = Some(pre); }
-        if let Some(c) = proj.clip_mut(id) { apply_text_animation(c, preset); }
         return true;
     }
     false
@@ -649,16 +547,39 @@ fn param_row(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, i: usize, ts: f64, c
 fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, changed: &mut bool) {
     let i = ins.sel_param.min(NPARAM - 1);
     let def = &PARAMS[i];
-    ui.label(RichText::new(format!("Value graph  -  {}", def.name)).size(10.0).color(MUTED));
-    // Keep the graph compact enough to avoid forcing the inspector/panel to resize. Position and
-    // rotation use a data-fit vertical range so wide off-screen values remain easy to keyframe.
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("Value graph  -  {}", def.name)).size(10.0).color(MUTED));
+        if ui.selectable_label(ins.graph_fit, "Fit values").on_hover_text("Fit the vertical graph range to this parameter's keys").clicked() {
+            ins.graph_fit = !ins.graph_fit;
+        }
+        if ui.small_button("+ Key").on_hover_text("Add or select a key at the playhead").clicked() {
+            if let Some(existing) = fx.key_near(i, ts) {
+                ins.sel_key = Some(existing);
+            } else {
+                if !fx.is_animated(i) { fx.toggle_anim(i, ts); }
+                else { fx.toggle_key(i, ts); }
+                ins.sel_key = fx.key_near(i, ts);
+                *changed = true;
+            }
+        }
+        if let Some(k) = ins.sel_key.filter(|k| *k < fx.keys[i].len()) {
+            if ui.small_button("− Key").on_hover_text("Remove the selected keyframe").clicked() {
+                let kt = fx.keys[i][k].t;
+                fx.toggle_key(i, kt);
+                ins.sel_key = None;
+                *changed = true;
+            }
+        }
+    });
+    // Keep the graph compact. Fit mode focuses on keyed values; Full range keeps the parameter's
+    // complete legal range visible for edits that need a stable scale.
     let h = (ui.available_height() - 58.0).clamp(100.0, 240.0);
-    let (graph_lo, graph_hi) = if matches!(i, 0 | 1 | 3) {
+    let (graph_lo, graph_hi) = if ins.graph_fit {
         let mut values = vec![fx.base[i]];
         values.extend(fx.keys[i].iter().map(|k| k.v));
         let minv = values.iter().copied().fold(f32::INFINITY, f32::min);
         let maxv = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let minimum_span = if i == 3 { 360.0 } else if i == 0 { 600.0 } else { 400.0 };
+        let minimum_span = if i == 3 { 360.0 } else if i == 0 { 600.0 } else if i == 1 { 400.0 } else { (def.hi - def.lo) * 0.08 };
         let span = (maxv - minv).max(minimum_span);
         let pad = (span * 0.18).max(minimum_span * 0.25);
         ((minv - pad).max(def.lo), (maxv + pad).min(def.hi))
@@ -668,16 +589,28 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 6.0, rgba(8, 14, 36, 170));
 
-    let plot = rect.shrink(10.0);
+    let plot = Rect::from_min_max(
+        pos2(rect.left() + 36.0, rect.top() + 10.0),
+        pos2(rect.right() - 8.0, rect.bottom() - 24.0),
+    );
     let (t0, t1) = (clip.src_off, clip.src_off + clip.dur.max(0.1));
     let x_of = |t: f64| plot.left() + ((t - t0) / (t1 - t0)) as f32 * plot.width();
     let y_of = |v: f32| plot.bottom() - (v - graph_lo) / graph_span * plot.height();
     let t_of = |x: f32| (t0 + ((x - plot.left()) / plot.width().max(1.0)) as f64 * (t1 - t0)).clamp(t0, t1);
     let v_of = |y: f32| (graph_lo + (plot.bottom() - y) / plot.height().max(1.0) * graph_span).clamp(graph_lo, graph_hi);
 
-    for k in 0..=4 {
-        let y = plot.top() + plot.height() * k as f32 / 4.0;
+    for tick in 0..=4 {
+        let f = tick as f32 / 4.0;
+        let y = plot.top() + plot.height() * f;
+        let x = plot.left() + plot.width() * f;
+        let value = graph_hi - graph_span * f;
+        let source_t = t0 + (t1 - t0) * f as f64;
         p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, rgba(145, 151, 160, 50)));
+        p.line_segment([pos2(x, plot.top()), pos2(x, plot.bottom())], Stroke::new(1.0, rgba(145, 151, 160, 32)));
+        p.text(pos2(rect.left() + 3.0, y), Align2::LEFT_CENTER, format!("{value:.1}"), FontId::monospace(7.0), rgba(139, 148, 158, 185));
+        if tick == 0 || tick == 2 || tick == 4 {
+            p.text(pos2(x, plot.bottom() + 10.0), Align2::CENTER_CENTER, format!("{:.1}s", source_t - clip.src_off), FontId::monospace(7.0), rgba(139, 148, 158, 185));
+        }
     }
     // curve
     let n = 160;
@@ -702,83 +635,133 @@ fn graph(ui: &mut Ui, ins: &mut Inspector, fx: &mut Fx, clip: &Clip, ts: f64, ch
             rgba(139, 148, 158, 150),
         );
     }
-    // keys
-    for (idx, k) in fx.keys[i].iter().enumerate() {
-        let c = pos2(x_of(k.t), y_of(k.v));
+    // Keys are independent drag and context-menu targets, so right-clicking a diamond never
+    // removes it by accident. The drag token remains stable even while a key moves in time.
+    let mut remove_at = None;
+    for idx in 0..fx.keys[i].len() {
+        let key = fx.keys[i][idx];
+        let c = pos2(x_of(key.t), y_of(key.v));
         let on = ins.sel_key == Some(idx);
         p.add(Shape::convex_polygon(diamond(c, if on { 6.5 } else { 5.5 }), if on { POWDER } else { KEY_STEEL }, Stroke::new(1.0, rgba(8, 14, 36, 255))));
-    }
-
-    let near = |fx: &Fx, pos: Pos2| fx.keys[i].iter().position(|k| (pos - pos2(x_of(k.t), y_of(k.v))).length() < 10.0);
-    if resp.drag_started() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            ins.graph_key = near(fx, pos);
-            if ins.graph_key.is_some() {
-                ins.sel_key = ins.graph_key;
-            }
+        let token = if ins.graph_key == Some(idx) { ins.graph_key_token.unwrap_or(key.t.to_bits()) } else { key.t.to_bits() };
+        let key_resp = ui.interact(
+            Rect::from_center_size(c, vec2(18.0, 18.0)),
+            Id::new(("value_graph_key", clip.id, i, token)),
+            Sense::click_and_drag(),
+        ).on_hover_cursor(CursorIcon::Grab);
+        if key_resp.drag_started() {
+            ins.graph_key = Some(idx);
+            ins.graph_key_token = Some(token);
+            ins.sel_key = Some(idx);
         }
-    }
-    if resp.dragged() {
-        if let (Some(k), Some(pos)) = (ins.graph_key, resp.interact_pointer_pos()) {
-            if k < fx.keys[i].len() {
-                let nk = fx.move_key(i, k, t_of(pos.x), v_of(pos.y));
+        if key_resp.dragged() {
+            if let Some(pos) = key_resp.interact_pointer_pos() {
+                let drag_idx = ins.graph_key.unwrap_or(idx).min(fx.keys[i].len().saturating_sub(1));
+                let nk = fx.move_key(i, drag_idx, t_of(pos.x), v_of(pos.y));
                 ins.graph_key = Some(nk);
                 ins.sel_key = Some(nk);
                 *changed = true;
             }
         }
+        if key_resp.drag_stopped() {
+            ins.graph_key = None;
+            ins.graph_key_token = None;
+        }
+        if key_resp.clicked() { ins.sel_key = Some(idx); }
+        key_resp.context_menu(|ui| {
+            ins.sel_key = Some(idx);
+            ui.label(RichText::new(format!("Key at {:.2}s", key.t - clip.src_off)).color(MUTED));
+            if idx + 1 < fx.keys[i].len() {
+                ui.menu_button("Interpolation to next key", |ui| {
+                    for ease in Ease::ALL {
+                        let selected = fx.keys[i].get(idx).map_or(false, |current| current.ease == ease);
+                        if ui.selectable_label(selected, ease.label()).clicked() {
+                            if let Some(current) = fx.keys[i].get_mut(idx) { current.ease = ease; }
+                            ins.sel_key = Some(idx);
+                            *changed = true;
+                            ui.close_menu();
+                        }
+                    }
+                });
+            } else {
+                ui.label(RichText::new("The last key has no outgoing segment.").size(9.0).color(MUTED));
+            }
+            if ui.button("Remove keyframe").clicked() {
+                remove_at = Some(idx);
+                ui.close_menu();
+            }
+        });
     }
-    if resp.drag_stopped() {
+    if let Some(idx) = remove_at {
+        if let Some(key) = fx.keys[i].get(idx).copied() { fx.toggle_key(i, key.t); }
+        ins.sel_key = None;
         ins.graph_key = None;
+        ins.graph_key_token = None;
+        *changed = true;
     }
     if resp.clicked() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            ins.sel_key = near(fx, pos);
-        }
+        let on_key = resp.interact_pointer_pos().map_or(false, |pos| {
+            fx.keys[i].iter().any(|key| (pos - pos2(x_of(key.t), y_of(key.v))).length() < 10.0)
+        });
+        if !on_key { ins.sel_key = None; }
     }
     if resp.double_clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
-            let tt = t_of(pos.x);
-            if !fx.is_animated(i) {
-                fx.toggle_anim(i, tt);
-            }
-            fx.set_value(i, tt, v_of(pos.y));
-            ins.sel_key = fx.key_near(i, tt);
-            *changed = true;
-        }
-    }
-    if resp.secondary_clicked() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            if let Some(k) = near(fx, pos) {
-                let kt = fx.keys[i][k].t;
-                fx.toggle_key(i, kt);
-                ins.sel_key = None;
+            let on_key = fx.keys[i].iter().any(|key| {
+                (pos - pos2(x_of(key.t), y_of(key.v))).length() < 10.0
+            });
+            if !on_key {
+                let tt = t_of(pos.x);
+                if !fx.is_animated(i) {
+                    fx.toggle_anim(i, tt);
+                }
+                fx.set_value(i, tt, v_of(pos.y));
+                ins.sel_key = fx.key_near(i, tt);
                 *changed = true;
             }
         }
     }
-
     // easing of the selected key (applies to the segment up to the next key)
     if let Some(k) = ins.sel_key.filter(|k| *k < fx.keys[i].len()) {
-        ui.label(RichText::new("SEGMENT INTERPOLATION").size(9.0).color(MUTED));
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for e in Ease::ALL {
-                let short = match e {
-                    Ease::Linear => "Linear",
-                    Ease::EaseIn => "In",
-                    Ease::EaseOut => "Out",
-                    Ease::EaseInOut => "In/Out",
-                    Ease::Hold => "Hold",
-                };
-                if ui.selectable_label(fx.keys[i][k].ease == e, RichText::new(short).size(10.0))
-                    .on_hover_text(e.label()).clicked() {
-                    fx.keys[i][k].ease = e;
-                    *changed = true;
-                }
-            }
+        let original = fx.keys[i][k];
+        let mut local_time = (original.t - clip.src_off).clamp(0.0, clip.dur);
+        let mut value = original.v;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Key time").size(9.0).color(MUTED));
+            ui.add_sized([72.0, 18.0], egui::DragValue::new(&mut local_time)
+                .clamp_range(0.0..=clip.dur).speed(0.01).fixed_decimals(2).suffix(" s"));
+            ui.label(RichText::new("Value").size(9.0).color(MUTED));
+            ui.add_sized([76.0, 18.0], egui::DragValue::new(&mut value)
+                .clamp_range(def.lo..=def.hi).speed(((def.hi - def.lo) / 1000.0).max(0.01)).fixed_decimals(1));
         });
+        if (local_time - (original.t - clip.src_off)).abs() > 1e-6 || (value - original.v).abs() > 1e-5 {
+            let moved = fx.move_key(i, k, clip.src_off + local_time, value);
+            ins.sel_key = Some(moved);
+            *changed = true;
+        }
+        if k + 1 < fx.keys[i].len() {
+            ui.label(RichText::new("SEGMENT INTERPOLATION").size(9.0).color(MUTED));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for e in Ease::ALL {
+                    let short = match e {
+                        Ease::Linear => "Linear",
+                        Ease::EaseIn => "In",
+                        Ease::EaseOut => "Out",
+                        Ease::EaseInOut => "In/Out",
+                        Ease::Hold => "Hold",
+                    };
+                    if ui.selectable_label(fx.keys[i][k].ease == e, RichText::new(short).size(10.0))
+                        .on_hover_text(e.label()).clicked() {
+                        fx.keys[i][k].ease = e;
+                        *changed = true;
+                    }
+                }
+            });
+        } else {
+            ui.label(RichText::new("Last key has no outgoing segment.").size(9.0).color(MUTED));
+        }
     } else if fx.is_animated(i) {
-        ui.label(RichText::new("Click a diamond to choose its easing - right-click removes it").size(9.0).color(MUTED));
+        ui.label(RichText::new("Drag keys to shape the curve. Double-click to add one; right-click a key for interpolation and removal.").size(9.0).color(MUTED));
     }
 }

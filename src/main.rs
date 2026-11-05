@@ -313,11 +313,14 @@ fn tab_strip(ui: &mut Ui, idx: &mut usize, names: &[&str]) {
         for (i, n) in names.iter().enumerate() {
             let font = FontId::monospace(11.0);
             let w = ui.painter().layout_no_wrap(n.to_string(), font.clone(), MUTED).size().x + 24.0;
-            let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
-            let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
             let on = *idx == i;
+            let button = Button::new(RichText::new(*n).font(font).color(Color32::TRANSPARENT))
+                .fill(Color32::TRANSPARENT)
+                .frame(false);
+            let resp = ui.add_sized([w, 30.0], button).on_hover_cursor(CursorIcon::PointingHand);
+            let rect = resp.rect;
             let col = if on || resp.hovered() { TEXT } else { MUTED };
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, n, font, col);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, n, FontId::monospace(11.0), col);
             if on {
                 ui.painter()
                     .line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(2.0, POWDER));
@@ -728,14 +731,14 @@ fn browser_panel(
     proxy_requested: &mut Option<u32>,
     relink_requested: &mut Option<u32>,
 ) -> Option<u32> {
+    b.tab = b.tab.min(1);
     if b.tab == 0 { b.refresh_source_status(proj); }
     let mut add = None;
-    let panel = glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
+    glass(12.0, 8.0, 12.0, 12.0).show(ui, |ui| {
         paint_panel_gradient(ui, 12.0, 8.0, 12.0, 12.0);
         ui.spacing_mut().item_spacing.y = 8.0;
-        // The Project bin owns the imported media pool. Grid/list are two views of the same
-        // assets, not separate panels; Effects remains its own tab.
-        tab_strip(ui, &mut b.tab, &["Project", "Effects", "Transitions"]);
+        // Effects and transitions share one browser, as two parts of the same editing workflow.
+        tab_strip(ui, &mut b.tab, &["Project", "Effects"]);
         match b.tab {
             0 => {
                 ui.horizontal(|ui| {
@@ -797,16 +800,41 @@ fn browser_panel(
                     }); }
                 }
             }
-            1 => {
+            _ => {
                 ui.add(
                     TextEdit::singleline(&mut b.search)
-                        .hint_text("Search effects")
+                        .hint_text("Search effects or transitions")
                         .desired_width(f32::INFINITY)
                         .margin(vec2(10.0, 5.0)),
                 );
-                ui.label(RichText::new("Drag an effect onto a video clip to apply it.").size(9.0).color(MUTED));
+                ui.label(RichText::new("Drag an effect or transition onto a video clip.").size(9.0).color(MUTED));
                 let q = b.search.trim().to_lowercase();
                 ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    let matching_transitions: Vec<TransitionKind> = TransitionKind::ALL.into_iter()
+                        .filter(|kind| q.is_empty() || kind.label().to_lowercase().contains(&q))
+                        .collect();
+                    if !matching_transitions.is_empty() {
+                        let mut transitions = CollapsingHeader::new("Transitions").default_open(false);
+                        if !q.is_empty() { transitions = transitions.open(Some(true)); }
+                        transitions.show(ui, |ui| {
+                                ui.label(RichText::new("Drag to the start of a clip to set its incoming transition.").size(9.0).color(MUTED));
+                                ui.add(Slider::new(&mut b.transition_duration, 0.05..=5.0).text("Duration").suffix(" s"));
+                                for kind in matching_transitions {
+                                    let label = kind.label();
+                                    let selected = b.transition_sel == Some(kind);
+                                    let fill = if selected { rgba(185, 193, 202, 46) } else { Color32::TRANSPARENT };
+                                    let resp = ui.add_sized(
+                                        [ui.available_width(), 28.0],
+                                        Button::new(label).fill(fill).frame(false).sense(Sense::click_and_drag()),
+                                    ).on_hover_text("Drag onto the start of a video clip to set its inbound transition");
+                                    if resp.clicked() { b.transition_sel = Some(kind); }
+                                    if resp.drag_started() {
+                                        *transition_drag = Some(kind);
+                                        b.transition_sel = Some(kind);
+                                    }
+                                }
+                            });
+                    }
                     for (folder, kids) in EFFECTS {
                         let vis: Vec<&'static str> = kids
                             .iter()
@@ -838,52 +866,8 @@ fn browser_panel(
                     }
                 });
             }
-            _ => {
-                ui.add(
-                    TextEdit::singleline(&mut b.search)
-                        .hint_text("Search video transitions")
-                        .desired_width(f32::INFINITY)
-                        .margin(vec2(10.0, 5.0)),
-                );
-                ui.label(RichText::new("Drag a transition onto the start of a video clip.").size(9.0).color(MUTED));
-                ui.add(Slider::new(&mut b.transition_duration, 0.05..=5.0).text("Duration").suffix(" s"));
-                let q = b.search.trim().to_lowercase();
-                ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                    for kind in TransitionKind::ALL {
-                        let label = kind.label();
-                        if !q.is_empty() && !label.to_lowercase().contains(&q) { continue; }
-                        let selected = b.transition_sel == Some(kind);
-                        let fill = if selected { rgba(185, 193, 202, 46) } else { Color32::TRANSPARENT };
-                        let resp = ui.add_sized(
-                            [ui.available_width(), 28.0],
-                            Button::new(label).fill(fill).frame(false).sense(Sense::click_and_drag()),
-                        ).on_hover_text("Drag onto a video clip to set its inbound transition");
-                        if resp.clicked() { b.transition_sel = Some(kind); }
-                        if resp.drag_started() {
-                            *transition_drag = Some(kind);
-                            b.transition_sel = Some(kind);
-                        }
-                    }
-                });
-            }
         }
     });
-    if b.tab == 0 {
-        panel.response.context_menu(|ui| {
-            if ui.button("Create Bin…").clicked() {
-                b.pending = Some(BrowserCommand::CreateBin(String::new()));
-                ui.close_menu();
-            }
-            ui.menu_button("New Item", |ui| {
-                for kind in [MediaKind::Black, MediaKind::White, MediaKind::Adjustment] {
-                    if ui.button(kind.label()).clicked() {
-                        b.pending = Some(BrowserCommand::CreateItem(kind));
-                        ui.close_menu();
-                    }
-                }
-            });
-        });
-    }
     if b.create_bin_open {
         let mut open = b.create_bin_open;
         let mut create = false;
@@ -1795,7 +1779,7 @@ impl App {
             let id = self.proj.add_graphic(self.t, Gfx::title(""), "Title");
             self.timeline.sel.clear();
             self.timeline.sel.push(id);
-            self.inspector.tab = 2; // Essential Graphics
+            self.inspector.tab = 1; // Essential Graphics
             self.inspector.focus_text_on_next_frame = true;
             self.after_edit();
         }
