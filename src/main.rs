@@ -313,14 +313,13 @@ fn tab_strip(ui: &mut Ui, idx: &mut usize, names: &[&str]) {
         for (i, n) in names.iter().enumerate() {
             let font = FontId::monospace(11.0);
             let w = ui.painter().layout_no_wrap(n.to_string(), font.clone(), MUTED).size().x + 24.0;
+            // Use a plain egui hit target here. A transparent Button can lose its hit area
+            // under the custom painted panel/tab styling, leaving labels visible but inert.
+            let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+            let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
             let on = *idx == i;
-            let button = Button::new(RichText::new(*n).font(font).color(Color32::TRANSPARENT))
-                .fill(Color32::TRANSPARENT)
-                .frame(false);
-            let resp = ui.add_sized([w, 30.0], button).on_hover_cursor(CursorIcon::PointingHand);
-            let rect = resp.rect;
             let col = if on || resp.hovered() { TEXT } else { MUTED };
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, n, FontId::monospace(11.0), col);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, n, font, col);
             if on {
                 ui.painter()
                     .line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(2.0, POWDER));
