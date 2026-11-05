@@ -222,20 +222,19 @@ fn selected_graphic(proj: &Project, sel: &[u32]) -> Option<(u32, crate::project:
     sel.iter().find_map(|id| proj.clip(*id).and_then(|c| c.gfx.clone().map(|g| (*id, g))))
 }
 
-fn add_graphic_button(ui: &mut Ui, proj: &mut Project, sel: &mut Vec<u32>, t: f64, kind: GfxKind) -> bool {
-    let (name, gfx) = match kind {
-        GfxKind::Text => ("Title", Gfx::title("Your title")),
-        GfxKind::Rect => ("Rectangle", Gfx::rect()),
-        GfxKind::Ellipse => ("Ellipse", Gfx::ellipse()),
-        GfxKind::Adjustment => ("Adjustment Layer", Gfx { kind: GfxKind::Adjustment, ..Gfx::rect() }),
-    };
-    if ui.button(format!("+ {name}")).clicked() {
-        let id = proj.add_graphic(t, gfx, name);
-        sel.clear();
-        sel.push(id);
-        return true;
-    }
-    false
+fn graphic_value_control(
+    ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>,
+    suffix: &str, speed: f64,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_sized([86.0, 18.0], Label::new(RichText::new(label).size(10.0).color(MUTED)));
+        let slider_width = (ui.available_width() - 68.0).max(48.0);
+        changed |= ui.add_sized([slider_width, 18.0], egui::Slider::new(value, range.clone()).show_value(false)).changed();
+        changed |= ui.add_sized([62.0, 18.0], egui::DragValue::new(value).clamp_range(range).speed(speed).suffix(suffix)).changed();
+    });
+    changed
 }
 
 fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mut Vec<u32>, t: f64) -> bool {
@@ -243,21 +242,15 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     ui.horizontal(|ui| {
         ui.label(RichText::new("TITLES").color(MUTED).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let add_text = add_graphic_button(ui, proj, sel, t, GfxKind::Text);
-            if add_text {
+            if ui.button("+ Title").clicked() {
+                let id = proj.add_graphic(t, Gfx::title("Your title"), "Title");
+                sel.clear();
+                sel.push(id);
                 created = true;
                 ins.focus_text_on_next_frame = true;
             }
         });
     });
-    CollapsingHeader::new("Add shapes")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                created |= add_graphic_button(ui, proj, sel, t, GfxKind::Rect);
-                created |= add_graphic_button(ui, proj, sel, t, GfxKind::Ellipse);
-            });
-        });
     ui.separator();
     ui.label(RichText::new("GRAPHIC LAYERS").color(MUTED).strong());
     let graphics: Vec<(u32, String, bool)> = proj.clips.iter().filter(|c| c.gfx.is_some())
@@ -312,14 +305,8 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     // Width and height affect the geometry of a shape. Text is laid out from its content and
     // font size, so showing canvas dimensions for text would be misleading (and do nothing).
     if gfx.kind != GfxKind::Text {
-        ui.horizontal(|ui| {
-            ui.label("Width");
-            changed |= ui.add(egui::DragValue::new(&mut gfx.w).clamp_range(1.0..=1920.0).speed(2.0)).changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("Height");
-            changed |= ui.add(egui::DragValue::new(&mut gfx.h).clamp_range(1.0..=1080.0).speed(2.0)).changed();
-        });
+        changed |= graphic_value_control(ui, "Width", &mut gfx.w, 1.0..=1920.0, " px", 2.0);
+        changed |= graphic_value_control(ui, "Height", &mut gfx.h, 1.0..=1080.0, " px", 2.0);
     }
     let mut col = Color32::from_rgba_unmultiplied(gfx.color[0], gfx.color[1], gfx.color[2], gfx.color[3]);
     ui.horizontal(|ui| { ui.label("Fill"); changed |= ui.color_edit_button_srgba(&mut col).changed(); });
@@ -327,38 +314,24 @@ fn graphics_panel(ui: &mut Ui, ins: &mut Inspector, proj: &mut Project, sel: &mu
     let mut outcol = Color32::from_rgba_unmultiplied(gfx.outline_color[0], gfx.outline_color[1], gfx.outline_color[2], gfx.outline_color[3]);
     ui.horizontal(|ui| { ui.label("Outline"); changed |= ui.color_edit_button_srgba(&mut outcol).changed(); });
     gfx.outline_color = outcol.to_array();
-    ui.horizontal(|ui| {
-        ui.label("Outline width");
-        changed |= ui.add(egui::Slider::new(&mut gfx.outline, 0.0..=24.0)).changed();
-    });
+    changed |= graphic_value_control(ui, "Outline width", &mut gfx.outline, 0.0..=24.0, " px", 0.1);
     if gfx.kind == GfxKind::Text {
         let mut bg = Color32::from_rgba_unmultiplied(gfx.bg[0], gfx.bg[1], gfx.bg[2], gfx.bg[3]);
         ui.horizontal(|ui| { ui.label("Text background"); changed |= ui.color_edit_button_srgba(&mut bg).changed(); });
         gfx.bg = bg.to_array();
-        ui.horizontal(|ui| { ui.label("Padding"); changed |= ui.add(egui::Slider::new(&mut gfx.pad, 0.0..=80.0)).changed(); });
+        changed |= graphic_value_control(ui, "Padding", &mut gfx.pad, 0.0..=80.0, " px", 0.5);
     }
     CollapsingHeader::new("Transform")
         .default_open(true)
         .show(ui, |ui| {
             for (index, label) in [(0usize, "Position X"), (1, "Position Y"), (2, "Scale"), (3, "Rotation"), (4, "Opacity")] {
-                ui.horizontal(|ui| {
-                    ui.add_sized([82.0, 18.0], Label::new(RichText::new(label).size(10.0).color(MUTED)));
-                    let mut value = fx.value(index, fx_time);
-                    let def = &PARAMS[index];
-                    let speed = if index <= 1 { 1.0 } else if index == 3 { 1.0 } else { 0.5 };
-                    let response = ui.add_sized(
-                        [ui.available_width(), 20.0],
-                        egui::DragValue::new(&mut value)
-                            .clamp_range(def.lo..=def.hi)
-                            .speed(speed)
-                            .fixed_decimals(0)
-                            .suffix(def.suffix),
-                    );
-                    if response.changed() {
-                        fx.set_value(index, fx_time, value);
-                        transform_changed = true;
-                    }
-                });
+                let mut value = fx.value(index, fx_time);
+                let def = &PARAMS[index];
+                let speed = if index <= 1 { 1.0 } else if index == 3 { 1.0 } else { 0.5 };
+                if graphic_value_control(ui, label, &mut value, def.lo..=def.hi, def.suffix, speed) {
+                    fx.set_value(index, fx_time, value);
+                    transform_changed = true;
+                }
             }
         });
     if changed || transform_changed {

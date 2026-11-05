@@ -1945,7 +1945,7 @@ impl eframe::App for App {
 
         self.assets.pump(ctx);
 
-        // drop video files onto the window: import into the media pool and append to the timeline
+        // Drop video files onto the window: import into the media pool and append to the timeline.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         let mut imported = false;
         for f in dropped {
@@ -1959,7 +1959,7 @@ impl eframe::App for App {
                     self.engine.insert(id, p); // already open: reuse it for playback
                     imported |= self.proj.append_media(id);
                 }
-                Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+                Err(e) => self.file_error = Some(format!("Could not import {}: {e}", path.display())),
             }
         }
         if imported {
@@ -2226,10 +2226,12 @@ impl eframe::App for App {
         // when they actually want it on the timeline.
         if import_requested {
             let files = rfd::FileDialog::new()
-                .add_filter("Video media", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg"])
+                .set_title("Import media into Yoru")
+                .add_filter("Video media", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "mp2", "m2v", "m2ts", "mts", "ts", "wmv", "flv", "3gp", "ogv", "vob"])
                 .pick_files();
             if let Some(paths) = files {
                 let mut imported_any = false;
+                let mut failures = Vec::new();
                 for path in paths {
                     if self.proj.media.iter().any(|m| m.path == path) {
                         continue; // do not duplicate an already-imported source
@@ -2244,11 +2246,15 @@ impl eframe::App for App {
                             self.browser.sel = self.proj.media.iter().position(|m| m.id == id).unwrap_or(0);
                             imported_any = true;
                         }
-                        Err(e) => eprintln!("cannot import {}: {e}", path.display()),
+                        Err(e) => failures.push(format!("{}: {e}", path.display())),
                     }
                 }
                 if imported_any {
                     self.mark_dirty();
+                }
+                if !failures.is_empty() {
+                    let details = failures.into_iter().take(4).collect::<Vec<_>>().join("\n");
+                    self.file_error = Some(format!("Some files could not be imported:\n{details}"));
                 }
             }
         }
